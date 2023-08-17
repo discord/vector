@@ -138,9 +138,11 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/rpc/code.proto"
         println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
         println!("cargo:rerun-if-changed=proto/vector/vector.proto");
         println!("cargo:rerun-if-changed=proto/vector/observability.proto");
+        println!("cargo:rerun-if-changed=proto/google/cloud/bigquery/storage/v1/storage.proto");
 
         // Create and store the "file descriptor set" from the compiled Protocol Buffers packages.
         // Used for gRPC reflection of Vector's own observability/API protos.
@@ -160,17 +162,12 @@ fn main() {
                 prost_build,
                 &[
                     "lib/vector-core/proto/event.proto",
+                    "proto/google/cloud/bigquery/storage/v1/storage.proto",
                     "proto/vector/ddsketch_full.proto",
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
                     "proto/vector/observability.proto",
-                ],
-                &[
-                    "proto",
-                    "proto/third-party",
-                    "proto/vector",
-                    "lib/vector-core/proto/",
                 ],
             )
             .unwrap();
@@ -280,3 +277,4 @@ fn main() {
     // Emit the aforementioned stanzas.
     tracker.emit_rerun_stanzas();
 }
+
