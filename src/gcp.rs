@@ -25,11 +25,15 @@ use crate::{config::ProxyConfig, http::HttpClient, http::HttpError};
 const SERVICE_ACCOUNT_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
+<<<<<<< HEAD
 // See https://cloud.google.com/compute/docs/access/authenticate-workloads#applications
 const METADATA_TOKEN_EXPIRY_MARGIN_SECS: u64 = 200;
 
 const METADATA_TOKEN_ERROR_RETRY_SECS: u64 = 2;
 
+=======
+pub const BIGQUERYSTORAGE_URL: &str = "https://bigquerystorage.googleapis.com:443";
+>>>>>>> 200a6ce6d (feat(new sink): new `gcp_bigquery` sink)
 pub const PUBSUB_URL: &str = "https://pubsub.googleapis.com";
 
 pub static PUBSUB_ADDRESS: Lazy<String> = Lazy::new(|| {
