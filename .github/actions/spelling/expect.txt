@@ -269,6 +269,14 @@ IMSD
 incentivizes
 indexmap
 inodes
+indicatif
+indoc
+influxdata
+ingesters
+ingestor
+initdb
+initech
+Insertdata
 installdeb
 interpretervm
 invtrapezium

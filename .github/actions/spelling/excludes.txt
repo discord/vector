@@ -2,3 +2,7 @@
 ^\.github/actions/spelling/
 ^\Qbenches/codecs/moby_dick.txt\E$
 ^\Qwebsite/layouts/shortcodes/config/unit-tests.html\E$
+^lib/codecs/tests/data/native_encoding/
+^\Qwebsite/config.toml\E$
+^proto/google/
+ignore$
