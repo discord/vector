@@ -69,6 +69,7 @@ badunit
 bak
 barfoo
 barieom
+basearch
 baseof
 basevalue
 baskinc
@@ -450,6 +451,8 @@ gogoproto
 goldberg
 goldmark
 GPB
+gpgcheck
+gpgkey
 gqlgen
 graphqlconfig
 grault
@@ -576,6 +579,7 @@ kernelmode
 keybase
 keyclock
 keyid
+keyring
 keyxxxxx
 khvzak
 kib
@@ -636,6 +640,7 @@ lukesteensen
 macports
 MAINPID
 majorly
+makecache
 MAKECMDGOALS
 Makefiles
 markability
