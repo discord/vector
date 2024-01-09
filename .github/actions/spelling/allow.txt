@@ -403,6 +403,7 @@ podman
 postgresql
 proxyuser
 pseudocode
+pushgateway
 qwerty
 rabbitmq
 rclone
@@ -417,6 +418,7 @@ rsyslog
 rsyslogd
 security-tab
 servlet
+Sinjo
 sublocation
 snyk
 socketaddr
