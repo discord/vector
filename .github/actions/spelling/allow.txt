@@ -345,6 +345,7 @@ ifneq
 imobile
 influxd
 ionik
+ipallowlist
 ipod
 ircd
 jemalloc
