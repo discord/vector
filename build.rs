@@ -116,15 +116,15 @@ fn main() {
 
     #[cfg(feature = "protobuf-build")]
     {
-        println!("cargo:rerun-if-changed=proto/dd_trace.proto");
-        println!("cargo:rerun-if-changed=proto/dnstap.proto");
-        println!("cargo:rerun-if-changed=proto/ddsketch_full.proto");
-        println!("cargo:rerun-if-changed=proto/dd_metric.proto");
         println!("cargo:rerun-if-changed=proto/google/cloud/bigquery/storage/v1/storage.proto");
-        println!("cargo:rerun-if-changed=proto/google/pubsub/v1/pubsub.proto");
-        println!("cargo:rerun-if-changed=proto/google/rpc/code.proto");
-        println!("cargo:rerun-if-changed=proto/google/rpc/status.proto");
-        println!("cargo:rerun-if-changed=proto/vector.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/dnstap.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/rpc/code.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
+        println!("cargo:rerun-if-changed=proto/vector/dd_metric.proto");
+        println!("cargo:rerun-if-changed=proto/vector/dd_trace.proto");
+        println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
+        println!("cargo:rerun-if-changed=proto/vector/vector.proto");
 
         // Create and store the "file descriptor set" from the compiled Protocol Buffers packages.
         //
@@ -146,17 +146,21 @@ fn main() {
                 prost_build,
                 &[
                     "lib/vector-core/proto/event.proto",
-                    "proto/dnstap.proto",
-                    "proto/ddsketch_full.proto",
-                    "proto/dd_metric.proto",
-                    "proto/dd_trace.proto",
                     "proto/google/cloud/bigquery/storage/v1/storage.proto",
-                    "proto/google/pubsub/v1/pubsub.proto",
-                    "proto/google/rpc/code.proto",
-                    "proto/google/rpc/status.proto",
-                    "proto/vector.proto",
+                    "proto/third-party/google/pubsub/v1/pubsub.proto",
+                    "proto/third-party/google/rpc/code.proto",
+                    "proto/third-party/google/rpc/status.proto",
+                    "proto/third-party/dnstap.proto",
+                    "proto/vector/ddsketch_full.proto",
+                    "proto/vector/dd_metric.proto",
+                    "proto/vector/dd_trace.proto",
+                    "proto/vector/vector.proto",
                 ],
-                &["proto/", "lib/vector-core/proto/"],
+                &[
+                    "proto/third-party",
+                    "proto/vector",
+                    "lib/vector-core/proto/",
+                ],
             )
             .unwrap();
     }
