@@ -185,7 +185,6 @@ concating
 concats
 condrestart
 conffiles
-configkey
 configmap
 confl
 confluentinc
@@ -865,6 +864,7 @@ protoc
 protofbuf
 protosizer
 Prt
+psl
 psv
 publickey
 purgecss
@@ -1143,7 +1143,6 @@ trivy
 Troutwine
 trustarc
 truste
-TRUSTSTORE
 TSDB
 Tsvg
 turbofish
@@ -1245,7 +1244,6 @@ wtcache
 wtime
 wtimeouts
 wtr
-wurstmeister
 xact
 xcatsy
 Xcg
