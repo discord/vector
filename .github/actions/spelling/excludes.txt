@@ -118,4 +118,5 @@
 ^\Qwebsite/layouts/shortcodes/config/unit-tests.html\E$
 ^lib/codecs/tests/data/native_encoding/
 ^proto/google/
+^\Qwebsite/config.toml\E$
 ignore$
