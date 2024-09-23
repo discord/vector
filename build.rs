@@ -155,6 +155,11 @@ fn main() {
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
                 ],
+                &[
+                    "proto/third-party",
+                    "proto/vector",
+                    "lib/vector-core/proto/",
+                ],
             )
             .unwrap();
     }

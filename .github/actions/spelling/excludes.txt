@@ -117,9 +117,6 @@
 ^\Qwebsite/cue/reference/remap/functions/ip_pton.cue\E$
 ^\Qwebsite/layouts/shortcodes/config/unit-tests.html\E$
 ^lib/codecs/tests/data/native_encoding/
-<<<<<<< HEAD
 ^\Qwebsite/config.toml\E$
-=======
 ^proto/google/
->>>>>>> b0fb6a4fb (Fix spelling test)
 ignore$
