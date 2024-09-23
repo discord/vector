@@ -138,7 +138,6 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
-        println!("cargo:rerun-if-changed=proto/third-party/google/rpc/code.proto"
         println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
         println!("cargo:rerun-if-changed=proto/vector/vector.proto");
         println!("cargo:rerun-if-changed=proto/vector/observability.proto");
@@ -172,6 +171,7 @@ fn main() {
                 &[
                     "proto/third-party",
                     "proto/vector",
+                    "proto/gogole/cloud/bigquery/storage/v1",
                     "lib/vector-core/proto/",
                 ],
             )
