@@ -169,6 +169,11 @@ fn main() {
                     "proto/vector/vector.proto",
                     "proto/vector/observability.proto",
                 ],
+                &[
+                    "proto/third-party",
+                    "proto/vector",
+                    "lib/vector-core/proto/",
+                ],
             )
             .unwrap();
     }
