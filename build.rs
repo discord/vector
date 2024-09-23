@@ -161,7 +161,12 @@ fn main() {
                 prost_build,
                 &[
                     "lib/vector-core/proto/event.proto",
+                    "proto/google/cloud/bigquery/storage/v1/arrow.proto",
+                    "proto/google/cloud/bigquery/storage/v1/avro.proto",
+                    "proto/google/cloud/bigquery/storage/v1/protobuf.proto",
                     "proto/google/cloud/bigquery/storage/v1/storage.proto",
+                    "proto/google/cloud/bigquery/storage/v1/stream.proto",
+                    "proto/google/cloud/bigquery/storage/v1/table.proto",
                     "proto/vector/ddsketch_full.proto",
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
                     "proto/third-party/google/rpc/status.proto",
@@ -171,7 +176,7 @@ fn main() {
                 &[
                     "proto/third-party",
                     "proto/vector",
-                    "proto/gogole/cloud/bigquery/storage/v1",
+                    "proto/google/cloud/bigquery/storage/v1",
                     "lib/vector-core/proto/",
                 ],
             )
