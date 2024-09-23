@@ -3,6 +3,7 @@ modules:
   - path: lib/vector-core/proto
   - path: proto/third-party
   - path: proto/vector
+  - path: proto/google/cloud/bigquery/storage/v1
 lint:
   use:
     - DEFAULT
