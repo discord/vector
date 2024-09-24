@@ -6,7 +6,7 @@ fn main() {
         .bytes(["raw_bytes"])
         .compile_protos(
             &["proto/event.proto"],
-            &["proto", "../../proto/third-party", "../../proto/vector",  "../../proto/google/cloud/bigquery/storage/v1"],
+            &["proto", "../../proto/third-party", "../../proto/vector"],
         )
         .unwrap();
 }
