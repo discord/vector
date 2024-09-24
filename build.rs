@@ -117,13 +117,13 @@ fn main() {
     #[cfg(feature = "protobuf-build")]
     {
         println!("cargo:rerun-if-changed=proto/third-party/dnstap.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/cloud/bigquery/storage/v1/storage.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
         println!("cargo:rerun-if-changed=proto/vector/dd_metric.proto");
         println!("cargo:rerun-if-changed=proto/vector/dd_trace.proto");
         println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
         println!("cargo:rerun-if-changed=proto/vector/vector.proto");
-        println!("cargo:rerun-if-changed=proto/google/cloud/bigquery/storage/v1/storage.proto");
 
         // Create and store the "file descriptor set" from the compiled Protocol Buffers packages.
         //
@@ -145,16 +145,16 @@ fn main() {
                 prost_build,
                 &[
                     "lib/vector-core/proto/event.proto",
-                    "proto/google/cloud/bigquery/storage/v1/arrow.proto",
-                    "proto/google/cloud/bigquery/storage/v1/avro.proto",
-                    "proto/google/cloud/bigquery/storage/v1/protobuf.proto",
-                    "proto/google/cloud/bigquery/storage/v1/storage.proto",
-                    "proto/google/cloud/bigquery/storage/v1/stream.proto",
-                    "proto/google/cloud/bigquery/storage/v1/table.proto",
+                    // "proto/google/cloud/bigquery/storage/v1/arrow.proto",
+                    // "proto/google/cloud/bigquery/storage/v1/avro.proto",
+                    // "proto/google/cloud/bigquery/storage/v1/protobuf.proto",
+                    // "proto/google/cloud/bigquery/storage/v1/stream.proto",
+                    // "proto/google/cloud/bigquery/storage/v1/table.proto",
                     "proto/third-party/dnstap.proto",
                     "proto/vector/ddsketch_full.proto",
                     "proto/vector/dd_metric.proto",
                     "proto/vector/dd_trace.proto",
+                    "proto/third-party/google/cloud/bigquery/storage/v1/storage.proto",
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
@@ -162,7 +162,6 @@ fn main() {
                 &[
                     "proto/third-party",
                     "proto/vector",
-                    "proto/google/cloud/bigquery/storage/v1",
                     "lib/vector-core/proto/",
                 ],
             )
