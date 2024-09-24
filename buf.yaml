@@ -4,7 +4,6 @@ modules:
   - path: proto/third-party
   - path: proto/vector
   - path: lib/vector-vrl/dnstap-parser/proto
-  - path: proto/google/cloud/bigquery/storage/v1
 lint:
   use:
     - DEFAULT
