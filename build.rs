@@ -117,6 +117,7 @@ fn main() {
     #[cfg(feature = "protobuf-build")]
     {
         println!("cargo:rerun-if-changed=proto/third-party/dnstap.proto");
+        println!("cargo:rerun-if-changed=proto/third-party/google/cloud/bigquery/storage/v1/storage.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
         println!("cargo:rerun-if-changed=proto/vector/dd_metric.proto");
@@ -148,6 +149,7 @@ fn main() {
                     "proto/vector/ddsketch_full.proto",
                     "proto/vector/dd_metric.proto",
                     "proto/vector/dd_trace.proto",
+                    "proto/third-party/google/cloud/bigquery/storage/v1/storage.proto",
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
@@ -268,3 +270,4 @@ fn main() {
     // Emit the aforementioned stanzas.
     tracker.emit_rerun_stanzas();
 }
+

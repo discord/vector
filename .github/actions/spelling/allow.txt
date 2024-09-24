@@ -244,6 +244,7 @@ armhf
 backpressure
 backticks
 bigendian
+bigquery
 bindir
 binfmt
 bitcast
