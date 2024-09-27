@@ -7,11 +7,11 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tower::Service;
-use vector_common::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
-use vector_core::event::EventStatus;
-use vector_core::stream::DriverResponse;
+use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
+use vector_lib::event::EventStatus;
+use vector_lib::stream::DriverResponse;
 
-use super::proto::google::cloud::bigquery::storage::v1 as proto;
+use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
 use crate::event::{EventFinalizers, Finalizable};
 use crate::gcp::GcpAuthenticator;
 
@@ -75,13 +75,13 @@ impl DriverResponse for BigqueryResponse {
             None => EventStatus::Dropped,
             Some(proto::append_rows_response::Response::AppendResult(_)) => EventStatus::Delivered,
             Some(proto::append_rows_response::Response::Error(status)) => {
-                match super::proto::google::rpc::Code::try_from(status.code) {
+                match super::proto::third_party::google::rpc::Code::try_from(status.code) {
                     // we really shouldn't be able to get here, but just in case
-                    Ok(super::proto::google::rpc::Code::Ok) => EventStatus::Delivered,
+                    Ok(super::proto::third_party::google::rpc::Code::Ok) => EventStatus::Delivered,
                     // these errors can't be retried because the event payload is almost definitely bad
-                    Ok(super::proto::google::rpc::Code::InvalidArgument)
-                    | Ok(super::proto::google::rpc::Code::NotFound)
-                    | Ok(super::proto::google::rpc::Code::AlreadyExists) => EventStatus::Rejected,
+                    Ok(super::proto::third_party::google::rpc::Code::InvalidArgument)
+                    | Ok(super::proto::third_party::google::rpc::Code::NotFound)
+                    | Ok(super::proto::third_party::google::rpc::Code::AlreadyExists) => EventStatus::Rejected,
                     // everything else can probably be retried
                     _ => EventStatus::Errored,
                 }

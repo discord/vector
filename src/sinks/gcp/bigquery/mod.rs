@@ -16,18 +16,20 @@ mod sink;
 
 #[allow(warnings, clippy::pedantic, clippy::nursery)]
 pub(crate) mod proto {
-    pub(crate) mod google {
-        pub(crate) mod cloud {
-            pub(crate) mod bigquery {
-                pub(crate) mod storage {
-                    pub(crate) mod v1 {
-                        tonic::include_proto!("google.cloud.bigquery.storage.v1");
+    pub(crate) mod third_party {
+        pub(crate) mod google {
+            pub(crate) mod cloud {
+                pub(crate) mod bigquery {
+                    pub(crate) mod storage {
+                        pub(crate) mod v1 {
+                            tonic::include_proto!("google.cloud.bigquery.storage.v1");
+                        }
                     }
                 }
             }
-        }
-        pub(crate) mod rpc {
-            tonic::include_proto!("google.rpc");
+            pub(crate) mod rpc {
+                tonic::include_proto!("google.rpc");
+            }
         }
     }
 }

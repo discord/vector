@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use vector_lib::configurable::configurable_component;
 
 pub mod bigquery;
-pub mod chronicle_unstructured;
 pub mod cloud_storage;
 pub mod pubsub;
 pub mod stackdriver;
