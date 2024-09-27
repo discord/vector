@@ -1,9 +1,9 @@
-use codecs::encoding::ProtobufSerializerConfig;
+use vector_lib::codecs::encoding::ProtobufSerializerConfig;
 use futures::FutureExt;
 use http::Uri;
 use indoc::indoc;
 use tonic::transport::Channel;
-use vector_config::configurable_component;
+use vector_lib::configurable::configurable_component;
 
 use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
 use super::request_builder::{BigqueryRequestBuilder, MAX_BATCH_PAYLOAD_SIZE};
@@ -75,7 +75,7 @@ pub struct BigqueryConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     acknowledgements: AcknowledgementsConfig,
 }
