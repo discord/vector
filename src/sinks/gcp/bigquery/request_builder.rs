@@ -3,10 +3,10 @@ use codecs::encoding::ProtobufSerializer;
 use prost::Message;
 use std::num::NonZeroUsize;
 use tokio_util::codec::Encoder;
-use vector_common::request_metadata::RequestMetadata;
-use vector_core::event::Finalizable;
+use vector_lib::request_metadata::RequestMetadata;
+use vector_lib::event::Finalizable;
 
-use super::proto::google::cloud::bigquery::storage::v1 as proto;
+use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
 use super::service::BigqueryRequest;
 use crate::event::{Event, EventFinalizers};
 use crate::sinks::util::metadata::RequestMetadataBuilder;

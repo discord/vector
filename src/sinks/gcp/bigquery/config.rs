@@ -5,7 +5,7 @@ use indoc::indoc;
 use tonic::transport::Channel;
 use vector_config::configurable_component;
 
-use super::proto::google::cloud::bigquery::storage::v1 as proto;
+use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
 use super::request_builder::{BigqueryRequestBuilder, MAX_BATCH_PAYLOAD_SIZE};
 use super::service::{AuthInterceptor, BigqueryService};
 use super::sink::BigquerySink;
