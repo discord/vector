@@ -151,6 +151,7 @@ fn main() {
                     "proto/vector/dd_trace.proto",
                     "proto/third-party/google/cloud/bigquery/storage/v1/storage.proto",
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
+                    "proto/third-party/google/rpc/code.proto",
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
                 ],

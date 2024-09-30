@@ -1,12 +1,12 @@
 use bytes::BytesMut;
-use codecs::encoding::ProtobufSerializer;
+use vector_lib::codecs::encoding::ProtobufSerializer;
 use prost::Message;
 use std::num::NonZeroUsize;
 use tokio_util::codec::Encoder;
-use vector_common::request_metadata::RequestMetadata;
-use vector_core::event::Finalizable;
+use vector_lib::request_metadata::RequestMetadata;
+use vector_lib::event::Finalizable;
 
-use super::proto::google::cloud::bigquery::storage::v1 as proto;
+use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
 use super::service::BigqueryRequest;
 use crate::event::{Event, EventFinalizers};
 use crate::sinks::util::metadata::RequestMetadataBuilder;
@@ -22,8 +22,8 @@ pub enum BigqueryRequestBuilderError {
     ProtobufEncoding { message: String }, // `error` needs to be some concrete type
 }
 
-impl From<vector_common::Error> for BigqueryRequestBuilderError {
-    fn from(error: vector_common::Error) -> Self {
+impl From<vector_lib::Error> for BigqueryRequestBuilderError {
+    fn from(error: vector_lib::Error) -> Self {
         BigqueryRequestBuilderError::ProtobufEncoding {
             message: format!("{:?}", error),
         }
@@ -142,7 +142,7 @@ mod test {
     use codecs::encoding::{ProtobufSerializerConfig, ProtobufSerializerOptions};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use vector_core::event::{Event, EventMetadata, LogEvent, Value};
+    use vector_lib::event::{Event, EventMetadata, LogEvent, Value};
 
     use super::BigqueryRequestBuilder;
     use crate::sinks::util::IncrementalRequestBuilder;
