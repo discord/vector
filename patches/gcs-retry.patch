@@ -1,0 +1,136 @@
+diff --git a/src/gcp.rs b/src/gcp.rs
+index bfc486f92..148fa9dec 100644
+--- a/src/gcp.rs
++++ b/src/gcp.rs
+@@ -16,7 +16,7 @@ use hyper::header::AUTHORIZATION;
+ use once_cell::sync::Lazy;
+ use smpl_jwt::Jwt;
+ use snafu::{ResultExt, Snafu};
+-use tokio::{sync::watch, time::Instant};
++use tokio::sync::watch;
+ use vector_lib::configurable::configurable_component;
+ use vector_lib::sensitive_string::SensitiveString;
+ 
+@@ -25,6 +25,11 @@ use crate::{config::ProxyConfig, http::HttpClient, http::HttpError};
+ const SERVICE_ACCOUNT_TOKEN_URL: &str =
+     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+ 
++// See https://cloud.google.com/compute/docs/access/authenticate-workloads#applications
++const METADATA_TOKEN_EXPIRY_MARGIN_SECS: u64 = 200;
++
++const METADATA_TOKEN_ERROR_RETRY_SECS: u64 = 2;
++
+ pub const PUBSUB_URL: &str = "https://pubsub.googleapis.com";
+ 
+ pub static PUBSUB_ADDRESS: Lazy<String> = Lazy::new(|| {
+@@ -194,19 +199,25 @@ impl GcpAuthenticator {
+     async fn token_regenerator(self, sender: watch::Sender<()>) {
+         match self {
+             Self::Credentials(inner) => {
+-                let period =
+-                    Duration::from_secs(inner.token.read().unwrap().expires_in() as u64 / 2);
+-                let mut interval = tokio::time::interval_at(Instant::now() + period, period);
++                let expires_in = inner.token.read().unwrap().expires_in() as u64;
++                let mut deadline =
++                    Duration::from_secs(expires_in.saturating_sub(METADATA_TOKEN_EXPIRY_MARGIN_SECS));
+                 loop {
+-                    interval.tick().await;
++                    tokio::time::sleep(deadline).await;
+                     debug!("Renewing GCP authentication token.");
+                     match inner.regenerate_token().await {
+-                        Ok(()) => sender.send_replace(()),
++                        Ok(()) => {
++                            sender.send_replace(());
++                            let expires_in = inner.token.read().unwrap().expires_in() as u64;
++                            deadline =
++                                Duration::from_secs(expires_in.saturating_sub(METADATA_TOKEN_EXPIRY_MARGIN_SECS));
++                        }
+                         Err(error) => {
+                             error!(
+                                 message = "Failed to update GCP authentication token.",
+                                 %error
+                             );
++                            deadline = Duration::from_secs(METADATA_TOKEN_ERROR_RETRY_SECS);
+                         }
+                     }
+                 }
+diff --git a/src/sinks/gcs_common/config.rs b/src/sinks/gcs_common/config.rs
+index 914d780c8..e59a4e8e4 100644
+--- a/src/sinks/gcs_common/config.rs
++++ b/src/sinks/gcs_common/config.rs
+@@ -6,7 +6,7 @@ use vector_lib::configurable::configurable_component;
+ 
+ use crate::{
+     gcp::{GcpAuthenticator, GcpError},
+-    http::HttpClient,
++    http::{HttpClient, HttpError},
+     sinks::{
+         gcs_common::service::GcsResponse,
+         util::retries::{RetryAction, RetryLogic},
+@@ -141,7 +141,7 @@ pub struct GcsRetryLogic;
+ 
+ // This is a clone of HttpRetryLogic for the Body type, should get merged
+ impl RetryLogic for GcsRetryLogic {
+-    type Error = hyper::Error;
++    type Error = HttpError;
+     type Response = GcsResponse;
+ 
+     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
+@@ -159,7 +159,7 @@ impl RetryLogic for GcsRetryLogic {
+             }
+             _ if status.is_server_error() => RetryAction::Retry(status.to_string().into()),
+             _ if status.is_success() => RetryAction::Successful,
+-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
++            _ => RetryAction::Retry(format!("catchall retry with response status: {}", status).into()),
+         }
+     }
+ }
+diff --git a/src/sinks/util/http.rs b/src/sinks/util/http.rs
+index 0904a67cb..e3fae07e0 100644
+--- a/src/sinks/util/http.rs
++++ b/src/sinks/util/http.rs
+@@ -470,6 +470,7 @@ impl RetryLogic for HttpRetryLogic {
+         let status = response.status();
+ 
+         match status {
++            StatusCode::UNAUTHORIZED => RetryAction::Retry("unauthorized".into()),
+             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
+             StatusCode::NOT_IMPLEMENTED => {
+                 RetryAction::DontRetry("endpoint not implemented".into())
+@@ -478,7 +479,7 @@ impl RetryLogic for HttpRetryLogic {
+                 format!("{}: {}", status, String::from_utf8_lossy(response.body())).into(),
+             ),
+             _ if status.is_success() => RetryAction::Successful,
+-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
++            _ => RetryAction::Retry(format!("catchall retry with response status: {}", status).into()),
+         }
+     }
+ }
+diff --git a/src/sinks/util/retries.rs b/src/sinks/util/retries.rs
+index 003f1990b..fea5cf5be 100644
+--- a/src/sinks/util/retries.rs
++++ b/src/sinks/util/retries.rs
+@@ -192,13 +192,20 @@ where
+                         internal_log_rate_limit = true
+                     );
+                     Some(self.build_retry())
++                } else if error.downcast_ref::<hyper::Error>().is_some() {
++                    warn!(
++                        message = "Request failed on a Hyper error. This is likely a transient network issue, retrying.",
++                        %error,
++                        internal_log_rate_limit = true
++                    );
++                    Some(self.build_retry())
+                 } else {
+-                    error!(
+-                        message = "Unexpected error type; dropping the request.",
++                    warn!(
++                        message = "Unexpected Error Type. Retrying anyway",
+                         %error,
+                         internal_log_rate_limit = true
+                     );
+-                    None
++                    Some(self.build_retry())
+                 }
+             }
+         }

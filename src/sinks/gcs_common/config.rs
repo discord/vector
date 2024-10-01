@@ -6,7 +6,7 @@ use vector_lib::configurable::configurable_component;
 
 use crate::{
     gcp::{GcpAuthenticator, GcpError},
-    http::HttpClient,
+    http::{HttpClient, HttpError},
     sinks::{
         gcs_common::service::GcsResponse,
         util::retries::{RetryAction, RetryLogic},
@@ -141,7 +141,7 @@ pub struct GcsRetryLogic;
 
 // This is a clone of HttpRetryLogic for the Body type, should get merged
 impl RetryLogic for GcsRetryLogic {
-    type Error = hyper::Error;
+    type Error = HttpError;
     type Response = GcsResponse;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
@@ -159,7 +159,7 @@ impl RetryLogic for GcsRetryLogic {
             }
             _ if status.is_server_error() => RetryAction::Retry(status.to_string().into()),
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
+            _ => RetryAction::Retry(format!("catchall retry with response status: {}", status).into()),
         }
     }
 }

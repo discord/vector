@@ -470,6 +470,7 @@ impl RetryLogic for HttpRetryLogic {
         let status = response.status();
 
         match status {
+            StatusCode::UNAUTHORIZED => RetryAction::Retry("unauthorized".into()),
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
@@ -478,7 +479,7 @@ impl RetryLogic for HttpRetryLogic {
                 format!("{}: {}", status, String::from_utf8_lossy(response.body())).into(),
             ),
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
+            _ => RetryAction::Retry(format!("catchall retry with response status: {}", status).into()),
         }
     }
 }
