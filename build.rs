@@ -271,4 +271,3 @@ fn main() {
     // Emit the aforementioned stanzas.
     tracker.emit_rerun_stanzas();
 }
-

@@ -1,8 +1,8 @@
-use vector_lib::codecs::encoding::ProtobufSerializerConfig;
 use futures::FutureExt;
 use http::Uri;
 use indoc::indoc;
 use tonic::transport::Channel;
+use vector_lib::codecs::encoding::ProtobufSerializerConfig;
 use vector_lib::configurable::configurable_component;
 
 use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
