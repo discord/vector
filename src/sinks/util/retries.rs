@@ -192,13 +192,20 @@ where
                         internal_log_rate_limit = true
                     );
                     Some(self.build_retry())
-                } else {
-                    error!(
-                        message = "Unexpected error type; dropping the request.",
+                } else if error.downcast_ref::<hyper::Error>().is_some() {
+                    warn!(
+                        message = "Request failed on a Hyper error. This is likely a transient network issue, retrying.",
                         %error,
                         internal_log_rate_limit = true
                     );
-                    None
+                    Some(self.build_retry())
+                } else {
+                    warn!(
+                        message = "Unexpected Error Type. Retrying anyway",
+                        %error,
+                        internal_log_rate_limit = true
+                    );
+                    Some(self.build_retry())
                 }
             }
         }
