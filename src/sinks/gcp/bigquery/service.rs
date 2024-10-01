@@ -7,8 +7,8 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tower::Service;
-use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::event::EventStatus;
+use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
 use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
@@ -81,7 +81,9 @@ impl DriverResponse for BigqueryResponse {
                     // these errors can't be retried because the event payload is almost definitely bad
                     Ok(super::proto::third_party::google::rpc::Code::InvalidArgument)
                     | Ok(super::proto::third_party::google::rpc::Code::NotFound)
-                    | Ok(super::proto::third_party::google::rpc::Code::AlreadyExists) => EventStatus::Rejected,
+                    | Ok(super::proto::third_party::google::rpc::Code::AlreadyExists) => {
+                        EventStatus::Rejected
+                    }
                     // everything else can probably be retried
                     _ => EventStatus::Errored,
                 }
