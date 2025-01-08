@@ -152,9 +152,10 @@ impl RunningTopology {
                     components = ?remaining_components,
                     "Failed to gracefully shut down in time. Killing components."
                 );
-            }) as future::BoxFuture<'static, ()>
+                Result::Err(())
+            }) as future::BoxFuture<'static, Result<(), ()>>
         } else {
-            Box::pin(future::pending()) as future::BoxFuture<'static, ()>
+            Box::pin(future::pending()) as future::BoxFuture<'static, Result<(), ()>>
         };
 
         // Reports in intervals which components are still running.
@@ -190,19 +191,23 @@ impl RunningTopology {
         };
 
         // Finishes once all tasks have shutdown.
-        let success = futures::future::join_all(wait_handles).map(|_| ());
+        let success = futures::future::join_all(wait_handles).map(|_| Result::Ok(()));
 
         // Aggregate future that ends once anything detects that all tasks have shutdown.
         let shutdown_complete_future = future::select_all(vec![
-            Box::pin(timeout) as future::BoxFuture<'static, ()>,
-            Box::pin(reporter) as future::BoxFuture<'static, ()>,
-            Box::pin(success) as future::BoxFuture<'static, ()>,
+            Box::pin(timeout) as future::BoxFuture<'static, Result<(), ()>>,
+            Box::pin(reporter) as future::BoxFuture<'static, Result<(), ()>>,
+            Box::pin(success) as future::BoxFuture<'static, Result<(), ()>>,
         ]);
 
         // Now kick off the shutdown process by shutting down the sources.
-        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline);
+        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline).map(|_| Result::Ok(()));
 
-        futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+        futures::future::join(source_shutdown_complete, shutdown_complete_future)
+            .map(|xy| match xy.1.0 {
+                Result::Err(_) => panic!("alexj's panic: failed to gracefully shutdown in time"),
+                Result::Ok(_) => (),
+            })
     }
 
     /// Attempts to load a new configuration and update this running topology.
