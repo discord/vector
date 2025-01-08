@@ -188,7 +188,6 @@ impl RunningTopology {
                     "Shutting down... Waiting on running components."
                 );
             }
-            Result::Ok(())
         };
 
         // Finishes once all tasks have shutdown.
@@ -202,7 +201,7 @@ impl RunningTopology {
         ]);
 
         // Now kick off the shutdown process by shutting down the sources.
-        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline).map(|_| Result::Ok(()));
+        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline).map(|_| Result::<(), ()>::Ok(()));
 
         futures::future::join(source_shutdown_complete, shutdown_complete_future)
             .map(|xy| match xy.1.0 {
