@@ -203,9 +203,10 @@ impl RunningTopology {
         // Now kick off the shutdown process by shutting down the sources.
         let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline).map(|_| Result::<(), ()>::Ok(()));
 
+        // Panic to ensure that Vector returns a non-zero exit code when it's unable to gracefully shutdown
         futures::future::join(source_shutdown_complete, shutdown_complete_future)
-            .map(|xy| match xy.1.0 {
-                Result::Err(_) => panic!("alexj's panic: failed to gracefully shutdown in time"),
+            .map(|futures| match futures.1.0 {
+                Result::Err(_) => panic!("failed to gracefully shutdown in time, panic to force non-zero exit code"),
                 Result::Ok(_) => (),
             })
     }
