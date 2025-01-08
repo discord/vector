@@ -152,9 +152,10 @@ impl RunningTopology {
                     components = ?remaining_components,
                     "Failed to gracefully shut down in time. Killing components."
                 );
-            }) as future::BoxFuture<'static, ()>
+                Result::Err(remaining_components)
+            }) as future::BoxFuture<'static, Result<(), String>>
         } else {
-            Box::pin(future::pending()) as future::BoxFuture<'static, ()>
+            Box::pin(future::pending()) as future::BoxFuture<'static, Result<(), String>>
         };
 
         // Reports in intervals which components are still running.
@@ -190,19 +191,24 @@ impl RunningTopology {
         };
 
         // Finishes once all tasks have shutdown.
-        let success = futures::future::join_all(wait_handles).map(|_| ());
+        let success = futures::future::join_all(wait_handles).map(|_| Result::Ok(()));
 
         // Aggregate future that ends once anything detects that all tasks have shutdown.
         let shutdown_complete_future = future::select_all(vec![
-            Box::pin(timeout) as future::BoxFuture<'static, ()>,
-            Box::pin(reporter) as future::BoxFuture<'static, ()>,
-            Box::pin(success) as future::BoxFuture<'static, ()>,
+            Box::pin(timeout) as future::BoxFuture<'static, Result<(), String>>,
+            Box::pin(reporter.map(|()| Result::<(), String>::Ok(()))) as future::BoxFuture<'static, Result<(), String>>,
+            Box::pin(success) as future::BoxFuture<'static, Result<(), String>>,
         ]);
 
         // Now kick off the shutdown process by shutting down the sources.
-        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline);
+        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline).map(|_| Result::<(), String>::Ok(()));
 
-        futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+        // Panic to ensure that Vector returns a non-zero exit code when it's unable to gracefully shutdown
+        futures::future::join(source_shutdown_complete, shutdown_complete_future)
+            .map(|futures| match futures.1.0 {
+                Result::Err(s) => panic!("failed to gracefully shutdown in time, panic to force non-zero exit code. remaining components: {}", &s),
+                Result::Ok(_) => (),
+            })
     }
 
     /// Attempts to load a new configuration and update this running topology.
