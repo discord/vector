@@ -188,6 +188,7 @@ impl RunningTopology {
                     "Shutting down... Waiting on running components."
                 );
             }
+            Result::Ok(())
         };
 
         // Finishes once all tasks have shutdown.
