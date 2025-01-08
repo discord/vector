@@ -196,7 +196,7 @@ impl RunningTopology {
         // Aggregate future that ends once anything detects that all tasks have shutdown.
         let shutdown_complete_future = future::select_all(vec![
             Box::pin(timeout) as future::BoxFuture<'static, Result<(), ()>>,
-            Box::pin(reporter) as future::BoxFuture<'static, Result<(), ()>>,
+            Box::pin(reporter) as future::BoxFuture<'static, ()>,
             Box::pin(success) as future::BoxFuture<'static, Result<(), ()>>,
         ]);
 
