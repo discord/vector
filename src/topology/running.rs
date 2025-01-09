@@ -153,9 +153,9 @@ impl RunningTopology {
                     "Failed to gracefully shut down in time. Killing components."
                 );
                 Result::Err(remaining_components)
-            }) as future::BoxFuture<'static, Result<(), ()>>
+            }) as future::BoxFuture<'static, Result<(), String>>
         } else {
-            Box::pin(future::pending()) as future::BoxFuture<'static, Result<(), ()>>
+            Box::pin(future::pending()) as future::BoxFuture<'static, Result<(), String>>
         };
 
         // Reports in intervals which components are still running.
