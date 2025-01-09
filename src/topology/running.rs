@@ -206,7 +206,7 @@ impl RunningTopology {
         // Panic to ensure that Vector returns a non-zero exit code when it's unable to gracefully shutdown
         futures::future::join(source_shutdown_complete, shutdown_complete_future)
             .map(|futures| match futures.1.0 {
-                Result::Err(s) => panic!(format!("failed to gracefully shutdown in time, panic to force non-zero exit code: {s}")),
+                Result::Err(s) => panic!("failed to gracefully shutdown in time, panic to force non-zero exit code. remaining components: {}", &s),
                 Result::Ok(_) => (),
             })
     }
