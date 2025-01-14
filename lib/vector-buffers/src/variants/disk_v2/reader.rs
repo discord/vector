@@ -977,7 +977,7 @@ where
             if self.ledger.is_writer_done() {
                 let total_buffer_size = self.ledger.get_total_buffer_size();
                 if total_buffer_size == 0 {
-                    debug!("writer is done and total buffer size is 0");
+                    debug!("buffer writer is done and buffer is empty")
                     return Ok(None);
                 }
             }
@@ -1075,7 +1075,7 @@ where
                     continue;
                 }
 
-                debug!("reader is on writer's current data file: waiting for writer to wake the reader");
+                debug!("waiting for buffer writer to wake the reader");
                 self.ledger.wait_for_writer().await;
             } else {
                 debug!(
