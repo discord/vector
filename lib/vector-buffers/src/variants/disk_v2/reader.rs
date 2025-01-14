@@ -977,7 +977,7 @@ where
             if self.ledger.is_writer_done() {
                 let total_buffer_size = self.ledger.get_total_buffer_size();
                 if total_buffer_size == 0 {
-                    debug!("buffer writer is done and buffer is empty")
+                    debug!("buffer writer is done and buffer is empty");
                     return Ok(None);
                 }
             }
