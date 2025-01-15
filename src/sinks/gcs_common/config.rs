@@ -3,6 +3,7 @@ use http::{StatusCode, Uri};
 use hyper::Body;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
+use tokio::time::{interval, Duration};
 
 use crate::{
     gcp::{GcpAuthenticator, GcpError},
@@ -111,14 +112,37 @@ pub fn build_healthcheck(
 ) -> crate::Result<Healthcheck> {
     let healthcheck = async move {
         let uri = base_url.parse::<Uri>()?;
-        let mut request = http::Request::head(uri).body(Body::empty())?;
-
-        auth.apply(&mut request);
+        let mut num_retries = 0;
+        let max_retries = 3;
+        // repeat healthcheck every 5 sec
+        let mut interval = interval(Duration::from_secs(5));
+        let mut num_failures = 0;
 
         let not_found_error = GcsError::BucketNotFound { bucket }.into();
 
-        let response = client.send(request).await?;
-        healthcheck_response(response, not_found_error)
+        loop {
+            interval.tick().await;
+            let mut request = http::Request::head(uri.clone()).body(Body::empty())?;
+
+            auth.apply(&mut request);
+
+            let response = client.send(request).await?;
+            num_retries += 1;
+            if response.status().is_success() {
+                // the healthcheck passes on the first success
+                return healthcheck_response(response, not_found_error);
+            } else {
+                // debug the healthcheck response
+                warn!("healthcheck response was not successful! {:#?}", response);
+                num_failures += 1;
+            }
+
+            if num_retries >= max_retries {
+                info!("non-success healthcheck responses = {}", num_failures);
+                info!("total healthcheck attempts = {}", num_retries);
+                return healthcheck_response(response, not_found_error);
+            }
+        }
     };
 
     Ok(healthcheck.boxed())

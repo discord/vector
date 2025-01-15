@@ -1,5 +1,5 @@
 diff --git a/src/gcp.rs b/src/gcp.rs
-index bfc486f92..148fa9dec 100644
+index bfc486f92..baa8e143d 100644
 --- a/src/gcp.rs
 +++ b/src/gcp.rs
 @@ -16,7 +16,7 @@ use hyper::header::AUTHORIZATION;
@@ -10,18 +10,18 @@ index bfc486f92..148fa9dec 100644
 +use tokio::sync::watch;
  use vector_lib::configurable::configurable_component;
  use vector_lib::sensitive_string::SensitiveString;
- 
+
 @@ -25,6 +25,11 @@ use crate::{config::ProxyConfig, http::HttpClient, http::HttpError};
  const SERVICE_ACCOUNT_TOKEN_URL: &str =
      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
- 
+
 +// See https://cloud.google.com/compute/docs/access/authenticate-workloads#applications
 +const METADATA_TOKEN_EXPIRY_MARGIN_SECS: u64 = 200;
 +
 +const METADATA_TOKEN_ERROR_RETRY_SECS: u64 = 2;
 +
  pub const PUBSUB_URL: &str = "https://pubsub.googleapis.com";
- 
+
  pub static PUBSUB_ADDRESS: Lazy<String> = Lazy::new(|| {
 @@ -194,19 +199,25 @@ impl GcpAuthenticator {
      async fn token_regenerator(self, sender: watch::Sender<()>) {
@@ -55,11 +55,15 @@ index bfc486f92..148fa9dec 100644
                      }
                  }
 diff --git a/src/sinks/gcs_common/config.rs b/src/sinks/gcs_common/config.rs
-index 914d780c8..e59a4e8e4 100644
+index 914d780c8..41a657ab8 100644
 --- a/src/sinks/gcs_common/config.rs
 +++ b/src/sinks/gcs_common/config.rs
-@@ -6,7 +6,7 @@ use vector_lib::configurable::configurable_component;
- 
+@@ -3,10 +3,11 @@ use http::{StatusCode, Uri};
+ use hyper::Body;
+ use snafu::Snafu;
+ use vector_lib::configurable::configurable_component;
++use tokio::time::{interval, Duration};
+
  use crate::{
      gcp::{GcpAuthenticator, GcpError},
 -    http::HttpClient,
@@ -67,16 +71,59 @@ index 914d780c8..e59a4e8e4 100644
      sinks::{
          gcs_common::service::GcsResponse,
          util::retries::{RetryAction, RetryLogic},
-@@ -141,7 +141,7 @@ pub struct GcsRetryLogic;
- 
+@@ -111,14 +112,37 @@ pub fn build_healthcheck(
+ ) -> crate::Result<Healthcheck> {
+     let healthcheck = async move {
+         let uri = base_url.parse::<Uri>()?;
+-        let mut request = http::Request::head(uri).body(Body::empty())?;
+-
+-        auth.apply(&mut request);
++        let mut num_retries = 0;
++        let max_retries = 3;
++        // repeat healthcheck every 5 sec
++        let mut interval = interval(Duration::from_secs(5));
++        let mut num_failures = 0;
+
+         let not_found_error = GcsError::BucketNotFound { bucket }.into();
+
+-        let response = client.send(request).await?;
+-        healthcheck_response(response, not_found_error)
++        loop {
++            interval.tick().await;
++            let mut request = http::Request::head(uri.clone()).body(Body::empty())?;
++
++            auth.apply(&mut request);
++
++            let response = client.send(request).await?;
++            num_retries += 1;
++            if response.status().is_success() {
++                // the healthcheck passes on the first success
++                return healthcheck_response(response, not_found_error);
++            } else {
++                // debug the healthcheck response
++                warn!("healthcheck response was not successful! {:#?}", response);
++                num_failures += 1;
++            }
++
++            if num_retries >= max_retries {
++                info!("non-success healthcheck responses = {}", num_failures);
++                info!("total healthcheck attempts = {}", num_retries);
++                return healthcheck_response(response, not_found_error);
++            }
++        }
+     };
+
+     Ok(healthcheck.boxed())
+@@ -141,7 +165,7 @@ pub struct GcsRetryLogic;
+
  // This is a clone of HttpRetryLogic for the Body type, should get merged
  impl RetryLogic for GcsRetryLogic {
 -    type Error = hyper::Error;
 +    type Error = HttpError;
      type Response = GcsResponse;
- 
+
      fn is_retriable_error(&self, _error: &Self::Error) -> bool {
-@@ -159,7 +159,7 @@ impl RetryLogic for GcsRetryLogic {
+@@ -159,7 +183,7 @@ impl RetryLogic for GcsRetryLogic {
              }
              _ if status.is_server_error() => RetryAction::Retry(status.to_string().into()),
              _ if status.is_success() => RetryAction::Successful,
@@ -91,7 +138,7 @@ index 0904a67cb..e3fae07e0 100644
 +++ b/src/sinks/util/http.rs
 @@ -470,6 +470,7 @@ impl RetryLogic for HttpRetryLogic {
          let status = response.status();
- 
+
          match status {
 +            StatusCode::UNAUTHORIZED => RetryAction::Retry("unauthorized".into()),
              StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
