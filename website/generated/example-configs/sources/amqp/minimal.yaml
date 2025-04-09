@@ -1,4 +1,0 @@
-sources:
-  my_source_id:
-    type: amqp
-    connection_string: amqp://user:password@127.0.0.1:5672/%2f?timeout=10

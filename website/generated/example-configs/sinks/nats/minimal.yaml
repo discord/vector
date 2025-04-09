@@ -1,9 +1,0 @@
-sinks:
-  my_sink_id:
-    type: nats
-    inputs:
-      - my-source-or-transform-id
-    encoding:
-      codec: json
-    subject: events-{{ host }}
-    url: nats://demo.nats.io

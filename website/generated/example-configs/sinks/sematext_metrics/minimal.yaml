@@ -1,7 +1,0 @@
-sinks:
-  my_sink_id:
-    type: sematext_metrics
-    inputs:
-      - my-source-or-transform-id
-    default_namespace: service
-    token: ${SEMATEXT_TOKEN}

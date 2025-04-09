@@ -1,7 +1,0 @@
-sinks:
-  my_sink_id:
-    type: elasticsearch
-    inputs:
-      - my-source-or-transform-id
-    endpoints:
-      - http://10.24.32.122:9000

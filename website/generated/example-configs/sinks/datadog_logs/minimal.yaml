@@ -1,5 +1,0 @@
-sinks:
-  my_sink_id:
-    type: datadog_logs
-    inputs:
-      - my-source-or-transform-id

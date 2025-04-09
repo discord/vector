@@ -1,5 +1,0 @@
-sinks:
-  my_sink_id:
-    type: blackhole
-    inputs:
-      - my-source-or-transform-id
