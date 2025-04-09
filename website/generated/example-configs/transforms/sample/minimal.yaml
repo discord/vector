@@ -1,6 +1,0 @@
-transforms:
-  my_transform_id:
-    type: sample
-    inputs:
-      - my-source-or-transform-id
-    ratio: 0.13

@@ -1,9 +1,0 @@
-sinks:
-  my_sink_id:
-    type: aws_cloudwatch_logs
-    inputs:
-      - my-source-or-transform-id
-    encoding:
-      codec: json
-    group_name: group-name
-    stream_name: stream-{{ host }}

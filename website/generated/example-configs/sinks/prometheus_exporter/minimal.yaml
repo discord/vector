@@ -1,5 +1,0 @@
-sinks:
-  my_sink_id:
-    type: prometheus_exporter
-    inputs:
-      - my-source-or-transform-id

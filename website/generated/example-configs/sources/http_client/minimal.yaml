@@ -1,4 +1,0 @@
-sources:
-  my_source_id:
-    type: http_client
-    endpoint: http://127.0.0.1:9898/logs
