@@ -7,12 +7,14 @@ use vector_config::configurable_component;
 
 use super::proto::google::cloud::bigquery::storage::v1 as proto;
 use super::request_builder::{BigqueryRequestBuilder, MAX_BATCH_PAYLOAD_SIZE};
-use super::service::{AuthInterceptor, BigqueryService};
+use super::service::{AuthInterceptor, BigqueryRetryLogic, BigqueryService};
 use super::sink::BigquerySink;
 use crate::config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext};
 use crate::gcp::{GcpAuthConfig, GcpAuthenticator, Scope, BIGQUERY_STORAGE_URL};
 use crate::sinks::util::{BatchConfig, SinkBatchSettings, TowerRequestConfig};
+use crate::sinks::util::service::ServiceBuilderExt;
 use crate::sinks::{Healthcheck, VectorSink};
+use tower::ServiceBuilder;
 
 fn default_endpoint() -> String {
     BIGQUERY_STORAGE_URL.to_string()
@@ -165,7 +167,10 @@ impl SinkConfig for BigqueryConfig {
             .connect_timeout(std::time::Duration::from_secs(10))
             .connect()
             .await?;
-        let service = BigqueryService::with_auth(channel, auth).await?;
+        let request_settings = self.request.into_settings();
+        let service = ServiceBuilder::new()
+            .settings(request_settings, BigqueryRetryLogic)
+            .service(BigqueryService::with_auth(channel, auth).await?);
 
         let batcher_settings = self
             .batch

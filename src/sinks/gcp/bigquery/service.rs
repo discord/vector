@@ -14,6 +14,7 @@ use vector_core::stream::DriverResponse;
 use super::proto::google::cloud::bigquery::storage::v1 as proto;
 use crate::event::{EventFinalizers, Finalizable};
 use crate::gcp::GcpAuthenticator;
+use crate::sinks::util::retries::{RetryAction, RetryLogic};
 
 #[derive(Clone)]
 pub struct AuthInterceptor {
@@ -121,6 +122,27 @@ impl From<tonic::Status> for BigqueryServiceError {
 impl From<Vec<proto::RowError>> for BigqueryServiceError {
     fn from(row_errors: Vec<proto::RowError>) -> Self {
         Self::RowWrite { row_errors }
+    }
+}
+
+#[derive(Clone)]
+pub struct BigqueryRetryLogic;
+
+impl RetryLogic for BigqueryRetryLogic {
+    type Response = BigqueryResponse;
+    type Error = BigqueryServiceError;
+
+    fn is_retriable_error(&self, error: &Self::Error) -> bool {
+        match error {
+            BigqueryServiceError::Transport { .. } => true,
+            BigqueryServiceError::RowWrite { .. } => false,
+            BigqueryServiceError::Request { status } => !matches!(
+                status.code(),
+                tonic::Code::InvalidArgument
+                    | tonic::Code::NotFound
+                    | tonic::Code::AlreadyExists
+            ),
+        }
     }
 }
 

@@ -7,12 +7,13 @@ use vector_core::sink::StreamSink;
 use vector_core::stream::BatcherSettings;
 
 use super::request_builder::BigqueryRequestBuilder;
-use super::service::BigqueryService;
+use super::service::{BigqueryRetryLogic, BigqueryService};
 use crate::sinks::prelude::SinkRequestBuildError;
 use crate::sinks::util::builder::SinkBuilderExt;
+use crate::sinks::util::service::Svc;
 
 pub struct BigquerySink {
-    pub service: BigqueryService,
+    pub service: Svc<BigqueryService, BigqueryRetryLogic>,
     pub batcher_settings: BatcherSettings,
     pub request_builder: BigqueryRequestBuilder,
 }
