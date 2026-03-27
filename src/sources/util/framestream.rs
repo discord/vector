@@ -54,6 +54,7 @@ use crate::{
         util::{
             AfterReadExt,
             net::{MAX_IN_FLIGHT_EVENTS_TARGET, try_bind_tcp_listener},
+            unix::remove_stale_socket,
         },
     },
 };
@@ -710,19 +711,7 @@ pub fn build_framestream_unix_source(
 ) -> crate::Result<Source> {
     let path = frame_handler.socket_path();
 
-    //check if the path already exists (and try to delete it)
-    match fs::metadata(&path) {
-        Ok(_) => {
-            //exists, so try to delete it
-            info!(message = "Deleting file.", ?path);
-            fs::remove_file(&path)?;
-        }
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {} //doesn't exist, do nothing
-        Err(e) => {
-            error!("Unable to get socket information; error = {e:?}.");
-            return Err(Box::new(e));
-        }
-    }
+    remove_stale_socket(&path);
 
     let listener = UnixListener::bind(&path)?;
 
