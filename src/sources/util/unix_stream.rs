@@ -25,7 +25,7 @@ use crate::{
     },
     shutdown::ShutdownSignal,
     sources::util::change_socket_permissions,
-    sources::util::unix::UNNAMED_SOCKET_HOST,
+    sources::util::unix::{remove_stale_socket, UNNAMED_SOCKET_HOST},
     sources::Source,
     SourceSender,
 };
@@ -43,6 +43,8 @@ pub fn build_unix_stream_source(
     out: SourceSender,
 ) -> crate::Result<Source> {
     Ok(Box::pin(async move {
+        remove_stale_socket(&listen_path);
+
         let listener = UnixListener::bind(&listen_path).unwrap_or_else(|e| {
             panic!(
                 "Failed to bind to listener socket at path: {}. Err: {}",
