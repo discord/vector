@@ -18,7 +18,7 @@ use crate::{
     },
     shutdown::ShutdownSignal,
     sources::util::change_socket_permissions,
-    sources::util::unix::UNNAMED_SOCKET_HOST,
+    sources::util::unix::{remove_stale_socket, UNNAMED_SOCKET_HOST},
     sources::Source,
     SourceSender,
 };
@@ -37,6 +37,8 @@ pub fn build_unix_datagram_source(
     out: SourceSender,
 ) -> crate::Result<Source> {
     Ok(Box::pin(async move {
+        remove_stale_socket(&listen_path);
+
         let socket = UnixDatagram::bind(&listen_path).expect("Failed to bind to datagram socket");
         info!(message = "Listening.", path = ?listen_path, r#type = "unix_datagram");
 
