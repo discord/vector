@@ -4,13 +4,18 @@ use indoc::indoc;
 use tonic::transport::Channel;
 use vector_lib::codecs::encoding::ProtobufSerializerConfig;
 use vector_lib::configurable::configurable_component;
+use tower::ServiceBuilder;
 
 use super::proto::google::cloud::bigquery::storage::v1 as proto;
 use super::request_builder::{BigqueryRequestBuilder, MAX_BATCH_PAYLOAD_SIZE};
-use super::service::{AuthInterceptor, BigqueryService};
+use super::service::{
+    AuthInterceptor, BigqueryRequest, BigqueryResponse, BigqueryService, BigqueryServiceError,
+};
 use super::sink::BigquerySink;
 use crate::config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext};
 use crate::gcp::{GcpAuthConfig, GcpAuthenticator, Scope, BIGQUERY_STORAGE_URL};
+use crate::sinks::util::retries::{RetryAction, RetryLogic};
+use crate::sinks::util::service::ServiceBuilderExt;
 use crate::sinks::util::{BatchConfig, SinkBatchSettings, TowerRequestConfig};
 use crate::sinks::{Healthcheck, VectorSink};
 
@@ -166,6 +171,10 @@ impl SinkConfig for BigqueryConfig {
             .connect()
             .await?;
         let service = BigqueryService::with_auth(channel, auth).await?;
+        let request_settings = self.request.into_settings();
+        let service = ServiceBuilder::new()
+            .settings(request_settings, BigqueryRetryLogic)
+            .service(service);
 
         let batcher_settings = self
             .batch
@@ -194,6 +203,36 @@ impl SinkConfig for BigqueryConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BigqueryRetryLogic;
+
+impl RetryLogic for BigqueryRetryLogic {
+    type Error = BigqueryServiceError;
+    type Request = BigqueryRequest;
+    type Response = BigqueryResponse;
+
+    fn is_retriable_error(&self, err: &Self::Error) -> bool {
+        match err {
+            BigqueryServiceError::Transport { .. } => true,
+            BigqueryServiceError::Request { status } => !matches!(
+                status.code(),
+                tonic::Code::InvalidArgument
+                    | tonic::Code::NotFound
+                    | tonic::Code::AlreadyExists
+                    | tonic::Code::PermissionDenied
+                    | tonic::Code::OutOfRange
+                    | tonic::Code::Unimplemented
+                    | tonic::Code::DataLoss
+            ),
+            BigqueryServiceError::RowWrite { .. } => false,
+        }
+    }
+
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
+        response.retry_action()
     }
 }
 

@@ -2,23 +2,30 @@ use futures_util::{
     stream::{self, BoxStream},
     StreamExt,
 };
+use tower::Service;
 use vector_lib::event::Event;
 use vector_lib::sink::StreamSink;
-use vector_lib::stream::BatcherSettings;
+use vector_lib::stream::{BatcherSettings, DriverResponse};
 
 use super::request_builder::BigqueryRequestBuilder;
-use super::service::BigqueryService;
+use super::service::BigqueryRequest;
 use crate::sinks::prelude::SinkRequestBuildError;
 use crate::sinks::util::builder::SinkBuilderExt;
 
-pub struct BigquerySink {
-    pub service: BigqueryService,
+pub struct BigquerySink<S> {
+    pub service: S,
     pub batcher_settings: BatcherSettings,
     pub request_builder: BigqueryRequestBuilder,
 }
 
-impl BigquerySink {
-    async fn run_inner(self: Box<BigquerySink>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+impl<S> BigquerySink<S>
+where
+    S: Service<BigqueryRequest> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Response: DriverResponse + Send + 'static,
+    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
+{
+    async fn run_inner(self: Box<BigquerySink<S>>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         input
             .batched(self.batcher_settings.as_byte_size_config())
             .incremental_request_builder(self.request_builder)
@@ -40,7 +47,13 @@ impl BigquerySink {
 }
 
 #[async_trait::async_trait]
-impl StreamSink<Event> for BigquerySink {
+impl<S> StreamSink<Event> for BigquerySink<S>
+where
+    S: Service<BigqueryRequest> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Response: DriverResponse + Send + 'static,
+    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
+{
     async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         self.run_inner(input).await
     }

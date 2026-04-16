@@ -14,6 +14,7 @@ use vector_lib::stream::DriverResponse;
 use super::proto::google::cloud::bigquery::storage::v1 as proto;
 use crate::event::{EventFinalizers, Finalizable};
 use crate::gcp::GcpAuthenticator;
+use crate::sinks::util::retries::RetryAction;
 
 #[derive(Clone)]
 pub struct AuthInterceptor {
@@ -32,6 +33,7 @@ impl Interceptor for AuthInterceptor {
     }
 }
 
+#[derive(Clone)]
 pub struct BigqueryRequest {
     pub request: proto::AppendRowsRequest,
     pub metadata: RequestMetadata,
@@ -60,6 +62,31 @@ pub struct BigqueryResponse {
     body: proto::AppendRowsResponse,
     request_byte_size: GroupedCountByteSize,
     request_uncompressed_size: usize,
+}
+
+impl BigqueryResponse {
+    pub fn retry_action<R>(&self) -> RetryAction<R> {
+        if !self.body.row_errors.is_empty() {
+            return RetryAction::DontRetry("row-level errors".into());
+        }
+        match &self.body.response {
+            None => RetryAction::DontRetry("empty response".into()),
+            Some(proto::append_rows_response::Response::AppendResult(_)) => {
+                RetryAction::Successful
+            }
+            Some(proto::append_rows_response::Response::Error(status)) => {
+                match tonic::Code::from(status.code) {
+                    tonic::Code::Ok => RetryAction::Successful,
+                    tonic::Code::InvalidArgument
+                    | tonic::Code::NotFound
+                    | tonic::Code::AlreadyExists => {
+                        RetryAction::DontRetry("permanent error".into())
+                    }
+                    _ => RetryAction::Retry("retriable BigQuery error".into()),
+                }
+            }
+        }
+    }
 }
 
 impl DriverResponse for BigqueryResponse {
@@ -128,6 +155,7 @@ type BigQueryWriteClient = proto::big_query_write_client::BigQueryWriteClient<
     InterceptedService<tonic::transport::Channel, AuthInterceptor>,
 >;
 
+#[derive(Clone)]
 pub struct BigqueryService {
     service: BigQueryWriteClient,
 }
