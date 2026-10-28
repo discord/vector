@@ -1,18 +1,18 @@
 mod optional_path;
 
-pub use optional_path::{OptionalTargetPath, OptionalValuePath};
 use std::fmt;
-use vector_config_macros::configurable_component;
 
+pub use optional_path::{OptionalTargetPath, OptionalValuePath};
+use vector_config_macros::configurable_component;
 pub use vrl::path::{
-    parse_target_path, parse_value_path, BorrowedSegment, OwnedSegment, OwnedTargetPath,
-    OwnedValuePath, PathConcat, PathParseError, PathPrefix, TargetPath, ValuePath,
+    BorrowedSegment, OwnedSegment, OwnedTargetPath, OwnedValuePath, PathConcat, PathParseError,
+    PathPrefix, TargetPath, ValuePath, parse_target_path, parse_value_path,
 };
 use vrl::value::KeyString;
 
 /// A wrapper around `OwnedValuePath` that allows it to be used in Vector config.
 /// This requires a valid path to be used. If you want to allow optional paths,
-/// use [optional_path::OptionalValuePath].
+/// use [`optional_path::OptionalValuePath`].
 #[configurable_component]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]

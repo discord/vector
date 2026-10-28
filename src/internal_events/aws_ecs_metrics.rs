@@ -1,19 +1,19 @@
 use std::borrow::Cow;
 
-use metrics::counter;
 use vector_lib::{
-    internal_event::{error_stage, error_type, InternalEvent},
+    NamedInternalEvent, counter,
+    internal_event::{CounterName, InternalEvent, error_stage, error_type},
     json_size::JsonSize,
 };
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct AwsEcsMetricsEventsReceived<'a> {
     pub byte_size: JsonSize,
     pub count: usize,
     pub endpoint: &'a str,
 }
 
-impl<'a> InternalEvent for AwsEcsMetricsEventsReceived<'a> {
+impl InternalEvent for AwsEcsMetricsEventsReceived<'_> {
     fn emit(self) {
         trace!(
             message = "Events received.",
@@ -23,26 +23,26 @@ impl<'a> InternalEvent for AwsEcsMetricsEventsReceived<'a> {
             endpoint = %self.endpoint,
         );
         counter!(
-            "component_received_events_total",
+            CounterName::ComponentReceivedEventsTotal,
             "endpoint" => self.endpoint.to_string(),
         )
         .increment(self.count as u64);
         counter!(
-            "component_received_event_bytes_total",
+            CounterName::ComponentReceivedEventBytesTotal,
             "endpoint" => self.endpoint.to_string(),
         )
         .increment(self.byte_size.get() as u64);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct AwsEcsMetricsParseError<'a> {
     pub error: serde_json::Error,
     pub endpoint: &'a str,
     pub body: Cow<'a, str>,
 }
 
-impl<'a> InternalEvent for AwsEcsMetricsParseError<'a> {
+impl InternalEvent for AwsEcsMetricsParseError<'_> {
     fn emit(self) {
         error!(
             message = "Parsing error.",
@@ -50,16 +50,15 @@ impl<'a> InternalEvent for AwsEcsMetricsParseError<'a> {
             error = ?self.error,
             stage = error_stage::PROCESSING,
             error_type = error_type::PARSER_FAILED,
-            internal_log_rate_limit = true,
         );
         debug!(
-            message = %format!("Failed to parse response:\\n\\n{}\\n\\n", self.body.escape_debug()),
+            response = %self.body.escape_debug(),
             endpoint = %self.endpoint,
-            internal_log_rate_limit = true,
+            "Failed to parse response.",
         );
-        counter!("parse_errors_total").increment(1);
+        counter!(CounterName::ParseErrorsTotal).increment(1);
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "stage" => error_stage::PROCESSING,
             "error_type" => error_type::PARSER_FAILED,
             "endpoint" => self.endpoint.to_string(),

@@ -1,9 +1,7 @@
 use darling::util::path_to_string;
 use proc_macro::TokenStream;
-
 use quote::quote;
-use syn::{parse_macro_input, spanned::Spanned, Attribute, DeriveInput, Error, LitStr};
-use vector_config_common::configurable_package_name_hack;
+use syn::{Attribute, DeriveInput, Error, LitStr, parse_macro_input, spanned::Spanned};
 
 use crate::attrs::{self, path_matches};
 
@@ -90,13 +88,12 @@ pub fn derive_component_name_impl(input: TokenStream) -> TokenStream {
 
     // We have a single, valid component name, so let's actually spit out our derive.
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let vector_config = configurable_package_name_hack();
     let derived = quote! {
         impl #impl_generics #ident #ty_generics #where_clause {
             pub(super) const NAME: &'static str = #component_name;
         }
 
-        impl #impl_generics #vector_config::NamedComponent for #ident #ty_generics #where_clause {
+        impl #impl_generics ::vector_config::NamedComponent for #ident #ty_generics #where_clause {
             fn get_component_name(&self) -> &'static str {
                 #component_name
             }
@@ -110,7 +107,9 @@ fn attr_to_component_name(attr: &Attribute) -> Result<Option<String>, Error> {
     if !path_matches(
         attr.path(),
         &[
+            attrs::API_COMPONENT,
             attrs::ENRICHMENT_TABLE_COMPONENT,
+            attrs::GLOBAL_OPTION_COMPONENT,
             attrs::PROVIDER_COMPONENT,
             attrs::SINK_COMPONENT,
             attrs::SOURCE_COMPONENT,
@@ -134,8 +133,7 @@ fn attr_to_component_name(attr: &Attribute) -> Result<Option<String>, Error> {
         return Err(Error::new(
             attr.span(),
             format!(
-                "{}s must have a name specified (e.g. `{}(\"my_component\")`)",
-                component_type, component_type_attr
+                "{component_type}s must have a name specified (e.g. `{component_type_attr}(\"my_component\")`)"
             ),
         ));
     }
@@ -147,8 +145,7 @@ fn attr_to_component_name(attr: &Attribute) -> Result<Option<String>, Error> {
             Error::new(
                 attr.span(),
                 format!(
-                    "expected a string literal for the {} name (i.e. `{}(\"...\")`)",
-                    component_type, component_type_attr
+                    "expected a string literal for the {component_type} name (i.e. `{component_type_attr}(\"...\")`)"
                 ),
             )
         })
@@ -178,13 +175,15 @@ fn check_component_name_validity(component_name: &str) -> Result<(), String> {
     // have an example string to show in the error to explain what the user needs to specify.
     let component_name_converted = component_name
         .chars()
-        .flat_map(|c| c.to_lowercase())
-        .map(|c| if !c.is_ascii_alphanumeric() { '_' } else { c })
+        .flat_map(char::to_lowercase)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect::<String>();
 
     if component_name == component_name_converted {
         Ok(())
     } else {
-        Err(format!("component names must be lowercase, and contain only letters, numbers, and underscores (e.g. \"{}\")", component_name_converted))
+        Err(format!(
+            "component names must be lowercase, and contain only letters, numbers, and underscores (e.g. \"{component_name_converted}\")"
+        ))
     }
 }

@@ -1,16 +1,47 @@
-use crate::gelf::GELF_TARGET_PATHS;
-use crate::{gelf_fields::*, VALID_FIELD_REGEX};
+use crate::{
+    VALID_FIELD_REGEX,
+    encoding::GelfChunker,
+    gelf::GELF_TARGET_PATHS,
+    gelf_fields::{
+        FACILITY, FILE, FULL_MESSAGE, GELF_VERSION, HOST, LEVEL, LINE, SHORT_MESSAGE, TIMESTAMP,
+        VERSION,
+    },
+};
 use bytes::{BufMut, BytesMut};
 use lookup::event_path;
 use ordered_float::NotNan;
-use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use tokio_util::codec::Encoder;
+use vector_config_macros::configurable_component;
 use vector_core::{
-    config::{log_schema, DataType},
+    config::{DataType, log_schema},
     event::{Event, KeyString, LogEvent, Value},
     schema,
 };
+
+/// Config used to build a `GelfSerializer`.
+#[configurable_component]
+#[derive(Debug, Clone)]
+pub struct GelfSerializerOptions {
+    /// Maximum size for each GELF chunked datagram (including 12-byte header).
+    /// Chunking starts when datagrams exceed this size.
+    /// For Graylog target, keep at or below 8192 bytes; for Vector target (`gelf` decoding with `chunked_gelf` framing), up to 65,500 bytes is recommended.
+    #[configurable(validation(range(min = 13)))]
+    #[serde(default = "default_max_chunk_size")]
+    pub max_chunk_size: usize,
+}
+
+const fn default_max_chunk_size() -> usize {
+    8192
+}
+
+impl Default for GelfSerializerOptions {
+    fn default() -> Self {
+        Self {
+            max_chunk_size: default_max_chunk_size(),
+        }
+    }
+}
 
 /// On GELF encoding behavior:
 ///   Graylog has a relaxed parsing. They are much more lenient than the spec would
@@ -19,12 +50,18 @@ use vector_core::{
 ///   of vector will still work.
 ///   The exception is that if 'Additional fields' are found to be missing an underscore prefix and
 ///   are otherwise valid field names, we prepend the underscore.
-
+///
 /// Errors that can occur during GELF serialization.
 #[derive(Debug, Snafu)]
 pub enum GelfSerializerError {
     #[snafu(display(r#"LogEvent does not contain required field: "{}""#, field))]
     MissingField { field: KeyString },
+    #[snafu(display(
+        r#"LogEvent contains field with invalid name not matching pattern '{}': "{}""#,
+        pattern,
+        field,
+    ))]
+    InvalidField { field: KeyString, pattern: String },
     #[snafu(display(
         r#"LogEvent contains a value with an invalid type. field = "{}" type = "{}" expected type = "{}""#,
         field,
@@ -39,27 +76,36 @@ pub enum GelfSerializerError {
 }
 
 /// Config used to build a `GelfSerializer`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct GelfSerializerConfig;
+#[configurable_component]
+#[derive(Debug, Clone, Default)]
+pub struct GelfSerializerConfig {
+    /// The GELF Serializer Options.
+    #[serde(default, rename = "gelf")]
+    pub options: GelfSerializerOptions,
+}
 
 impl GelfSerializerConfig {
     /// Creates a new `GelfSerializerConfig`.
-    pub const fn new() -> Self {
-        Self
+    #[must_use]
+    pub const fn new(options: GelfSerializerOptions) -> Self {
+        Self { options }
     }
 
     /// Build the `GelfSerializer` from this configuration.
+    #[must_use]
     pub fn build(&self) -> GelfSerializer {
-        GelfSerializer::new()
+        GelfSerializer::new(self.options.clone())
     }
 
     /// The data type of events that are accepted by `GelfSerializer`.
-    pub fn input_type() -> DataType {
+    #[must_use]
+    pub fn input_type(&self) -> DataType {
         DataType::Log
     }
 
     /// The schema required by the serializer.
-    pub fn schema_requirement() -> schema::Requirement {
+    #[must_use]
+    pub fn schema_requirement(&self) -> schema::Requirement {
         // While technically we support `Value` variants that can't be losslessly serialized to
         // JSON, we don't want to enforce that limitation to users yet.
         schema::Requirement::empty()
@@ -69,25 +115,35 @@ impl GelfSerializerConfig {
 /// Serializer that converts an `Event` to bytes using the GELF format.
 /// Spec: <https://docs.graylog.org/docs/gelf>
 #[derive(Debug, Clone)]
-pub struct GelfSerializer;
+pub struct GelfSerializer {
+    options: GelfSerializerOptions,
+}
 
 impl GelfSerializer {
     /// Creates a new `GelfSerializer`.
-    pub fn new() -> Self {
-        GelfSerializer
+    #[must_use]
+    pub fn new(options: GelfSerializerOptions) -> Self {
+        GelfSerializer { options }
     }
 
     /// Encode event and represent it as JSON value.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "The codec API error documentation needs a separate audit."
+    )]
     pub fn to_json_value(&self, event: Event) -> Result<serde_json::Value, vector_common::Error> {
         // input_type() restricts the event type to LogEvents
         let log = to_gelf_event(event.into_log())?;
         serde_json::to_value(&log).map_err(|e| e.to_string().into())
     }
-}
 
-impl Default for GelfSerializer {
-    fn default() -> Self {
-        Self::new()
+    /// Instantiates the GELF chunking configuration.
+    #[must_use]
+    pub fn chunker(&self) -> GelfChunker {
+        GelfChunker {
+            max_chunk_size: self.options.max_chunk_size,
+        }
     }
 }
 
@@ -135,19 +191,24 @@ fn coerce_required_fields(mut log: LogEvent) -> vector_common::Result<LogEvent> 
         err_missing_field(HOST)?;
     }
 
-    if !log.contains(&GELF_TARGET_PATHS.short_message) {
-        if let Some(message_key) = log_schema().message_key_target_path() {
-            if log.contains(message_key) {
-                log.rename_key(message_key, &GELF_TARGET_PATHS.short_message);
-            } else {
-                err_missing_field(SHORT_MESSAGE)?;
-            }
+    if !log.contains(&GELF_TARGET_PATHS.short_message)
+        && let Some(message_key) = log_schema().message_key_target_path()
+    {
+        if log.contains(message_key) {
+            log.rename_key(message_key, &GELF_TARGET_PATHS.short_message);
+        } else {
+            err_missing_field(SHORT_MESSAGE)?;
         }
     }
     Ok(log)
 }
 
 /// Validates rules for field names and value types, coercing in some cases.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Preserve the existing floating-point representation of numeric values."
+)]
 fn coerce_field_names_and_values(
     mut log: LogEvent,
 ) -> vector_common::Result<(LogEvent, Vec<String>)> {
@@ -169,11 +230,15 @@ fn coerce_field_names_and_values(
                     if let Value::Timestamp(ts) = value {
                         let ts_millis = ts.timestamp_millis();
                         if ts_millis % 1000 != 0 {
-                            *value = Value::Float(NotNan::new(ts_millis as f64 / 1000.0).unwrap());
+                            // i64 to f64 / 1000.0 will never be NaN
+                            *value = Value::Float(
+                                NotNan::new(ts_millis as f64 / 1000.0)
+                                    .expect("i64 -> f64 produced NaN"),
+                            );
                         } else {
                             // keep full range of representable time if no milliseconds are set
                             // but still convert to numeric according to GELF protocol
-                            *value = Value::Integer(ts.timestamp())
+                            *value = Value::Integer(ts.timestamp());
                         }
                     }
                 }
@@ -190,8 +255,9 @@ fn coerce_field_names_and_values(
                 _ => {
                     // additional fields must be only word chars, dashes and periods.
                     if !VALID_FIELD_REGEX.is_match(field) {
-                        return MissingFieldSnafu {
+                        return InvalidFieldSnafu {
                             field: field.clone(),
+                            pattern: VALID_FIELD_REGEX.to_string(),
                         }
                         .fail()
                         .map_err(|e| e.to_string().into());
@@ -236,16 +302,18 @@ fn to_gelf_event(log: LogEvent) -> vector_common::Result<LogEvent> {
 
 #[cfg(test)]
 mod tests {
-    use crate::encoding::SerializerConfig;
-
-    use super::*;
     use chrono::NaiveDateTime;
     use vector_core::event::{Event, EventMetadata};
-    use vrl::btreemap;
-    use vrl::value::{ObjectMap, Value};
+    use vrl::{
+        btreemap,
+        value::{ObjectMap, Value},
+    };
+
+    use super::*;
+    use crate::encoding::SerializerConfig;
 
     fn do_serialize(expect_success: bool, event_fields: ObjectMap) -> Option<serde_json::Value> {
-        let config = GelfSerializerConfig::new();
+        let config = GelfSerializerConfig::new(GelfSerializerOptions::default());
         let mut serializer = config.build();
         let event: Event = LogEvent::from_map(event_fields, EventMetadata::default()).into();
         let mut buffer = BytesMut::new();
@@ -264,7 +332,9 @@ mod tests {
 
     #[test]
     fn gelf_serde_json_to_value_supported_success() {
-        let serializer = SerializerConfig::Gelf.build().unwrap();
+        let serializer = SerializerConfig::Gelf(GelfSerializerConfig::default())
+            .build()
+            .unwrap();
 
         let event_fields = btreemap! {
             VERSION => "1.1",
@@ -279,7 +349,9 @@ mod tests {
 
     #[test]
     fn gelf_serde_json_to_value_supported_failure_to_encode() {
-        let serializer = SerializerConfig::Gelf.build().unwrap();
+        let serializer = SerializerConfig::Gelf(GelfSerializerConfig::default())
+            .build()
+            .unwrap();
         let event_fields = btreemap! {};
         let log_event: Event = LogEvent::from_map(event_fields, EventMetadata::default()).into();
         assert!(serializer.supports_json());
@@ -335,6 +407,11 @@ mod tests {
     }
 
     #[test]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::float_cmp,
+        reason = "Assert the exact floating-point value produced by this serialization fixture."
+    )]
     fn gelf_serializing_timestamp() {
         // floating point in case of sub second timestamp
         {

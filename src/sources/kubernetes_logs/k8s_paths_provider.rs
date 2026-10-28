@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use k8s_openapi::api::core::v1::{Namespace, Pod};
-use kube::runtime::reflector::{store::Store, ObjectRef};
+use kube::runtime::reflector::{ObjectRef, store::Store};
 use vector_lib::file_source::paths_provider::PathsProvider;
 
 use super::path_helpers::build_pod_logs_directory;
@@ -18,21 +18,24 @@ pub struct K8sPathsProvider {
     namespace_state: Store<Namespace>,
     include_paths: Vec<glob::Pattern>,
     exclude_paths: Vec<glob::Pattern>,
+    insert_namespace_fields: bool,
 }
 
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
-    pub fn new(
+    pub const fn new(
         pod_state: Store<Pod>,
         namespace_state: Store<Namespace>,
         include_paths: Vec<glob::Pattern>,
         exclude_paths: Vec<glob::Pattern>,
+        insert_namespace_fields: bool,
     ) -> Self {
         Self {
             pod_state,
             namespace_state,
             include_paths,
             exclude_paths,
+            insert_namespace_fields,
         }
     }
 }
@@ -47,7 +50,12 @@ impl PathsProvider for K8sPathsProvider {
             .into_iter()
             // filter out pods where we haven't fetched the namespace metadata yet
             // they will be picked up on a later run
+            // Only check namespace metadata if insert_namespace_fields is enabled
             .filter(|pod| {
+                if !self.insert_namespace_fields {
+                    // Skip namespace metadata check when namespace fields are disabled
+                    return true;
+                }
                 trace!(message = "Verifying Namespace metadata for pod.", pod = ?pod.metadata.name);
                 if let Some(namespace) = pod.metadata.namespace.as_ref() {
                     self.namespace_state
@@ -120,7 +128,7 @@ fn extract_excluded_containers_for_pod(pod: &Pod) -> impl Iterator<Item = &str> 
                 Some(value)
             })
             .flat_map(|containers| containers.split(','))
-            .map(|container| container.trim())
+            .map(str::trim)
     })
 }
 
@@ -171,7 +179,7 @@ where
         })
 }
 
-fn real_glob(pattern: &str) -> impl Iterator<Item = PathBuf> {
+fn real_glob(pattern: &str) -> impl Iterator<Item = PathBuf> + use<> {
     glob::glob_with(
         pattern,
         glob::MatchOptions {
@@ -180,7 +188,7 @@ fn real_glob(pattern: &str) -> impl Iterator<Item = PathBuf> {
         },
     )
     .expect("the pattern is supposed to always be correct")
-    .flat_map(|paths| paths.into_iter())
+    .flat_map(IntoIterator::into_iter)
 }
 
 fn filter_paths<'a>(
@@ -198,11 +206,7 @@ fn filter_paths<'a>(
                 },
             )
         });
-        if include {
-            m
-        } else {
-            !m
-        }
+        if include { m } else { !m }
     })
 }
 
@@ -455,7 +459,7 @@ mod tests {
 
             let actual_paths: Vec<_> = list_pod_log_paths(mock_glob, &pod).collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
-            assert_eq!(actual_paths, expected_paths)
+            assert_eq!(actual_paths, expected_paths);
         }
     }
 
@@ -528,7 +532,7 @@ mod tests {
                 actual_paths, expected_paths,
                 "failed for patterns {:?}",
                 &str_patterns
-            )
+            );
         }
     }
 
@@ -580,7 +584,7 @@ mod tests {
                 actual_paths, expected_paths,
                 "failed for patterns {:?}",
                 &str_patterns
-            )
+            );
         }
     }
 
@@ -622,7 +626,7 @@ mod tests {
                 actual_patterns, expected_patterns,
                 "failed for dir {:?} and containers {:?}",
                 &pod_logs_dir, &containers,
-            )
+            );
         }
     }
 }

@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 use vector_lib::configurable::configurable_component;
+use vector_vrl_metrics::MetricsStorage;
 
 use crate::event::Event;
 
@@ -9,8 +10,10 @@ pub(crate) mod is_metric;
 pub(crate) mod is_trace;
 mod vrl;
 
-pub use self::datadog_search::{DatadogSearchConfig, DatadogSearchRunner};
-pub use self::vrl::VrlConfig;
+pub use self::{
+    datadog_search::{DatadogSearchConfig, DatadogSearchRunner},
+    vrl::VrlConfig,
+};
 use self::{
     is_log::{check_is_log, check_is_log_with_context},
     is_metric::{check_is_metric, check_is_metric_with_context},
@@ -51,7 +54,6 @@ impl Condition {
     /// Checks if a condition is true.
     ///
     /// The event should not be modified, it is only mutable so it can be passed into VRL, but VRL type checking prevents mutation.
-    #[allow(dead_code)]
     pub fn check(&self, e: Event) -> (bool, Event) {
         match self {
             Condition::IsLog => check_is_log(e),
@@ -68,6 +70,8 @@ impl Condition {
     ///
     /// This can be mildly expensive for conditions that do not often match, as it allocates a string for the error
     /// case. As such, it should typically be avoided in hot paths.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::match_same_arms, reason = "Preserve branch-specific context")]
     pub(crate) fn check_with_context(&self, e: Event) -> (Result<(), String>, Event) {
         match self {
             Condition::IsLog => check_is_log_with_context(e),
@@ -116,16 +120,19 @@ pub enum ConditionConfig {
 }
 
 impl ConditionConfig {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn build(
         &self,
         enrichment_tables: &vector_lib::enrichment::TableRegistry,
+        metrics_storage: &MetricsStorage,
     ) -> crate::Result<Condition> {
         match self {
             ConditionConfig::IsLog => Ok(Condition::IsLog),
             ConditionConfig::IsMetric => Ok(Condition::IsMetric),
             ConditionConfig::IsTrace => Ok(Condition::IsTrace),
-            ConditionConfig::Vrl(x) => x.build(enrichment_tables),
-            ConditionConfig::DatadogSearch(x) => x.build(enrichment_tables),
+            ConditionConfig::Vrl(x) => x.build(enrichment_tables, metrics_storage),
+            ConditionConfig::DatadogSearch(x) => x.build(enrichment_tables, metrics_storage),
         }
     }
 }
@@ -151,9 +158,12 @@ pub trait Conditional: std::fmt::Debug {
 }
 
 pub trait ConditionalConfig: std::fmt::Debug + Send + Sync + dyn_clone::DynClone {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     fn build(
         &self,
         enrichment_tables: &vector_lib::enrichment::TableRegistry,
+        metrics_storage: &MetricsStorage,
     ) -> crate::Result<Condition>;
 }
 
@@ -190,9 +200,16 @@ pub enum AnyCondition {
 }
 
 impl AnyCondition {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::default_trait_access,
+        reason = "Preserve inferred default types"
+    )]
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn build(
         &self,
         enrichment_tables: &vector_lib::enrichment::TableRegistry,
+        metrics_storage: &MetricsStorage,
     ) -> crate::Result<Condition> {
         match self {
             AnyCondition::String(s) => {
@@ -200,10 +217,20 @@ impl AnyCondition {
                     source: s.clone(),
                     runtime: Default::default(),
                 };
-                vrl_config.build(enrichment_tables)
+                vrl_config.build(enrichment_tables, metrics_storage)
             }
-            AnyCondition::Map(m) => m.build(enrichment_tables),
+            AnyCondition::Map(m) => m.build(enrichment_tables, metrics_storage),
         }
+    }
+
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
+    pub fn validate(
+        &self,
+        enrichment_tables: &vector_lib::enrichment::TableRegistry,
+        metrics_storage: &MetricsStorage,
+    ) -> crate::Result<()> {
+        self.build(enrichment_tables, metrics_storage).map(|_| ())
     }
 }
 
@@ -227,24 +254,25 @@ mod tests {
 
     #[test]
     fn deserialize_anycondition_default() {
-        let conf: Test = toml::from_str(r#"condition = ".nork == false""#).unwrap();
+        let conf: Test = serde_yaml::from_str(r#"condition: ".nork == false""#).unwrap();
         assert_eq!(
             r#"String(".nork == false")"#,
             format!("{:?}", conf.condition)
-        )
+        );
     }
 
     #[test]
     fn deserialize_anycondition_vrl() {
-        let conf: Test = toml::from_str(indoc! {r#"
-            condition.type = "vrl"
-            condition.source = '.nork == true'
-        "#})
+        let conf: Test = serde_yaml::from_str(indoc! {"
+            condition:
+              type: vrl
+              source: '.nork == true'
+        "})
         .unwrap();
 
         assert_eq!(
             r#"Map(Vrl(VrlConfig { source: ".nork == true", runtime: Ast }))"#,
             format!("{:?}", conf.condition)
-        )
+        );
     }
 }

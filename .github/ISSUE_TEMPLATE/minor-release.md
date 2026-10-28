@@ -5,50 +5,52 @@ title: "Vector [version] release"
 labels: "domain: releasing"
 ---
 
-The week before the release:
+# Prepare the release
 
-- [ ] Check for any outstanding deprecation actions in [DEPRECATIONS.md](docs/DEPRECATIONS.md) and
-      take them (or have someone help you take them)
-- [ ] Create a new release branch from master to freeze commits
-  - `git fetch && git checkout origin/master && git checkout -b v0.<new version number> && git push -u`
-- [ ] Create a new release preparation branch from `master`
-  - `git checkout -b prepare-v0.<new version number> && git push -u`
-- [ ] Check if there is a newer version of Alpine or Debian available to update the release images
-      in `distribution/docker/`. Update if so.
-- [ ] Run `cargo vdev build release-cue` to generate a new cue file for the release
-  - [ ] Add description key to the generated cue file with a description of the release (see
-        previous releases for examples).
-  - [ ] Ensure any breaking changes are highlighted in the release upgrade guide
-  - [ ] Ensure any deprecations are highlighted in the release upgrade guide
-- [ ] Update version number in `website/cue/reference/administration/interfaces/kubectl.cue`
-- [ ] Update version number in `distribution/install.sh`
-- [ ] Add new version to `website/cue/reference/versions.cue`
-- [ ] Create new release md file by copying an existing one in `./website/content/en/releases/` and
-      updating version number
-- [ ] Commit these changes
-- [ ] Open PR against the release branch (`v0.<new version number>`) for review
-- [ ] PR approval
+This checklist is for stable minor releases. Set the version for the commands below:
 
-On the day of release:
+```shell
+export NEW_VECTOR_VERSION=0.59.0 # Replace with the version being released.
+export RELEASE_BRANCH="v${NEW_VECTOR_VERSION%.*}"
+```
 
-- [ ] Rebase the release preparation branch on the release branch
-    - [ ] Squash the release preparation commits (but not the cherry-picked commits!) to a single
-        commit. This makes it easier to cherry-pick to master after the release. 
-    - [ ] Ensure release date in cue matches current date.
-- [ ] Merge release preparation branch into the release branch
-    - `git co v0.<new version number> && git merge --ff-only prepare-v0.<new version number>`
-- [ ] Tag new release
-  - [ ] `git tag v0.<minor>.0 -a -m v0.<minor>.0`
-  - [ ] `git push origin v0.<minor>.0`
-- [ ] Wait for release workflow to complete
-  - Discoverable via [https://github.com/timberio/vector/actions/workflows/release.yml](https://github.com/timberio/vector/actions/workflows/release.yml)
-- [ ] Release Linux packages. See [`vector-release` usage](https://github.com/DataDog/vector-release#usage).
-- [ ] Release updated Helm chart. See [releasing Helm chart](https://github.com/vectordotdev/helm-charts#releasing).
-- [ ] Once Helm chart is released, updated Vector manifests
-    - Run `cargo vdev build manifests` and open a PR with changes
-- [ ] Add docker images to [https://github.com/DataDog/images](https://github.com/DataDog/images/tree/master/vector) to have them available internally.
-- [ ] Cherry-pick any release commits from the release branch that are not on `master`, to `master`
-- [ ] Bump the release number in the `Cargo.toml` on master to the next major release
-- [ ] Reset the `website` branch to the `HEAD` of the release branch to update https://vector.dev
-  - [ ] `git checkout website && git reset --hard origin/v0.<new version number> && git push`
-- [ ] Kick-off post-mortems for any regressions resolved by the release
+- [ ] Cut a new release of [VRL](https://github.com/vectordotdev/vrl) if needed.
+  - VRL release steps: https://github.com/vectordotdev/vrl/blob/main/release/README.md
+- [ ] Run the [Prepare release](https://github.com/vectordotdev/vector/actions/workflows/release_prepare.yml)
+      workflow from `master` with `version` set to the stable Vector version and `vrl_version` to the exact released VRL version.
+  - The workflow activates the `RELEASE_FREEZE_RULESET_ID` ruleset and grants `vectordotdev-bot` an **Always** bypass
+    to some of `master`'s rulesets (`RELEASE_FREEZE_BOT_BYPASS`).
+  - If preparation fails after activation, the freeze remains active. Retry, or run
+    [Unfreeze master](https://github.com/vectordotdev/vector/actions/workflows/release_unfreeze.yml)
+    with `workflow_dispatch` to unfreeze the repository.
+- [ ] Review the bot-authored `prepare-v-<major>-<minor>-<patch>-website` PR: edit the release description,
+      changelog, upgrade guidance, and release date as needed. Review deprecations with
+      `cargo vdev deprecation show --version "${NEW_VECTOR_VERSION}"`.
+
+Keep the freeze active until **both** the release workflow has pushed its post-release housekeeping
+to `master` **and** the Kubernetes manifests push below has completed. Maintainers with
+bypass access must also respect this window: do not merge unrelated PRs into `master`.
+[Unfreeze master](https://github.com/vectordotdev/vector/actions/workflows/release_unfreeze.yml)
+closes the window automatically once both are done.
+
+# Publish the release
+
+- [ ] On release day, squash-merge the approved preparation PR directly into `master` using admin
+      permissions (`Merge without waiting for requirements to be met (bypass rules)`). Do not use the merge queue.
+
+The merge kicks off the [Tag approved release](https://github.com/vectordotdev/vector/actions/workflows/release_autotag.yml)
+workflow, which creates the version tag and release branch at that exact commit.
+The tag starts the release workflow; do not create the tag or release branch manually.
+
+- [ ] Wait for [release workflow](https://github.com/vectordotdev/vector/actions/workflows/release.yml) to complete.
+  - If it fails, use **Re-run failed jobs** to continue the release.
+- [ ] Confirm that the release changelog was published to https://vector.dev/releases/
+  - Refer to the internal releasing doc to monitor the deployment.
+- [ ] Confirm that [Homebrew](https://github.com/vectordotdev/homebrew-brew) was released ([workflow](https://github.com/vectordotdev/homebrew-brew/actions/workflows/release.yml))
+- [ ] Release Linux packages. Refer to the internal releasing doc.
+
+- [ ] Wait for the Helm chart [Post Release](https://github.com/vectordotdev/helm-charts/actions/workflows/release-post.yml) to complete.
+  - See [releasing Helm chart](https://github.com/vectordotdev/helm-charts/blob/develop/RELEASING.md).
+
+- [ ] Wait for the Helm chart release to push the Kubernetes manifests directly to `master` ([workflow](https://github.com/vectordotdev/vector/actions/workflows/release_manifests.yml)).
+- [ ] Wait for the [Unfreeze master](https://github.com/vectordotdev/vector/actions/workflows/release_unfreeze.yml) workflow to finalize the release.

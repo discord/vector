@@ -1,13 +1,14 @@
 use std::{
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
+    time::Duration,
 };
 
-use futures_util::{stream::Fuse, Stream, StreamExt};
+use futures_util::{Stream, StreamExt, stream::Fuse};
 use pin_project::pin_project;
 use vector_lib::event::Metric;
 
-use super::buffer::metrics::{MetricNormalize, MetricNormalizer};
+use crate::sinks::util::buffer::metrics::{MetricNormalize, MetricNormalizer};
 
 #[pin_project]
 pub struct Normalizer<St, N>
@@ -27,6 +28,13 @@ where
         Self {
             stream: stream.fuse(),
             normalizer: MetricNormalizer::from(normalizer),
+        }
+    }
+
+    pub fn new_with_ttl(stream: St, normalizer: N, ttl: Duration) -> Self {
+        Self {
+            stream: stream.fuse(),
+            normalizer: MetricNormalizer::with_ttl(normalizer, ttl),
         }
     }
 }
@@ -50,5 +58,28 @@ where
                 None => return Poll::Ready(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::stream;
+
+    use super::*;
+
+    #[test]
+    fn new_with_ttl_preserves_fractional_seconds() {
+        let mut normalizer =
+            Normalizer::new_with_ttl(stream::empty::<Metric>(), (), Duration::from_millis(500));
+
+        assert_eq!(
+            normalizer
+                .normalizer
+                .get_state_mut()
+                .ttl_policy()
+                .unwrap()
+                .ttl,
+            Duration::from_millis(500)
+        );
     }
 }

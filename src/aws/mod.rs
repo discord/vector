@@ -3,13 +3,24 @@ pub mod auth;
 pub mod region;
 pub mod timeout;
 
+use std::{
+    error::Error,
+    pin::Pin,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime},
+};
+
 pub use auth::{AwsAuthentication, ImdsAuthentication};
 use aws_config::{
-    meta::region::ProvideRegion, retry::RetryConfig, timeout::TimeoutConfig, Region, SdkConfig,
+    Region, SdkConfig, meta::region::ProvideRegion, retry::RetryConfig, timeout::TimeoutConfig,
 };
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sigv4::{
-    http_request::{SignableBody, SignableRequest, SigningSettings},
+    http_request::{PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings},
     sign::v4,
 };
 use aws_smithy_async::rt::sleep::TokioSleep;
@@ -26,29 +37,26 @@ use aws_smithy_runtime_api::client::{
 use aws_smithy_types::body::SdkBody;
 use aws_types::sdk_config::SharedHttpClient;
 use bytes::Bytes;
-use futures_util::FutureExt;
-use http::HeaderMap;
-use http_body::{combinators::BoxBody, Body};
+use http::{HeaderMap, HeaderName, header::HeaderValue};
+use http_body::{Body, combinators::BoxBody};
 use pin_project::pin_project;
 use regex::RegexSet;
 pub use region::RegionOrEndpoint;
 use snafu::Snafu;
-use std::{
-    error::Error,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock,
-    },
-    task::{Context, Poll},
-    time::{Duration, SystemTime},
-};
 pub use timeout::AwsTimeout;
 
-use crate::config::ProxyConfig;
-use crate::http::{build_proxy_connector, build_tls_connector, status};
-use crate::internal_events::AwsBytesSent;
-use crate::tls::{MaybeTlsSettings, TlsConfig};
+use crate::{
+    config::ProxyConfig,
+    http::{build_proxy_connector, build_tls_connector, status},
+    internal_events::{
+        AwsBytesSent,
+        http_client::{
+            AboutToSendHttpRequest, GotHttpResponse, GotHttpWarning, HttpRequestTelemetry,
+            HttpResponseTelemetry,
+        },
+    },
+    tls::{MaybeTlsSettings, TlsConfig},
+};
 
 static RETRIABLE_CODES: OnceLock<RegexSet> = OnceLock::new();
 
@@ -100,11 +108,11 @@ fn check_response(res: &HttpResponse) -> bool {
 }
 
 /// Creates the http connector that has been configured to use the given proxy and TLS settings.
-/// All AWS requests should use this connector as the aws crates by default use RustTLS which we
+/// All AWS requests should use this connector as the aws crates by default use `RustTLS` which we
 /// have turned off as we want to consistently use openssl.
 fn connector(
     proxy: &ProxyConfig,
-    tls_options: &Option<TlsConfig>,
+    tls_options: Option<&TlsConfig>,
 ) -> crate::Result<SharedHttpClient> {
     let tls_settings = MaybeTlsSettings::tls_client(tls_options)?;
 
@@ -123,13 +131,20 @@ pub trait ClientBuilder {
     type Client;
 
     /// Build the client using the given config settings.
-    fn build(config: &SdkConfig) -> Self::Client;
+    fn build(&self, config: &SdkConfig) -> Self::Client;
 }
 
-fn region_provider(
+/// Provides the configured AWS region.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "Audit and document the existing error contracts separately from lint enforcement."
+)]
+pub fn region_provider(
     proxy: &ProxyConfig,
-    tls_options: &Option<TlsConfig>,
-) -> crate::Result<impl ProvideRegion> {
+    tls_options: Option<&TlsConfig>,
+) -> crate::Result<impl ProvideRegion + use<>> {
+    // Region is not yet known here, so we cannot wrap with AwsHttpClient for observability.
     let config = aws_config::provider_config::ProviderConfig::default()
         .with_http_client(connector(proxy, tls_options)?);
 
@@ -146,7 +161,7 @@ fn region_provider(
 
 async fn resolve_region(
     proxy: &ProxyConfig,
-    tls_options: &Option<TlsConfig>,
+    tls_options: Option<&TlsConfig>,
     region: Option<Region>,
 ) -> crate::Result<Region> {
     match region {
@@ -161,28 +176,46 @@ async fn resolve_region(
 }
 
 /// Create the SDK client using the provided settings.
-pub async fn create_client<T: ClientBuilder>(
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "Audit and document the existing error contracts separately from lint enforcement."
+)]
+pub async fn create_client<T>(
+    builder: &T,
     auth: &AwsAuthentication,
     region: Option<Region>,
     endpoint: Option<String>,
     proxy: &ProxyConfig,
-    tls_options: &Option<TlsConfig>,
-    timeout: &Option<AwsTimeout>,
-) -> crate::Result<T::Client> {
-    create_client_and_region::<T>(auth, region, endpoint, proxy, tls_options, timeout)
+    tls_options: Option<&TlsConfig>,
+    timeout: Option<&AwsTimeout>,
+) -> crate::Result<T::Client>
+where
+    T: ClientBuilder,
+{
+    create_client_and_region::<T>(builder, auth, region, endpoint, proxy, tls_options, timeout)
         .await
         .map(|(client, _)| client)
 }
 
 /// Create the SDK client and resolve the region using the provided settings.
-pub async fn create_client_and_region<T: ClientBuilder>(
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "Audit and document the existing error contracts separately from lint enforcement."
+)]
+pub async fn create_client_and_region<T>(
+    builder: &T,
     auth: &AwsAuthentication,
     region: Option<Region>,
     endpoint: Option<String>,
     proxy: &ProxyConfig,
-    tls_options: &Option<TlsConfig>,
-    timeout: &Option<AwsTimeout>,
-) -> crate::Result<(T::Client, Region)> {
+    tls_options: Option<&TlsConfig>,
+    timeout: Option<&AwsTimeout>,
+) -> crate::Result<(T::Client, Region)>
+where
+    T: ClientBuilder,
+{
     let retry_config = RetryConfig::disabled();
 
     // The default credentials chains will look for a region if not given but we'd like to
@@ -198,13 +231,14 @@ pub async fn create_client_and_region<T: ClientBuilder>(
     let connector = AwsHttpClient {
         http: connector,
         region: region.clone(),
+        emit_bytes_sent: true,
     };
 
     // Build the configuration first.
     let mut config_builder = SdkConfig::builder()
         .http_client(connector)
         .sleep_impl(Arc::new(TokioSleep::new()))
-        .identity_cache(auth.credentials_cache().await?)
+        .identity_cache(auth.credentials_cache()?)
         .credentials_provider(
             auth.credentials_provider(region.clone(), proxy, tls_options)
                 .await?,
@@ -214,6 +248,10 @@ pub async fn create_client_and_region<T: ClientBuilder>(
 
     if let Some(endpoint_override) = endpoint {
         config_builder = config_builder.endpoint_url(endpoint_override);
+    } else if let Some(endpoint_from_config) =
+        aws_config::default_provider::endpoint_url::endpoint_url_provider(&provider_config).await
+    {
+        config_builder = config_builder.endpoint_url(endpoint_from_config);
     }
 
     if let Some(use_fips) =
@@ -239,7 +277,7 @@ pub async fn create_client_and_region<T: ClientBuilder>(
 
     let config = config_builder.build();
 
-    Ok((T::build(&config), region))
+    Ok((T::build(builder, &config), region))
 }
 
 #[derive(Snafu, Debug)]
@@ -250,11 +288,21 @@ enum SigningError {
 
 /// Sign the request prior to sending to AWS.
 /// The signature is added to the provided `request`.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "Audit and document the existing error contracts separately from lint enforcement."
+)]
+#[allow(
+    clippy::missing_panics_doc,
+    reason = "Audit and document the existing panic conditions separately from lint enforcement."
+)]
 pub async fn sign_request(
     service_name: &str,
     request: &mut http::Request<Bytes>,
     credentials_provider: &SharedCredentialsProvider,
-    region: &Option<Region>,
+    region: Option<&Region>,
+    payload_checksum_sha256: bool,
 ) -> crate::Result<()> {
     let headers = request
         .headers()
@@ -276,12 +324,21 @@ pub async fn sign_request(
 
     let credentials = credentials_provider.provide_credentials().await?;
     let identity = Identity::new(credentials, None);
+
+    let mut signing_settings = SigningSettings::default();
+
+    // Include the x-amz-content-sha256 header when calculating the AWS v4 signature;
+    // this is required by some AWS services, e.g. S3 and OpenSearch Serverless
+    if payload_checksum_sha256 {
+        signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    }
+
     let signing_params_builder = v4::SigningParams::builder()
         .identity(&identity)
-        .region(region.as_ref().map(|r| r.as_ref()).unwrap_or(""))
+        .region(region.as_ref().map_or("", std::convert::AsRef::as_ref))
         .name(service_name)
         .time(SystemTime::now())
-        .settings(SigningSettings::default());
+        .settings(signing_settings);
 
     let signing_params = signing_params_builder
         .build()
@@ -298,6 +355,10 @@ pub async fn sign_request(
 struct AwsHttpClient<T> {
     http: T,
     region: Region,
+    /// When `false`, the connector skips `AwsBytesSent` so that control-plane
+    /// traffic (STS `AssumeRole`, IMDS, SSO token exchange) does not inflate
+    /// `component_sent_bytes_total`.
+    emit_bytes_sent: bool,
 }
 
 impl<T> HttpClient for AwsHttpClient<T>
@@ -314,6 +375,7 @@ where
         SharedHttpConnector::new(AwsConnector {
             region: self.region.clone(),
             http: http_connector,
+            emit_bytes_sent: self.emit_bytes_sent,
         })
     }
 }
@@ -322,6 +384,122 @@ where
 struct AwsConnector<T> {
     http: T,
     region: Region,
+    emit_bytes_sent: bool,
+}
+
+// ── Telemetry trait implementations for the AWS SDK HTTP types ────────────────
+//
+// `HttpRequest` and `HttpResponse` are the SDK's own structs (not `http::Request`
+// / `http::Response`), so they cannot implement the hyper-specific body/version
+// accessors.  The required method impls (method/uri and status) are enough for
+// metric labels; the optional rich-logging fields fall back to `None`.
+
+impl HttpRequestTelemetry for HttpRequest {
+    fn method(&self) -> &str {
+        self.method()
+    }
+
+    fn uri(&self) -> String {
+        self.uri().to_string()
+    }
+
+    fn headers(&self) -> HeaderMap<HeaderValue> {
+        smithy_headers_to_map(self.headers())
+    }
+
+    fn body_size_hint(&self) -> (u64, Option<u64>) {
+        let hint = Body::size_hint(self.body());
+        (hint.lower(), hint.upper())
+    }
+
+    fn extra_sensitive_headers(&self) -> &'static [HeaderName] {
+        &AWS_EXTRA_SENSITIVE_HEADERS
+    }
+}
+
+impl HttpResponseTelemetry for HttpResponse {
+    fn status_u16(&self) -> u16 {
+        self.status().as_u16()
+    }
+
+    fn headers(&self) -> HeaderMap<HeaderValue> {
+        smithy_headers_to_map(self.headers())
+    }
+
+    fn body_size_hint(&self) -> (u64, Option<u64>) {
+        let hint = Body::size_hint(self.body());
+        (hint.lower(), hint.upper())
+    }
+
+    fn extra_sensitive_headers(&self) -> &'static [HeaderName] {
+        &AWS_EXTRA_SENSITIVE_HEADERS
+    }
+}
+
+/// AWS-specific headers that carry credential material and must never appear in
+/// logs.
+///
+/// - `x-amz-security-token`    — STS temporary session token
+/// - `x-amz-sso_bearer_token`  — IAM Identity Center access token (exchangeable for role credentials)
+/// - `x-aws-ec2-metadata-token` — `IMDSv2` session token (valid for up to 6 h)
+static AWS_EXTRA_SENSITIVE_HEADERS: [HeaderName; 3] = [
+    HeaderName::from_static("x-amz-security-token"),
+    HeaderName::from_static("x-amz-sso_bearer_token"),
+    HeaderName::from_static("x-aws-ec2-metadata-token"),
+];
+
+/// Converts the AWS SDK's string-pair header iterator into an `http::HeaderMap`.
+/// Sanitization (marking sensitive headers) is handled by the trait's default
+/// `sanitized_headers` method.
+fn smithy_headers_to_map(
+    headers: &aws_smithy_runtime_api::http::Headers,
+) -> HeaderMap<HeaderValue> {
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        map.insert(header_name, header_value);
+    }
+    map
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl<T> AwsConnector<T>
+where
+    T: HttpConnector,
+{
+    /// Calls the inner HTTP connector and emits common telemetry.
+    /// Does not emit `AwsBytesSent` telemetry.
+    fn call_inner(&self, req: HttpRequest) -> HttpConnectorFuture {
+        emit!(AboutToSendHttpRequest { request: &req });
+
+        let fut: HttpConnectorFuture = self.http.call(req);
+
+        HttpConnectorFuture::new(async move {
+            let before = Instant::now();
+            let result = fut.await;
+            let roundtrip = before.elapsed();
+
+            match &result {
+                Ok(response) => {
+                    emit!(GotHttpResponse {
+                        response,
+                        roundtrip
+                    });
+                }
+                Err(error) => {
+                    emit!(GotHttpWarning { error, roundtrip });
+                }
+            }
+
+            result
+        })
+    }
 }
 
 impl<T> HttpConnector for AwsConnector<T>
@@ -329,7 +507,12 @@ where
     T: HttpConnector,
 {
     fn call(&self, req: HttpRequest) -> HttpConnectorFuture {
-        let bytes_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if !self.emit_bytes_sent {
+            return HttpConnectorFuture::new(self.call_inner(req));
+        }
+
+        let bytes_sent = Arc::new(AtomicUsize::new(0));
+
         let req = req.map(|body| {
             let bytes_sent = Arc::clone(&bytes_sent);
             body.map_preserve_contents(move |body| {
@@ -338,20 +521,25 @@ where
             })
         });
 
-        let fut = self.http.call(req);
+        let fut = self.call_inner(req);
         let region = self.region.clone();
 
-        HttpConnectorFuture::new(fut.inspect(move |result| {
-            let byte_size = bytes_sent.load(Ordering::Relaxed);
-            if let Ok(result) = result {
-                if result.status().is_success() {
-                    emit!(AwsBytesSent {
-                        byte_size,
-                        region: Some(region),
-                    });
-                }
+        HttpConnectorFuture::new(async move {
+            let result = fut.await;
+
+            if let Ok(response) = &result
+                && response.status().is_success()
+            {
+                let byte_size = bytes_sent.load(Ordering::Relaxed);
+
+                emit!(AwsBytesSent {
+                    byte_size,
+                    region: Some(region),
+                });
             }
-        }))
+
+            result
+        })
     }
 }
 
@@ -363,7 +551,7 @@ struct MeasuredBody {
 }
 
 impl MeasuredBody {
-    fn new(body: SdkBody, shared_bytes_sent: Arc<AtomicUsize>) -> Self {
+    const fn new(body: SdkBody, shared_bytes_sent: Arc<AtomicUsize>) -> Self {
         Self {
             inner: body,
             shared_bytes_sent,

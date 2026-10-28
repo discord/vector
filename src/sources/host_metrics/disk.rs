@@ -1,10 +1,9 @@
-use crate::internal_events::HostMetricsScrapeDetailError;
 use futures::StreamExt;
 use heim::units::information::byte;
-use vector_lib::configurable::configurable_component;
-use vector_lib::metric_tags;
+use vector_lib::{configurable::configurable_component, internal_event::CounterName, metric_tags};
 
-use super::{default_all_devices, example_devices, filter_result, FilterList, HostMetrics};
+use super::{FilterList, HostMetrics, default_all_devices, example_devices, filter_result};
+use crate::internal_events::HostMetricsScrapeDetailError;
 
 /// Options for the disk metrics collector.
 #[configurable_component]
@@ -18,6 +17,10 @@ pub struct DiskConfig {
 }
 
 impl HostMetrics {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Preserve the existing conversion of source counters to floating-point metrics. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     pub async fn disk_metrics(&self, output: &mut super::MetricsBuffer) {
         match heim::disk::io_counters().await {
             Ok(counters) => {
@@ -41,22 +44,22 @@ impl HostMetrics {
                     };
                     output.name = "disk";
                     output.counter(
-                        "disk_read_bytes_total",
+                        CounterName::DiskReadBytesTotal,
                         counter.read_bytes().get::<byte>() as f64,
                         tags.clone(),
                     );
                     output.counter(
-                        "disk_reads_completed_total",
+                        CounterName::DiskReadsCompletedTotal,
                         counter.read_count() as f64,
                         tags.clone(),
                     );
                     output.counter(
-                        "disk_written_bytes_total",
+                        CounterName::DiskWrittenBytesTotal,
                         counter.write_bytes().get::<byte>() as f64,
                         tags.clone(),
                     );
                     output.counter(
-                        "disk_writes_completed_total",
+                        CounterName::DiskWritesCompletedTotal,
                         counter.write_count() as f64,
                         tags,
                     );
@@ -76,8 +79,8 @@ impl HostMetrics {
 mod tests {
     use super::{
         super::{
-            tests::{all_counters, assert_filtered_metrics, count_name, count_tag},
             HostMetrics, HostMetricsConfig, MetricsBuffer,
+            tests::{all_counters, assert_filtered_metrics, count_name, count_tag},
         },
         DiskConfig,
     };
@@ -88,12 +91,12 @@ mod tests {
         HostMetrics::new(HostMetricsConfig::default())
             .disk_metrics(&mut buffer)
             .await;
-        let metrics = buffer.metrics;
+        let metrics = buffer.into_metrics();
 
         // The Windows test runner doesn't generate any disk metrics on the VM.
         #[cfg(not(windows))]
         assert!(!metrics.is_empty());
-        assert!(metrics.len() % 4 == 0);
+        assert!(metrics.len().is_multiple_of(4));
         assert!(all_counters(&metrics));
 
         // There are exactly four disk_* names
@@ -103,12 +106,7 @@ mod tests {
             "disk_written_bytes_total",
             "disk_writes_completed_total",
         ] {
-            assert_eq!(
-                count_name(&metrics, name),
-                metrics.len() / 4,
-                "name={}",
-                name
-            );
+            assert_eq!(count_name(&metrics, name), metrics.len() / 4, "name={name}");
         }
 
         // They should all have a "device" tag
@@ -125,7 +123,7 @@ mod tests {
             })
             .disk_metrics(&mut buffer)
             .await;
-            buffer.metrics
+            buffer.into_metrics()
         })
         .await;
     }

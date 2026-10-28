@@ -1,15 +1,18 @@
-use metrics::counter;
-use vector_lib::internal_event::InternalEvent;
-use vector_lib::internal_event::{error_stage, error_type, ComponentEventsDropped, UNINTENTIONAL};
+use vector_lib::{
+    NamedInternalEvent, counter,
+    internal_event::{
+        ComponentEventsDropped, CounterName, InternalEvent, UNINTENTIONAL, error_stage, error_type,
+    },
+};
 
 use crate::event::metric::Metric;
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SematextMetricsInvalidMetricError<'a> {
     pub metric: &'a Metric,
 }
 
-impl<'a> InternalEvent for SematextMetricsInvalidMetricError<'a> {
+impl InternalEvent for SematextMetricsInvalidMetricError<'_> {
     fn emit(self) {
         let reason = "Invalid metric received.";
         error!(
@@ -19,10 +22,9 @@ impl<'a> InternalEvent for SematextMetricsInvalidMetricError<'a> {
             stage = error_stage::PROCESSING,
             value = ?self.metric.value(),
             kind = ?self.metric.kind(),
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_code" => "invalid_metric",
             "error_type" => error_type::ENCODER_FAILED,
             "stage" => error_stage::PROCESSING,
@@ -33,7 +35,7 @@ impl<'a> InternalEvent for SematextMetricsInvalidMetricError<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SematextMetricsEncodeEventError<E> {
     pub error: E,
 }
@@ -46,10 +48,9 @@ impl<E: std::fmt::Display> InternalEvent for SematextMetricsEncodeEventError<E> 
             error = %self.error,
             error_type = error_type::ENCODER_FAILED,
             stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_type" => error_type::ENCODER_FAILED,
             "stage" => error_stage::PROCESSING,
         )

@@ -2,22 +2,22 @@ use std::convert::Infallible;
 
 use bytes::BytesMut;
 use tokio_util::codec::Encoder;
-use vector_lib::request_metadata::RequestMetadata;
 use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
     config::telemetry,
     event::{EventFinalizers, Finalizable, Metric},
-    EstimatedJsonEncodedSizeOf,
+    request_metadata::RequestMetadata,
 };
 
 use super::{encoder::StatsdEncoder, service::StatsdRequest};
 use crate::{
     internal_events::SocketMode,
     sinks::util::{
-        metadata::RequestMetadataBuilder, request_builder::EncodeResult, IncrementalRequestBuilder,
+        IncrementalRequestBuilder, metadata::RequestMetadataBuilder, request_builder::EncodeResult,
     },
 };
 
-/// Incremental request builder specific to StatsD.
+/// Incremental request builder specific to `StatsD`.
 pub struct StatsdRequestBuilder {
     encoder: StatsdEncoder,
     request_max_size: usize,
@@ -122,7 +122,7 @@ impl IncrementalRequestBuilder<Vec<Metric>> for StatsdRequestBuilder {
                 // finalizers, etc.
                 request_buf.extend(&self.encode_buf[..]);
                 finalizers.merge(metric.take_finalizers());
-                request_metadata_builder.track_event(metric);
+                request_metadata_builder.track_event(&metric);
                 n += 1;
             }
 

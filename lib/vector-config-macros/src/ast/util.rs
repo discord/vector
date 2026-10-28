@@ -1,14 +1,13 @@
 use darling::{ast::NestedMeta, error::Accumulator};
-use quote::{quote, ToTokens};
-use serde_derive_internals::{attr as serde_attr, Ctxt};
+use quote::{ToTokens, quote};
+use serde_derive_internals::{Ctxt, attr as serde_attr};
 use syn::{
-    punctuated::Punctuated, spanned::Spanned, token::Comma, Attribute, Expr, ExprLit, ExprPath,
-    Lit, Meta, MetaNameValue,
+    Attribute, Expr, ExprLit, ExprPath, Lit, Meta, MetaNameValue, punctuated::Punctuated,
+    spanned::Spanned, token::Comma,
 };
 
-const ERR_FIELD_MISSING_DESCRIPTION: &str = "field must have a description -- i.e. `/// This is a widget...` or `#[configurable(description = \"...\")] -- or derive it from the underlying type of the field by specifying `#[configurable(derived)]`";
 const ERR_FIELD_IMPLICIT_TRANSPARENT: &str =
-    "field in a newtype wrapper should not be manually marked as `derived`/`transparent`";
+    "field in a newtype wrapper should not be manually marked as `transparent`";
 
 pub fn try_extract_doc_title_description(
     attributes: &[Attribute],
@@ -123,7 +122,7 @@ fn group_doc_lines(ungrouped: &[String]) -> Vec<String> {
                 buffer.push_str(s.strip_prefix(' ').unwrap_or(s));
                 buffer.push('\n');
             }
-        };
+        }
 
         grouped
     });
@@ -138,15 +137,7 @@ fn group_doc_lines(ungrouped: &[String]) -> Vec<String> {
 }
 
 fn none_if_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-pub fn err_field_missing_description<T: Spanned>(field: &T) -> darling::Error {
-    darling::Error::custom(ERR_FIELD_MISSING_DESCRIPTION).with_span(field)
+    if s.is_empty() { None } else { Some(s) }
 }
 
 pub fn err_field_implicit_transparent<T: Spanned>(field: &T) -> darling::Error {
@@ -196,7 +187,7 @@ where
 /// If a valid ident can be constructed from the path, and the ident's value matches `other`,
 /// `true` is returned. Otherwise, `false` is returned.
 fn path_matches<S: AsRef<str>>(path: &syn::Path, other: S) -> bool {
-    path.get_ident().filter(|i| *i == &other).is_some()
+    path.get_ident().is_some_and(|ident| ident == &other)
 }
 
 /// Tries to find a specific attribute with a specific name/value pair.
@@ -218,14 +209,17 @@ fn find_name_value_attribute(
         // Only take attributes whose name matches `attr_name`.
         .filter(|attr| path_matches(attr.path(), attr_name))
         // Derive macro helper attributes will always be in the list form.
-        .filter_map(|attr| match &attr.meta {
+        .flat_map(|attr| match &attr.meta {
             Meta::List(ml) => ml
                 .parse_args_with(Punctuated::<NestedMeta, Comma>::parse_terminated)
-                .map(|nested| nested.into_iter())
-                .ok(),
-            _ => None,
+                // Serde already reports parse errors, so avoid duplicate diagnostics.
+                .map_or_else(
+                    |_| Punctuated::<NestedMeta, Comma>::new().into_iter(),
+                    std::iter::IntoIterator::into_iter,
+                ),
+            // Non-list attributes cannot contain nested meta items; return empty iterator.
+            _ => Punctuated::<NestedMeta, Comma>::new().into_iter(),
         })
-        .flatten()
         // For each nested meta item in the list, find any that are name/value pairs where the
         // name matches `name_key`, and return their value.
         .find_map(|nm| match nm {
@@ -238,6 +232,29 @@ fn find_name_value_attribute(
             },
             _ => None,
         })
+}
+
+/// Checks whether an attribute list contains a flag-style entry.
+///
+/// For example, this returns true when `attributes` contains something like `#[serde(untagged)]`
+/// when called with `attr_name = "serde"` and `flag_name = "untagged"`.
+pub(crate) fn has_flag_attribute(
+    attributes: &[syn::Attribute],
+    attr_name: &str,
+    flag_name: &str,
+) -> bool {
+    attributes
+        .iter()
+        .filter(|attr| path_matches(attr.path(), attr_name))
+        .filter_map(|attr| match &attr.meta {
+            Meta::List(ml) => ml
+                .parse_args_with(Punctuated::<NestedMeta, Comma>::parse_terminated)
+                .map(std::iter::IntoIterator::into_iter)
+                .ok(),
+            _ => None,
+        })
+        .flatten()
+        .any(|nm| matches!(nm, NestedMeta::Meta(Meta::Path(ref path)) if path_matches(path, flag_name)))
 }
 
 /// Tries to find a delegated (de)serialization type from attributes.
@@ -278,4 +295,49 @@ pub fn find_delegated_serde_deser_ty(attributes: &[syn::Attribute]) -> Option<sy
             Lit::Str(s) => s.parse::<syn::Type>().ok(),
             _ => None,
         })
+}
+
+/// Recognizes Vector's boolean-or-struct helper through its supported qualified paths.
+///
+/// Proc macros cannot resolve imports, so bare names and arbitrary aliases are intentionally
+/// excluded. Callers must qualify this helper to receive its boolean-or-object schema.
+pub fn is_bool_or_struct_deserializer(path: &syn::ExprPath) -> bool {
+    path.qself.is_none()
+        && ["crate", "vector_core", "vector_lib"].iter().any(|root| {
+            path.path.segments.len() == 3
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .zip([*root, "serde", "bool_or_struct"])
+                    .all(|(segment, expected)| {
+                        segment.ident == expected && segment.arguments.is_empty()
+                    })
+        })
+}
+
+#[cfg(test)]
+mod bool_or_struct_tests {
+    use super::is_bool_or_struct_deserializer;
+
+    #[test]
+    fn recognizes_only_supported_qualified_helpers() {
+        for (path, expected) in [
+            ("crate::serde::bool_or_struct", true),
+            ("vector_core::serde::bool_or_struct", true),
+            ("vector_lib::serde::bool_or_struct", true),
+            ("::vector_lib::serde::bool_or_struct", true),
+            ("bool_or_struct", false),
+            ("other::bool_or_struct", false),
+            ("other::serde::bool_or_struct", false),
+            ("crate::other::bool_or_struct", false),
+            ("crate::serde::other_helper", false),
+        ] {
+            assert_eq!(
+                is_bool_or_struct_deserializer(&syn::parse_str(path).unwrap()),
+                expected,
+                "{path}"
+            );
+        }
+    }
 }

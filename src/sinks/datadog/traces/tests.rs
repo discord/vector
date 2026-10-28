@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
-use futures::{channel::mpsc::Receiver, stream, StreamExt};
+use futures::{StreamExt, channel::mpsc::Receiver, stream};
 use hyper::StatusCode;
 use indoc::indoc;
 use ordered_float::NotNan;
@@ -11,8 +11,7 @@ use rmp_serde;
 use vector_lib::event::{BatchNotifier, BatchStatus, Event};
 use vrl::event_path;
 
-use super::{apm_stats::StatsPayload, dd_proto, ddsketch_full, DatadogTracesConfig};
-
+use super::{DatadogTracesConfig, apm_stats::StatsPayload, dd_proto, ddsketch_full};
 use crate::{
     common::datadog,
     config::{SinkConfig, SinkContext},
@@ -20,8 +19,9 @@ use crate::{
     extra_context::ExtraContext,
     sinks::util::test::{build_test_server_status, load_sink, load_sink_with_context},
     test_util::{
-        components::{assert_sink_compliance, run_and_assert_sink_compliance, SINK_TAGS},
-        map_event_batch_stream, next_addr,
+        addr::next_addr,
+        components::{SINK_TAGS, assert_sink_compliance, run_and_assert_sink_compliance},
+        map_event_batch_stream,
     },
 };
 
@@ -32,7 +32,7 @@ async fn start_test(
     events: Vec<Event>,
 ) -> Receiver<(http::request::Parts, Bytes)> {
     assert_sink_compliance(&SINK_TAGS, async {
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let config = format!(
             indoc! {r#"
             default_api_key = "atoken"
@@ -106,7 +106,9 @@ pub fn simple_trace_event(resource: String) -> TraceEvent {
     t
 }
 
-fn validate_simple_span(span: dd_proto::Span, resource: String) {
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::float_cmp, reason = "Assert exact serialized values.")]
+fn validate_simple_span(span: &dd_proto::Span, resource: &str) {
     assert_eq!(span.service, "a_service");
     assert_eq!(span.name, "a_name");
     assert_eq!(span.resource, resource);
@@ -122,6 +124,8 @@ fn validate_simple_span(span: dd_proto::Span, resource: String) {
     assert_eq!(span.metrics["a_metric"], 0.577);
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::float_cmp, reason = "Assert an empty sketch.")]
 #[tokio::test]
 async fn smoke() {
     let mut t = simple_trace_event("a_resource".to_string());
@@ -146,7 +150,7 @@ async fn smoke() {
     );
     assert_eq!(trace_parts.headers.get("DD-API-KEY").unwrap(), "a_key");
 
-    let mut decoded_payload = dd_proto::TracePayload::decode(trace_body).unwrap();
+    let mut decoded_payload = dd_proto::AgentPayload::decode(trace_body).unwrap();
     assert_eq!(decoded_payload.tracer_payloads.len(), 1);
     assert_eq!(decoded_payload.host_name, "a_host");
     assert_eq!(decoded_payload.env, "an_env");
@@ -154,7 +158,7 @@ async fn smoke() {
     assert_eq!(tracer_payload.chunks.len(), 1);
     let mut chunk = tracer_payload.chunks.pop().unwrap();
     assert_eq!(chunk.spans.len(), 1);
-    validate_simple_span(chunk.spans.pop().unwrap(), "a_resource".to_string());
+    validate_simple_span(&chunk.spans.pop().unwrap(), "a_resource");
 
     let (stats_parts, stats_body) = stats.unwrap();
     assert_eq!(
@@ -257,18 +261,18 @@ async fn multiple_traces() {
     );
     assert_eq!(trace_parts.headers.get("DD-API-KEY").unwrap(), "a_key");
 
-    let mut decoded_payload = dd_proto::TracePayload::decode(trace_body).unwrap();
+    let mut decoded_payload = dd_proto::AgentPayload::decode(trace_body).unwrap();
     assert_eq!(decoded_payload.tracer_payloads.len(), 2);
     assert_eq!(decoded_payload.host_name, "a_host");
     assert_eq!(decoded_payload.env, "an_env");
 
-    ["trace_2", "trace_1"].into_iter().for_each(|t| {
+    for t in ["trace_2", "trace_1"] {
         let mut tracer_payload = decoded_payload.tracer_payloads.pop().unwrap();
         assert_eq!(tracer_payload.chunks.len(), 1);
         let mut chunk = tracer_payload.chunks.pop().unwrap();
         assert_eq!(chunk.spans.len(), 1);
-        validate_simple_span(chunk.spans.pop().unwrap(), t.to_string());
-    });
+        validate_simple_span(&chunk.spans.pop().unwrap(), t);
+    }
 
     let (stats_parts, stats_body) = stats.unwrap();
     assert_eq!(
@@ -325,10 +329,10 @@ async fn global_options() {
     };
     let (mut config, cx) = load_sink_with_context::<DatadogTracesConfig>(config, cx).unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it
     // to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -347,9 +351,10 @@ async fn global_options() {
         .collect::<Vec<_>>()
         .await;
 
-    assert!(keys
-        .iter()
-        .all(|value| value.to_str().unwrap() == "global-key"));
+    assert!(
+        keys.iter()
+            .all(|value| value.to_str().unwrap() == "global-key")
+    );
 }
 
 #[tokio::test]
@@ -369,10 +374,10 @@ async fn override_global_options() {
     };
     let (mut config, cx) = load_sink_with_context::<DatadogTracesConfig>(config, cx).unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it
     // to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -391,7 +396,8 @@ async fn override_global_options() {
         .collect::<Vec<_>>()
         .await;
 
-    assert!(keys
-        .iter()
-        .all(|value| value.to_str().unwrap() == "local-key"));
+    assert!(
+        keys.iter()
+            .all(|value| value.to_str().unwrap() == "local-key")
+    );
 }

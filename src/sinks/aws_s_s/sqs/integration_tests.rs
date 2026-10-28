@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 
 use aws_config::Region;
-use aws_sdk_sqs::{types::QueueAttributeName, Client as SqsClient};
-use tokio::time::{sleep, Duration};
+use aws_sdk_sqs::{Client as SqsClient, types::QueueAttributeName};
+use tokio::time::{Duration, sleep};
 use vector_lib::codecs::TextSerializerConfig;
 
-use crate::config::{SinkConfig, SinkContext};
-use crate::sinks::aws_s_s::sqs::{
-    config::{healthcheck, SqsSinkConfig},
-    BaseSSSinkConfig,
-};
 use crate::{
-    aws::{create_client, AwsAuthentication, RegionOrEndpoint},
+    aws::{AwsAuthentication, RegionOrEndpoint, create_client},
     common::sqs::SqsClientBuilder,
-    config::ProxyConfig,
+    config::{AcknowledgementsConfig, ProxyConfig, SinkConfig, SinkContext},
+    sinks::aws_s_s::sqs::{
+        BaseSSSinkConfig,
+        config::{SqsSinkConfig, healthcheck},
+        is_fifo,
+    },
+    sinks::util::TowerRequestConfig,
     test_util::{
-        components::{run_and_assert_sink_compliance, AWS_SINK_TAGS},
+        components::{AWS_SINK_TAGS, run_and_assert_sink_compliance},
         random_lines_with_stream, random_string,
     },
 };
@@ -30,12 +31,13 @@ async fn create_test_client() -> SqsClient {
     let endpoint = sqs_address();
     let proxy = ProxyConfig::default();
     create_client::<SqsClientBuilder>(
+        &SqsClientBuilder {},
         &auth,
         Some(Region::new("us-east-1")),
         Some(endpoint),
         &proxy,
-        &None,
-        &None,
+        None,
+        None,
     )
     .await
     .unwrap()
@@ -53,11 +55,11 @@ async fn sqs_send_message_batch() {
         encoding: TextSerializerConfig::default().into(),
         message_group_id: None,
         message_deduplication_id: None,
-        request: Default::default(),
-        tls: Default::default(),
+        request: TowerRequestConfig::default(),
+        tls: None,
         assume_role: None,
-        auth: Default::default(),
-        acknowledgements: Default::default(),
+        auth: AwsAuthentication::default(),
+        acknowledgements: AcknowledgementsConfig::default(),
     };
 
     let config = SqsSinkConfig {
@@ -81,7 +83,7 @@ async fn sqs_send_message_batch() {
 
     let response = client
         .receive_message()
-        .max_number_of_messages(input_lines.len() as i32)
+        .max_number_of_messages(i32::try_from(input_lines.len()).unwrap())
         .queue_url(queue_url)
         .send()
         .await
@@ -105,7 +107,7 @@ async fn sqs_send_message_batch() {
 async fn ensure_queue(queue_name: String) {
     let client = create_test_client().await;
 
-    let attributes: Option<HashMap<QueueAttributeName, String>> = if queue_name.ends_with(".fifo") {
+    let attributes: Option<HashMap<QueueAttributeName, String>> = if is_fifo(&queue_name) {
         let mut hash_map = HashMap::new();
         hash_map.insert(QueueAttributeName::FifoQueue, "true".into());
         Some(hash_map)

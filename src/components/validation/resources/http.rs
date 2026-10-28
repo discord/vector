@@ -7,30 +7,34 @@ use std::{
 };
 
 use axum::{
+    Router,
     response::IntoResponse,
     routing::{MethodFilter, MethodRouter},
-    Router,
 };
 use bytes::{BufMut as _, BytesMut};
 use http::{Method, Request, StatusCode, Uri};
+use http_body::{Body as _, Collected};
 use hyper::{Body, Client, Server};
 use tokio::{
     select,
-    sync::{mpsc, oneshot, Mutex, Notify},
+    sync::{Mutex, Notify, mpsc, oneshot},
 };
 use tokio_util::codec::Decoder;
-
-use crate::components::validation::{
-    sync::{Configuring, TaskCoordinator},
-    RunnerMetrics,
-};
 use vector_lib::{
-    codecs::encoding::Framer, codecs::encoding::Serializer::Json,
-    codecs::CharacterDelimitedEncoder, config::LogNamespace, event::Event,
     EstimatedJsonEncodedSizeOf,
+    codecs::{
+        CharacterDelimitedEncoder,
+        encoding::{Framer, Serializer::Json},
+    },
+    config::LogNamespace,
+    event::Event,
 };
 
-use super::{encode_test_event, ResourceCodec, ResourceDirection, TestEvent};
+use super::{ResourceCodec, ResourceDirection, TestEvent, encode_test_event};
+use crate::components::validation::{
+    RunnerMetrics,
+    sync::{Configuring, TaskCoordinator},
+};
 
 /// An HTTP resource.
 #[derive(Clone)]
@@ -49,11 +53,17 @@ impl HttpResourceConfig {
         }
     }
 
+    #[must_use]
     pub fn with_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = Some(headers);
         self
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve ownership and drop timing"
+    )]
     pub fn spawn_as_input(
         self,
         direction: ResourceDirection,
@@ -65,15 +75,21 @@ impl HttpResourceConfig {
         match direction {
             // The source will pull data from us.
             ResourceDirection::Pull => {
-                spawn_input_http_server(self, codec, input_rx, task_coordinator, runner_metrics)
+                spawn_input_http_server(self, codec, input_rx, task_coordinator, runner_metrics);
             }
             // We'll push data to the source.
             ResourceDirection::Push => {
-                spawn_input_http_client(self, codec, input_rx, task_coordinator, runner_metrics)
+                spawn_input_http_client(self, codec, input_rx, task_coordinator, runner_metrics);
             }
         }
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve ownership and drop timing"
+    )]
     pub fn spawn_as_output(self, ctx: HttpResourceOutputContext) -> vector_lib::Result<()> {
         match ctx.direction {
             // We'll pull data from the sink.
@@ -85,7 +101,11 @@ impl HttpResourceConfig {
 }
 
 /// Spawns an HTTP server that a source will make requests to in order to get events.
-#[allow(clippy::missing_const_for_fn)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve ownership and drop timing"
+)]
 fn spawn_input_http_server(
     config: HttpResourceConfig,
     codec: ResourceCodec,
@@ -113,16 +133,19 @@ fn spawn_input_http_server(
 
             async move {
                 let mut sendable_events = sendable_events.lock().await;
-                if let Some(event) = sendable_events.pop_front() {
-                    let mut buffer = BytesMut::new();
-                    encode_test_event(&mut encoder, &mut buffer, event);
+                match sendable_events.pop_front() {
+                    Some(event) => {
+                        let mut buffer = BytesMut::new();
+                        encode_test_event(&mut encoder, &mut buffer, event);
 
-                    buffer.into_response()
-                } else {
-                    // We'll send an empty 200 in the response since some
-                    // sources throw errors for anything other than a valid
-                    // response.
-                    StatusCode::OK.into_response()
+                        buffer.into_response()
+                    }
+                    _ => {
+                        // We'll send an empty 200 in the response since some
+                        // sources throw errors for anything other than a valid
+                        // response.
+                        StatusCode::OK.into_response()
+                    }
                 }
             }
         },
@@ -147,18 +170,15 @@ fn spawn_input_http_server(
                 // When the channel closes, we'll mark the input as being finished so that we know
                 // to close the external resource itself once the HTTP server has consumed/sent all
                 // outstanding events.
-                maybe_event = input_rx.recv(), if !input_finished => match maybe_event {
-                    Some(event) => {
-                        let mut outstanding_events = outstanding_events.lock().await;
-                        outstanding_events.push_back(event);
-                    },
-                    None => {
-                        info!("HTTP server external input resource input is finished.");
-                        input_finished = true;
-                    },
+                maybe_event = input_rx.recv(), if !input_finished => if let Some(event) = maybe_event {
+                    let mut outstanding_events = outstanding_events.lock().await;
+                    outstanding_events.push_back(event);
+                } else {
+                    info!("HTTP server external input resource input is finished.");
+                    input_finished = true;
                 },
 
-                _ = resource_notifier.notified() => {
+                () = resource_notifier.notified() => {
                     // The HTTP server notified us that it made progress with a send, which is
                     // specifically that it serviced a request which returned a non-zero number of
                     // events.
@@ -181,8 +201,8 @@ fn spawn_input_http_server(
         // Wait for the runner to signal us to shutdown
         resource_shutdown_rx.wait().await;
 
-        // Shutdown the server
-        _ = http_server_shutdown_tx.send(());
+        // Shutdown the server; error is ignored since it only fails if the server already stopped.
+        http_server_shutdown_tx.send(()).ok();
 
         info!("HTTP server external input resource marking as done.");
         resource_completed.mark_as_done();
@@ -192,6 +212,11 @@ fn spawn_input_http_server(
 }
 
 /// Spawns an HTTP client that pushes events to a source which is accepting events over HTTP.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Preserve ownership and drop timing"
+)]
 fn spawn_input_http_client(
     config: HttpResourceConfig,
     codec: ResourceCodec,
@@ -266,7 +291,7 @@ fn spawn_input_http_client(
                 }
                 Err(e) => {
                     // TODO: Emit metric that tracks a failed response from the HTTP server.
-                    error!("Failed to send request: {}", e);
+                    error!("Failed to send request: {e}");
                 }
             }
         }
@@ -291,7 +316,11 @@ pub struct HttpResourceOutputContext<'a> {
 
 impl HttpResourceOutputContext<'_> {
     /// Spawns an HTTP server that accepts events sent by a sink.
-    #[allow(clippy::missing_const_for_fn)]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve ownership and drop timing"
+    )]
     fn spawn_output_http_server(&self, config: HttpResourceConfig) -> vector_lib::Result<()> {
         // This HTTP server will wait for events to be sent by a sink, and collect them and send them on
         // via an output sender. We accept/collect events until we're told to shutdown.
@@ -322,19 +351,45 @@ impl HttpResourceOutputContext<'_> {
                 let mut decoder = decoder.clone();
 
                 async move {
-                    match hyper::body::to_bytes(request.into_body()).await {
+                    // Extract the Content-Encoding header before consuming the request
+                    let content_encoding = request
+                        .headers()
+                        .get("content-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(std::string::ToString::to_string);
+
+                    match request.into_body().collect().await.map(Collected::to_bytes) {
                         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                         Ok(body) => {
+                            let byte_size = body.len();
+
+                            // Validation tests should not use compression - error if we receive compressed data
+                            if let Some(encoding) = &content_encoding
+                                && encoding != "identity"
+                            {
+                                error!(
+                                    "Received compressed data (Content-Encoding: {encoding}). \
+                                        Validation tests assert on bytes sizes and compressed size might not be deterministic."
+                                );
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+
                             let mut body = BytesMut::from(&body[..]);
                             loop {
                                 match decoder.decode_eof(&mut body) {
-                                    Ok(Some((events, byte_size))) => {
+                                    // `decoded_byte_size` is the decoded size of an individual frame. `byte_size` represents the size of the
+                                    // entire payload which may contain multiple frames and their delimiters.
+                                    Ok(Some((events, decoded_byte_size))) => {
                                         if should_reject {
-                                            info!("HTTP server external output resource decoded {byte_size} bytes but test case configured to reject.");
+                                            info!(
+                                                "HTTP server external output resource decoded {decoded_byte_size:?} bytes but test case configured to reject.",
+                                            );
                                         } else {
                                             let mut output_runner_metrics =
                                                 output_runner_metrics.lock().await;
-                                            info!("HTTP server external output resource decoded {byte_size} bytes.");
+                                            info!(
+                                                "HTTP server external output resource decoded {decoded_byte_size:?} bytes."
+                                            );
 
                                             // Update the runner metrics for the received events. This will later
                                             // be used in the Validators, as the "expected" case.
@@ -361,13 +416,12 @@ impl HttpResourceOutputContext<'_> {
                                             // This status code is not retried and should result in the component under test
                                             // emitting error events
                                             return StatusCode::BAD_REQUEST.into_response();
-                                        } else {
-                                            return StatusCode::OK.into_response();
                                         }
+                                        return StatusCode::OK.into_response();
                                     }
                                     Err(_) => {
                                         error!(
-                                            "HTTP server failed to decode {:?}",
+                                            "HTTP server failed to decode body: {:?}",
                                             String::from_utf8_lossy(&body)
                                         );
                                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -394,7 +448,7 @@ impl HttpResourceOutputContext<'_> {
             resource_shutdown_rx.wait().await;
 
             // signal the server to shutdown
-            let _ = http_server_shutdown_tx.send(());
+            http_server_shutdown_tx.send(()).ok();
 
             // mark ourselves as done
             resource_completed.mark_as_done();
@@ -406,12 +460,11 @@ impl HttpResourceOutputContext<'_> {
     }
 
     /// Spawns an HTTP client that pulls events by making requests to an HTTP server driven by a sink.
-    #[allow(clippy::missing_const_for_fn)]
     fn spawn_output_http_client(&self, _config: HttpResourceConfig) {
         // TODO: The `prometheus_exporter` sink is the only sink that exposes an HTTP server which must be
         // scraped... but since we need special logic to aggregate/deduplicate scraped metrics, we can't
         // use this generically for that purpose.
-        todo!()
+        unimplemented!()
     }
 }
 
@@ -433,8 +486,7 @@ where
     let request_path = config
         .uri
         .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+        .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
     let request_method = config.method.clone().unwrap_or(Method::POST);
 
     // Create our synchronization primitives that are shared between the HTTP server and the

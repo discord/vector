@@ -1,13 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures_util::{future, FutureExt};
+use futures_util::{FutureExt, future};
 use stream_cancel::{Trigger, Tripwire};
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::schema::Definition;
 use vector_lib::{
-    config::{DataType, SourceOutput},
+    config::{DataType, LogNamespace, SourceOutput},
+    configurable::configurable_component,
+    schema::Definition,
     source::Source,
 };
 
@@ -22,15 +21,16 @@ pub struct TripwireSourceConfig {
 }
 
 impl GenerateConfig for TripwireSourceConfig {
-    fn generate_config() -> toml::Value {
+    fn generate_config() -> serde_json::Value {
         let config = Self {
             tripwire: Arc::new(Mutex::new(None)),
         };
-        toml::Value::try_from(&config).unwrap()
+        serde_json::to_value(&config).unwrap()
     }
 }
 
 impl TripwireSourceConfig {
+    #[must_use]
     pub fn new() -> (Trigger, Self) {
         let (trigger, tripwire) = Tripwire::new();
         (
@@ -61,8 +61,10 @@ impl SourceConfig for TripwireSourceConfig {
                     .then(crate::shutdown::tripwire_handler)
                     .boxed(),
             )
-            .map(|_| drop(out))
-            .unit_error(),
+            .map(|_| {
+                drop(out);
+                Ok(())
+            }),
         ))
     }
 

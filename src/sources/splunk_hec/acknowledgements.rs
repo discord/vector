@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     num::NonZeroU64,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -12,8 +12,10 @@ use futures::StreamExt;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
-use vector_lib::configurable::configurable_component;
-use vector_lib::{finalization::BatchStatusReceiver, finalizer::UnorderedFinalizer};
+use vector_lib::{
+    configurable::configurable_component, finalization::BatchStatusReceiver,
+    finalizer::UnorderedFinalizer,
+};
 use warp::Rejection;
 
 use super::ApiError;
@@ -97,6 +99,10 @@ pub struct IndexerAcknowledgement {
 }
 
 impl IndexerAcknowledgement {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Changing this source helper signature is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     pub fn new(config: HecAcknowledgementsConfig, shutdown: ShutdownSignal) -> Self {
         let channels: Arc<tokio::sync::Mutex<HashMap<String, Arc<Channel>>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -104,7 +110,7 @@ impl IndexerAcknowledgement {
         let idle_task_channels = Arc::clone(&channels);
 
         if config.ack_idle_cleanup {
-            tokio::spawn(async move {
+            crate::spawn_in_current_span(async move {
                 let mut interval = interval(Duration::from_secs(max_idle_time));
                 loop {
                     interval.tick().await;
@@ -128,6 +134,10 @@ impl IndexerAcknowledgement {
         }
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     /// Creates a channel with the specified id if it does not exist.
     async fn create_or_get_channel(&self, id: String) -> Result<Arc<Channel>, Rejection> {
         let mut channels = self.channels.lock().await;
@@ -204,7 +214,7 @@ impl Channel {
         let ack_ids_status = Arc::new(Mutex::new(RoaringTreemap::new()));
         let finalizer_ack_ids_status = Arc::clone(&ack_ids_status);
         let (ack_event_finalizer, mut ack_stream) = UnorderedFinalizer::new(Some(shutdown));
-        tokio::spawn(async move {
+        crate::spawn_in_current_span(async move {
             while let Some((status, ack_id)) = ack_stream.next().await {
                 if status == BatchStatus::Delivered {
                     let mut ack_ids_status = finalizer_ack_ids_status.lock().unwrap();
@@ -311,10 +321,12 @@ mod tests {
         }
         // Let the ack finalizer task run
         sleep(time::Duration::from_secs(1)).await;
-        assert!(channel
-            .get_acks_status(&expected_ack_ids)
-            .values()
-            .all(|&status| status == result));
+        assert!(
+            channel
+                .get_acks_status(&expected_ack_ids)
+                .values()
+                .all(|&status| status == result)
+        );
     }
 
     #[tokio::test]
@@ -330,15 +342,19 @@ mod tests {
         }
         // Let the ack finalizer task run
         sleep(time::Duration::from_secs(1)).await;
-        assert!(channel
-            .get_acks_status(&expected_ack_ids)
-            .values()
-            .all(|status| *status));
+        assert!(
+            channel
+                .get_acks_status(&expected_ack_ids)
+                .values()
+                .all(|status| *status)
+        );
         // Subsequent queries for the same ackId's should result in false
-        assert!(channel
-            .get_acks_status(&expected_ack_ids)
-            .values()
-            .all(|status| !*status));
+        assert!(
+            channel
+                .get_acks_status(&expected_ack_ids)
+                .values()
+                .all(|status| !*status)
+        );
     }
 
     #[tokio::test]
@@ -359,15 +375,19 @@ mod tests {
         // Let the ack finalizer task run
         sleep(time::Duration::from_secs(1)).await;
         // The first 10 pending ack ids are dropped
-        assert!(channel
-            .get_acks_status(&dropped_pending_ack_ids)
-            .values()
-            .all(|status| !*status));
+        assert!(
+            channel
+                .get_acks_status(&dropped_pending_ack_ids)
+                .values()
+                .all(|status| !*status)
+        );
         // The second 10 pending ack ids can be queried
-        assert!(channel
-            .get_acks_status(&expected_ack_ids)
-            .values()
-            .all(|status| *status));
+        assert!(
+            channel
+                .get_acks_status(&expected_ack_ids)
+                .values()
+                .all(|status| *status)
+        );
     }
 
     #[tokio::test]
@@ -399,18 +419,22 @@ mod tests {
             sleep(time::Duration::from_millis(100)).await;
         }
         sleep(time::Duration::from_secs(1)).await;
-        assert!(idx_ack
-            .get_acks_status_from_channel(channel.clone(), &dropped_pending_ack_ids)
-            .await
-            .unwrap()
-            .values()
-            .all(|status| !*status));
-        assert!(idx_ack
-            .get_acks_status_from_channel(channel, &expected_ack_ids)
-            .await
-            .unwrap()
-            .values()
-            .all(|status| *status));
+        assert!(
+            idx_ack
+                .get_acks_status_from_channel(channel.clone(), &dropped_pending_ack_ids)
+                .await
+                .unwrap()
+                .values()
+                .all(|status| !*status)
+        );
+        assert!(
+            idx_ack
+                .get_acks_status_from_channel(channel, &expected_ack_ids)
+                .await
+                .unwrap()
+                .values()
+                .all(|status| *status)
+        );
     }
 
     #[tokio::test]
@@ -431,10 +455,12 @@ mod tests {
             .unwrap();
 
         let (_tx, batch_rx) = BatchNotifier::new_with_receiver();
-        assert!(idx_ack
-            .get_ack_id_from_channel(channel.clone(), batch_rx)
-            .await
-            .is_err());
+        assert!(
+            idx_ack
+                .get_ack_id_from_channel(channel.clone(), batch_rx)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -455,12 +481,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (_tx, batch_rx) = BatchNotifier::new_with_receiver();
+        let (batch_notifier, batch_rx) = BatchNotifier::new_with_receiver();
         let channel_one_ack_id = channel_one.get_ack_id(batch_rx);
-        drop(_tx);
-        let (_tx, batch_rx) = BatchNotifier::new_with_receiver();
+        drop(batch_notifier);
+        let (batch_notifier, batch_rx) = BatchNotifier::new_with_receiver();
         let channel_two_ack_id = channel_two.get_ack_id(batch_rx);
-        drop(_tx);
+        drop(batch_notifier);
 
         assert_eq!(0, channel_one_ack_id);
         assert_eq!(0, channel_two_ack_id);
@@ -481,10 +507,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(idx_ack
-            .create_or_get_channel(String::from("channel-id-2"))
-            .await
-            .is_err());
+        assert!(
+            idx_ack
+                .create_or_get_channel(String::from("channel-id-2"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -504,10 +532,12 @@ mod tests {
             .unwrap();
         // Allow channel to expire and free up the max channel limit of 1
         sleep(time::Duration::from_secs(3)).await;
-        assert!(idx_ack
-            .create_or_get_channel(String::from("channel-id-2"))
-            .await
-            .is_ok());
+        assert!(
+            idx_ack
+                .create_or_get_channel(String::from("channel-id-2"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -534,11 +564,13 @@ mod tests {
             );
         }
         sleep(time::Duration::from_secs(2)).await;
-        assert!(idx_ack
-            .get_acks_status_from_channel(channel.clone(), &expected_ack_ids)
-            .await
-            .unwrap()
-            .values()
-            .all(|status| *status));
+        assert!(
+            idx_ack
+                .get_acks_status_from_channel(channel.clone(), &expected_ack_ids)
+                .await
+                .unwrap()
+                .values()
+                .all(|status| *status)
+        );
     }
 }

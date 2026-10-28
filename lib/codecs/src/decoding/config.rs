@@ -1,0 +1,60 @@
+use serde::{Deserialize, Serialize};
+use vector_core::config::LogNamespace;
+
+use crate::decoding::{Decoder, DeserializerConfig, FramingConfig};
+
+/// Config used to build a `Decoder`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DecodingConfig {
+    /// The framing config.
+    framing: FramingConfig,
+    /// The decoding config.
+    decoding: DeserializerConfig,
+    /// The namespace used when decoding.
+    log_namespace: LogNamespace,
+}
+
+impl DecodingConfig {
+    /// Creates a new `DecodingConfig` with the provided `FramingConfig` and
+    /// `DeserializerConfig`.
+    #[must_use]
+    pub const fn new(
+        framing: FramingConfig,
+        decoding: DeserializerConfig,
+        log_namespace: LogNamespace,
+    ) -> Self {
+        Self {
+            framing,
+            decoding,
+            log_namespace,
+        }
+    }
+
+    /// Get the decoding configuration.
+    #[must_use]
+    pub const fn config(&self) -> &DeserializerConfig {
+        &self.decoding
+    }
+
+    /// Get the framing configuration.
+    #[must_use]
+    pub const fn framing(&self) -> &FramingConfig {
+        &self.framing
+    }
+
+    /// Builds a `Decoder` from the provided configuration.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "The codec API error documentation needs a separate audit."
+    )]
+    pub fn build(&self) -> vector_common::Result<Decoder> {
+        // Build the framer.
+        let framer = self.framing.build();
+
+        // Build the deserializer.
+        let deserializer = self.decoding.build()?;
+
+        Ok(Decoder::new(framer, deserializer).with_log_namespace(self.log_namespace))
+    }
+}

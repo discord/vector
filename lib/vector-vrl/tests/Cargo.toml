@@ -2,27 +2,28 @@
 name = "vector-vrl-tests"
 version = "0.1.0"
 authors = ["Vector Contributors <vector@datadoghq.com>"]
-edition = "2021"
+edition = "2024"
 publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
 chrono-tz.workspace = true
-enrichment = { path = "../../enrichment" }
-vrl.workspace = true
-vector-vrl-functions = { path = "../../vector-vrl/functions" }
+vector-vrl-functions = { workspace = true, features = ["dnstap", "vrl-metrics"] }
+enrichment = { path = "../enrichment" }
+vector-vrl-metrics = { path = "../metrics" }
+vector-core = { path = "../../vector-core", default-features = false }
+vrl = { workspace = true, features = ["stdlib"] }
 
-ansi_term = "0.12"
-chrono.workspace = true
 clap.workspace = true
 glob.workspace = true
-prettydiff = "0.7"
-regex = "1"
 serde.workspace = true
 serde_json.workspace = true
-tracing-subscriber = { version = "0.3.18", default-features = false, features = ["fmt"] }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6.0" }
+tikv-jemallocator = { version = "0.7.0" }
 
 [features]
 default = []

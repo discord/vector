@@ -4,17 +4,16 @@ use rand::random;
 use vector_lib::lookup::lookup_v2::ConfigValuePath;
 use vrl::path::PathPrefix;
 
+use super::{
+    record::Record,
+    request_builder::{KinesisRequest, KinesisRequestBuilder},
+};
 use crate::{
     internal_events::{AwsKinesisStreamNoPartitionKeyError, SinkRequestBuildError},
     sinks::{
         prelude::*,
-        util::{processed_event::ProcessedEvent, StreamSink},
+        util::{StreamSink, processed_event::ProcessedEvent},
     },
-};
-
-use super::{
-    record::Record,
-    request_builder::{KinesisRequest, KinesisRequestBuilder},
 };
 
 pub type KinesisProcessedEvent = ProcessedEvent<LogEvent, KinesisKey>;
@@ -93,11 +92,11 @@ where
 }
 
 /// Returns a `KinesisProcessedEvent` containing the unmodified log event + metadata consisting of
-/// the partition key. The partition key is either generated from the provided partition_key_field
+/// the partition key. The partition key is either generated from the provided `partition_key_field`
 /// or is generated randomly.
 ///
-/// If the provided partition_key_field was not found in the log, `Error` `EventsDropped` internal
-/// events are emitted and None is returned.
+/// If the provided `partition_key_field` was not found in the log, `Error` `EventsDropped` internal
+/// events are emitted and `None` is returned.
 pub(crate) fn process_log(
     log: LogEvent,
     partition_key_field: Option<&ConfigValuePath>,
@@ -115,7 +114,12 @@ pub(crate) fn process_log(
         Cow::Owned(gen_partition_key())
     };
     let partition_key = if partition_key.len() >= 256 {
-        partition_key[..256].to_string()
+        #[expect(
+            clippy::string_slice,
+            reason = "floor_char_boundary guarantees a valid char boundary"
+        )]
+        let s = &partition_key[..partition_key.floor_char_boundary(256)];
+        s.to_string()
     } else {
         partition_key.into_owned()
     };
@@ -140,7 +144,7 @@ where
     R: Record + Clone,
 {
     pub events: Vec<KinesisRequest<R>>,
-    metadata: RequestMetadata,
+    pub metadata: RequestMetadata,
 }
 
 impl<R> Clone for BatchKinesisRequest<R>
@@ -149,7 +153,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            events: self.events.to_vec(),
+            events: self.events.clone(),
             metadata: self.metadata.clone(),
         }
     }

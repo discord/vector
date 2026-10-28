@@ -37,14 +37,14 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, Sink, Stream, TryFutureExt};
+use futures::{FutureExt, Sink, Stream, TryFutureExt, future::BoxFuture, stream::FuturesUnordered};
 use pin_project::pin_project;
 use tokio::{
     sync::oneshot,
-    time::{sleep, Duration, Sleep},
+    time::{Duration, Sleep, sleep},
 };
 use tower::{Service, ServiceBuilder};
 use tracing::Instrument;
@@ -55,10 +55,10 @@ use vector_lib::internal_event::{
 pub use vector_lib::sink::StreamSink;
 
 use super::{
+    EncodedEvent,
     batch::{Batch, EncodedBatch, FinalizersBatch, PushResult, StatefulBatch},
     buffer::{Partition, PartitionBuffer, PartitionInnerBuffer},
     service::{Map, ServiceBuilderExt},
-    EncodedEvent,
 };
 use crate::event::EventStatus;
 
@@ -303,14 +303,13 @@ where
                         .in_flight
                         .as_mut()
                         .and_then(|map| map.get_mut(partition))
-                        .map(|req| matches!(req.poll_unpin(cx), Poll::Ready(())))
-                        .unwrap_or(true)
+                        .is_none_or(|req| matches!(req.poll_unpin(cx), Poll::Ready(())))
                 {
                     partitions_ready.push(partition.clone());
                 }
             }
             let mut batch_consumed = false;
-            for partition in partitions_ready.iter() {
+            for partition in &partitions_ready {
                 let service_ready = match this.service.poll_ready(cx) {
                     Poll::Ready(Ok(())) => true,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -323,7 +322,7 @@ where
                     this.lingers.remove(partition);
 
                     let batch = batch.finish();
-                    let future = tokio::spawn(this.service.call(batch));
+                    let future = crate::spawn_in_current_span(this.service.call(batch));
 
                     if let Some(map) = this.in_flight.as_mut() {
                         map.insert(partition.clone(), future.map(|_| ()).fuse().boxed());
@@ -339,15 +338,15 @@ where
             }
 
             // Cleanup of in flight futures
-            if let Some(in_flight) = this.in_flight.as_mut() {
-                if in_flight.len() > this.partitions.len() {
-                    // There is at least one in flight future without a partition to check it
-                    // so we will do it here.
-                    let partitions = this.partitions;
-                    in_flight.retain(|partition, req| {
-                        partitions.contains_key(partition) || req.poll_unpin(cx).is_pending()
-                    });
-                }
+            if let Some(in_flight) = this.in_flight.as_mut()
+                && in_flight.len() > this.partitions.len()
+            {
+                // There is at least one in flight future without a partition to check it
+                // so we will do it here.
+                let partitions = this.partitions;
+                in_flight.retain(|partition, req| {
+                    partitions.contains_key(partition) || req.poll_unpin(cx).is_pending()
+                });
             }
 
             // Try move item from buffer to batch.
@@ -388,7 +387,7 @@ where
             .field("service", &self.service)
             .field("batch", &self.batch)
             .field("timeout", &self.timeout)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -495,7 +494,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceSink")
             .field("service", &self.service)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -564,17 +563,20 @@ pub trait Response: fmt::Debug {
 
 impl Response for () {}
 
-impl<'a> Response for &'a str {}
+impl Response for &str {}
 
 #[cfg(test)]
 mod tests {
     use std::{
         convert::Infallible,
-        sync::{atomic::AtomicUsize, atomic::Ordering::Relaxed, Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        },
     };
 
     use bytes::Bytes;
-    use futures::{future, stream, task::noop_waker_ref, SinkExt, StreamExt};
+    use futures::{SinkExt, StreamExt, future, stream, task::noop_waker_ref};
     use tokio::{task::yield_now, time::Instant};
     use vector_lib::{
         finalization::{BatchNotifier, BatchStatus, EventFinalizer, EventFinalizers},
@@ -666,13 +668,11 @@ mod tests {
         // Services future will be spawned and work between `yield_now` calls.
         let svc = tower::service_fn(|req: Vec<Request>| async move {
             let duration = match req[0].0 {
-                1..=3 => Duration::from_secs(1),
-
                 // The 4th request will introduce some sort of
                 // latency spike to ensure later events don't
                 // get acked.
                 4 => Duration::from_secs(5),
-                5 | 6 => Duration::from_secs(1),
+                1..=3 | 5 | 6 => Duration::from_secs(1),
                 _ => unreachable!(),
             };
 
@@ -1081,7 +1081,7 @@ mod tests {
                 // Delay and then error
                 delay = false;
                 sleep(Duration::from_secs(1))
-                    .map(move |_| {
+                    .map(move |()| {
                         sent_requests.lock().unwrap().push(req);
                         Result::<_, std::io::Error>::Ok(())
                     })
@@ -1109,7 +1109,7 @@ mod tests {
             .unwrap();
 
         let output = sent_requests.lock().unwrap();
-        // We sended '0' partition first and delayed sending only first request, first 10 events,
+        // We sent '0' partition first and delayed sending only first request, first 10 events,
         // which should delay sending the second batch of events in the same partition until
         // the first one succeeds.
         assert_eq!(
@@ -1137,7 +1137,7 @@ mod tests {
 
     impl Partition<Bytes> for Partitions {
         fn partition(&self) -> Bytes {
-            format!("{:?}", self).into()
+            format!("{self:?}").into()
         }
     }
 

@@ -1,19 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
-use aws_sdk_secretsmanager::{config, Client};
+use aws_sdk_secretsmanager::{Client, config};
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
 
-use crate::aws::{create_client, AwsAuthentication, ClientBuilder, RegionOrEndpoint};
-use crate::config::ProxyConfig;
-use crate::tls::TlsConfig;
-use crate::{config::SecretBackend, signal};
+use crate::{
+    aws::{AwsAuthentication, ClientBuilder, RegionOrEndpoint, create_client},
+    config::{ProxyConfig, SecretBackend},
+    signal,
+    tls::TlsConfig,
+};
 
 pub(crate) struct SecretsManagerClientBuilder;
 
 impl ClientBuilder for SecretsManagerClientBuilder {
     type Client = Client;
 
-    fn build(config: &aws_types::SdkConfig) -> Self::Client {
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
         let config = config::Builder::from(config).build();
         Client::from_conf(config)
     }
@@ -27,23 +29,20 @@ pub struct AwsSecretsManagerBackend {
     pub secret_id: String,
 
     #[serde(flatten)]
-    #[configurable(derived)]
     pub region: RegionOrEndpoint,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub auth: AwsAuthentication,
 
-    #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 }
 
 impl GenerateConfig for AwsSecretsManagerBackend {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(AwsSecretsManagerBackend {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(AwsSecretsManagerBackend {
             secret_id: String::from("secret-id"),
-            region: Default::default(),
-            auth: Default::default(),
+            region: RegionOrEndpoint::default(),
+            auth: AwsAuthentication::default(),
             tls: None,
         })
         .unwrap()
@@ -57,12 +56,13 @@ impl SecretBackend for AwsSecretsManagerBackend {
         _: &mut signal::SignalRx,
     ) -> crate::Result<HashMap<String, String>> {
         let client = create_client::<SecretsManagerClientBuilder>(
+            &SecretsManagerClientBuilder {},
             &self.auth,
             self.region.region(),
             self.region.endpoint(),
             &ProxyConfig::default(),
-            &self.tls,
-            &None,
+            self.tls.as_ref(),
+            None,
         )
         .await?;
 
@@ -82,20 +82,20 @@ impl SecretBackend for AwsSecretsManagerBackend {
         let output = serde_json::from_str::<HashMap<String, String>>(secret_string.as_str())?;
 
         let mut secrets = HashMap::new();
-        for k in secret_keys.into_iter() {
+        for k in secret_keys {
             if let Some(secret) = output.get(&k) {
                 if secret.is_empty() {
                     return Err(format!(
-                        "value for key '{}' in secret with id '{}' was empty",
-                        k, &self.secret_id
+                        "value for key '{k}' in secret with id '{}' was empty",
+                        &self.secret_id
                     )
                     .into());
                 }
-                secrets.insert(k.to_string(), secret.to_string());
+                secrets.insert(k, secret.clone());
             } else {
                 return Err(format!(
-                    "key '{}' in secret with id '{}' does not exist",
-                    k, &self.secret_id
+                    "key '{k}' in secret with id '{}' does not exist",
+                    &self.secret_id
                 )
                 .into());
             }

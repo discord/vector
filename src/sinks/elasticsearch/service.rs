@@ -6,23 +6,26 @@ use std::{
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::{Response, Uri};
-use hyper::{service::Service, Body, Request};
+use hyper::{Body, Request, service::Service};
 use tower::ServiceExt;
-use vector_lib::stream::DriverResponse;
-use vector_lib::ByteSizeOf;
 use vector_lib::{
+    ByteSizeOf,
     json_size::JsonSize,
     request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+    stream::DriverResponse,
 };
 
 use super::{ElasticsearchCommon, ElasticsearchConfig};
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
     http::HttpClient,
-    sinks::util::{
-        auth::Auth,
-        http::{HttpBatchService, RequestConfig},
-        Compression, ElementCount,
+    sinks::{
+        elasticsearch::{encoder::ProcessedEvent, request_builder::ElasticsearchRequestBuilder},
+        util::{
+            Compression, ElementCount,
+            auth::Auth,
+            http::{HttpBatchService, RequestConfig},
+        },
     },
 };
 
@@ -33,6 +36,8 @@ pub struct ElasticsearchRequest {
     pub batch_size: usize,
     pub events_byte_size: JsonSize,
     pub metadata: RequestMetadata,
+    pub original_events: Vec<ProcessedEvent>, //store original_events for reconstruct request when retrying
+    pub elasticsearch_request_builder: ElasticsearchRequestBuilder,
 }
 
 impl ByteSizeOf for ElasticsearchRequest {
@@ -93,6 +98,7 @@ impl ElasticsearchService {
 pub struct HttpRequestBuilder {
     pub bulk_uri: Uri,
     pub auth: Option<Auth>,
+    pub service_type: crate::sinks::elasticsearch::OpenSearchServiceType,
     pub compression: Compression,
     pub http_request_config: RequestConfig,
 }
@@ -101,12 +107,20 @@ impl HttpRequestBuilder {
     pub fn new(common: &ElasticsearchCommon, config: &ElasticsearchConfig) -> HttpRequestBuilder {
         HttpRequestBuilder {
             bulk_uri: common.bulk_uri.clone(),
-            http_request_config: config.request.clone(),
             auth: common.auth.clone(),
+            service_type: common.service_type.clone(),
             compression: config.compression,
+            http_request_config: config.request.clone(),
         }
     }
 
+    /// Builds and authenticates a bulk request.
+    ///
+    /// # Errors
+    /// Returns an error if AWS credentials cannot be loaded or the request cannot be signed.
+    ///
+    /// # Panics
+    /// Panics if the configured URI or headers are invalid for an HTTP request.
     pub async fn build_request(
         &self,
         es_req: ElasticsearchRequest,
@@ -124,7 +138,7 @@ impl HttpRequestBuilder {
         }
 
         for (header, value) in &self.http_request_config.headers {
-            builder = builder.header(&header[..], &value[..]);
+            builder = builder.header(header.as_str(), value.as_str());
         }
 
         let mut request = builder
@@ -142,9 +156,10 @@ impl HttpRequestBuilder {
                     region,
                 } => {
                     crate::sinks::elasticsearch::sign_request(
+                        &self.service_type,
                         &mut request,
                         provider,
-                        &Some(region.clone()),
+                        Some(region),
                     )
                     .await?;
                 }
@@ -192,8 +207,8 @@ impl Service<ElasticsearchRequest> for ElasticsearchService {
 
             let event_status = get_event_status(&http_response);
             Ok(ElasticsearchResponse {
-                event_status,
                 http_response,
+                event_status,
                 events_byte_size,
             })
         })

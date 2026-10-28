@@ -1,7 +1,11 @@
+use std::{ffi::OsStr, path::Path};
+
 use bytes::Bytes;
-use vector_lib::codecs::{encoding::Framer, JsonSerializerConfig, NewlineDelimitedEncoderConfig};
-use vector_lib::partition::Partitioner;
-use vector_lib::request_metadata::GroupedCountByteSize;
+use vector_lib::{
+    codecs::{JsonSerializerConfig, NewlineDelimitedEncoderConfig, encoding::Framer},
+    partition::Partitioner,
+    request_metadata::GroupedCountByteSize,
+};
 
 use super::config::WebHdfsConfig;
 use crate::{
@@ -10,8 +14,8 @@ use crate::{
     sinks::{
         opendal_common::{OpenDalRequest, OpenDalRequestBuilder},
         util::{
+            Compression, HttpEndpoint,
             request_builder::{EncodeResult, RequestBuilder},
-            Compression,
         },
     },
 };
@@ -20,11 +24,12 @@ fn default_config(encoding: EncodingConfigWithFraming) -> WebHdfsConfig {
     WebHdfsConfig {
         root: "/tmp/".to_string(),
         prefix: "%F/".to_string(),
-        endpoint: "http://127.0.0.1:9870".to_string(),
+        endpoint: HttpEndpoint::parse("http://127.0.0.1:9870").unwrap(),
         encoding,
         compression: Compression::gzip_default(),
-        batch: Default::default(),
-        acknowledgements: Default::default(),
+        batch: crate::sinks::util::BatchConfig::default(),
+        acknowledgements: crate::config::AcknowledgementsConfig::default(),
+        confinement: crate::template::ConfinementConfig::default(),
     }
 }
 
@@ -77,10 +82,16 @@ fn build_request(compression: Compression) -> OpenDalRequest {
 #[test]
 fn webhdfs_build_request() {
     let req = build_request(Compression::None);
-    assert!(req.metadata.partition_key.ends_with(".log"));
+    assert_eq!(
+        Path::new(&req.metadata.partition_key).extension(),
+        Some(OsStr::new("log"))
+    );
 
     let req = build_request(Compression::None);
-    assert!(req.metadata.partition_key.ends_with(".log"));
+    assert_eq!(
+        Path::new(&req.metadata.partition_key).extension(),
+        Some(OsStr::new("log"))
+    );
 
     let req = build_request(Compression::gzip_default());
     assert!(req.metadata.partition_key.ends_with(".log.gz"));

@@ -3,14 +3,14 @@ use std::{hash::Hash, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc,
 use futures_util::stream::{self, BoxStream};
 use serde_with::serde_as;
 use tower::{
+    Service, ServiceBuilder,
     balance::p2c::Balance,
     buffer::{Buffer, BufferLayer},
     discover::Change,
-    layer::{util::Stack, Layer},
+    layer::{Layer, util::Stack},
     limit::RateLimit,
     retry::Retry,
     timeout::Timeout,
-    Service, ServiceBuilder,
 };
 use vector_lib::configurable::configurable_component;
 
@@ -22,13 +22,13 @@ pub use crate::sinks::util::service::{
 use crate::{
     internal_events::OpenGauge,
     sinks::util::{
+        Batch, BatchSink, Partition, PartitionBatchSink,
         adaptive_concurrency::{
             AdaptiveConcurrencyLimit, AdaptiveConcurrencyLimitLayer, AdaptiveConcurrencySettings,
         },
         retries::{FibonacciRetryPolicy, JitterMode, RetryLogic},
         service::map::MapLayer,
         sink::Response,
-        Batch, BatchSink, Partition, PartitionBatchSink,
     },
 };
 
@@ -44,7 +44,10 @@ pub type TowerPartitionSink<S, B, RL, K> = PartitionBatchSink<Svc<S, RL>, B, K>;
 
 // Distributed service types
 pub type DistributedService<S, RL, HL, K, Req> = RateLimit<
-    Retry<FibonacciRetryPolicy<RL>, Buffer<Balance<DiscoveryService<S, RL, HL, K>, Req>, Req>>,
+    Retry<
+        FibonacciRetryPolicy<RL>,
+        Buffer<Req, <Balance<DiscoveryService<S, RL, HL, K>, Req> as Service<Req>>::Future>,
+    >,
 >;
 pub type DiscoveryService<S, RL, HL, K> =
     BoxStream<'static, Result<Change<K, SingleDistributedService<S, RL, HL>>, crate::Error>>;
@@ -90,8 +93,8 @@ pub trait TowerRequestConfigDefaults {
     const RATE_LIMIT_DURATION_SECS: u64 = 1;
     const RATE_LIMIT_NUM: u64 = i64::MAX as u64; // i64 avoids TOML deserialize issue
     const RETRY_ATTEMPTS: usize = isize::MAX as usize; // isize avoids TOML deserialize issue
-    const RETRY_MAX_DURATION_SECS: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(30) };
-    const RETRY_INITIAL_BACKOFF_SECS: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(1) };
+    const RETRY_MAX_DURATION_SECS: NonZeroU64 = NonZeroU64::new(30).unwrap();
+    const RETRY_INITIAL_BACKOFF_SECS: NonZeroU64 = NonZeroU64::new(1).unwrap();
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -101,15 +104,13 @@ impl TowerRequestConfigDefaults for GlobalTowerRequestConfigDefaults {}
 
 /// Middleware settings for outbound requests.
 ///
-/// Various settings can be configured, such as concurrency and rate limits, timeouts, retry behavior, etc.
+/// Various settings can be configured, such as concurrency and rate limits, timeouts, and retry behavior.
 ///
 /// Note that the retry backoff policy follows the Fibonacci sequence.
 #[serde_as]
 #[configurable_component]
-#[configurable(metadata(docs::advanced))]
 #[derive(Clone, Copy, Debug)]
 pub struct TowerRequestConfig<D: TowerRequestConfigDefaults = GlobalTowerRequestConfigDefaults> {
-    #[configurable(derived)]
     #[serde(default = "default_concurrency::<D>")]
     #[serde(skip_serializing_if = "concurrency_is_default::<D>")]
     pub concurrency: Concurrency,
@@ -148,17 +149,15 @@ pub struct TowerRequestConfig<D: TowerRequestConfigDefaults = GlobalTowerRequest
 
     /// The amount of time to wait before attempting the first retry for a failed request.
     ///
-    /// After the first retry has failed, the fibonacci sequence is used to select future backoffs.
+    /// After the first retry has failed, the Fibonacci sequence is used to select future backoffs.
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::human_name = "Retry Initial Backoff"))]
     #[serde(default = "default_retry_initial_backoff_secs::<D>")]
     pub retry_initial_backoff_secs: NonZeroU64,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub retry_jitter_mode: JitterMode,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub adaptive_concurrency: AdaptiveConcurrencySettings,
 
@@ -217,6 +216,7 @@ impl<D: TowerRequestConfigDefaults> Default for TowerRequestConfig<D> {
 }
 
 impl<D: TowerRequestConfigDefaults> TowerRequestConfig<D> {
+    #[must_use]
     pub const fn into_settings(&self) -> TowerRequestSettings {
         // the unwrap() calls below are safe because the final defaults are always Some<>
         TowerRequestSettings {
@@ -266,7 +266,7 @@ impl TowerRequestSettings {
         batch_timeout: Duration,
     ) -> TowerPartitionSink<S, B, RL, K>
     where
-        RL: RetryLogic<Response = S::Response>,
+        RL: RetryLogic<Request = <B as Batch>::Output, Response = S::Response>,
         S: Service<B::Output> + Clone + Send + 'static,
         S::Error: Into<crate::Error> + Send + Sync + 'static,
         S::Response: Send + Response,
@@ -291,7 +291,7 @@ impl TowerRequestSettings {
         batch_timeout: Duration,
     ) -> TowerBatchedSink<S, B, RL>
     where
-        RL: RetryLogic<Response = S::Response>,
+        RL: RetryLogic<Request = <B as Batch>::Output, Response = S::Response>,
         S: Service<B::Output> + Clone + Send + 'static,
         S::Error: Into<crate::Error> + Send + Sync + 'static,
         S::Response: Send + Response,
@@ -307,14 +307,14 @@ impl TowerRequestSettings {
 
     /// Distributes requests to services [(Endpoint, service, healthcheck)]
     ///
-    /// [BufferLayer] suggests that the `buffer_bound` should be at least equal to
+    /// [`BufferLayer`] suggests that the `buffer_bound` should be at least equal to
     /// the number of the callers of the service. For sinks, this should typically be 1.
     pub fn distributed_service<Req, RL, HL, S>(
         self,
-        retry_logic: RL,
+        retry_logic: &RL,
         services: Vec<(String, S)>,
-        health_config: HealthConfig,
-        health_logic: HL,
+        health_config: &HealthConfig,
+        health_logic: &HL,
         buffer_bound: usize,
     ) -> DistributedService<S, RL, HL, usize, Req>
     where
@@ -352,7 +352,7 @@ impl TowerRequestSettings {
                     )
             })
             .enumerate()
-            .map(|(i, service)| Ok(Change::Insert(i, service)))
+            .map(|(i, service)| Ok::<_, S::Error>(Change::Insert(i, service)))
             .collect::<Vec<_>>();
 
         // Build sink service
@@ -404,18 +404,18 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        atomic::{AtomicBool, Ordering::AcqRel},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering::AcqRel},
     };
 
-    use futures::{future, stream, FutureExt, SinkExt, StreamExt};
+    use futures::{FutureExt, SinkExt, StreamExt, future, stream};
     use tokio::time::Duration;
     use vector_lib::json_size::JsonSize;
 
     use super::*;
     use crate::sinks::util::{
-        retries::{RetryAction, RetryLogic},
         BatchSettings, EncodedEvent, PartitionBuffer, PartitionInnerBuffer, VecBuffer,
+        retries::{RetryAction, RetryLogic},
     };
 
     const TIMEOUT: Duration = Duration::from_secs(10);
@@ -426,28 +426,28 @@ mod tests {
         let toml = toml::to_string(&cfg).unwrap();
         toml::from_str::<TowerRequestConfig>(&toml).expect("Default config failed");
 
-        let cfg = toml::from_str::<TowerRequestConfig>("").expect("Empty config failed");
+        let cfg = serde_yaml::from_str::<TowerRequestConfig>("").expect("Empty config failed");
         assert_eq!(cfg.concurrency, Concurrency::Adaptive);
 
-        let cfg = toml::from_str::<TowerRequestConfig>("concurrency = 10")
+        let cfg = serde_yaml::from_str::<TowerRequestConfig>("concurrency: 10")
             .expect("Fixed concurrency failed");
         assert_eq!(cfg.concurrency, Concurrency::Fixed(10));
 
-        let cfg = toml::from_str::<TowerRequestConfig>(r#"concurrency = "adaptive""#)
+        let cfg = serde_yaml::from_str::<TowerRequestConfig>(r#"concurrency: "adaptive""#)
             .expect("Adaptive concurrency setting failed");
         assert_eq!(cfg.concurrency, Concurrency::Adaptive);
 
-        let cfg = toml::from_str::<TowerRequestConfig>(r#"concurrency = "none""#)
+        let cfg = serde_yaml::from_str::<TowerRequestConfig>(r#"concurrency: "none""#)
             .expect("None concurrency setting failed");
         assert_eq!(cfg.concurrency, Concurrency::None);
 
-        toml::from_str::<TowerRequestConfig>(r#"concurrency = "broken""#)
+        serde_yaml::from_str::<TowerRequestConfig>(r#"concurrency: "broken""#)
             .expect_err("Invalid concurrency setting didn't fail");
 
-        toml::from_str::<TowerRequestConfig>(r#"concurrency = 0"#)
+        serde_yaml::from_str::<TowerRequestConfig>("concurrency: 0")
             .expect_err("Invalid concurrency setting didn't fail on zero");
 
-        toml::from_str::<TowerRequestConfig>(r#"concurrency = -9"#)
+        serde_yaml::from_str::<TowerRequestConfig>("concurrency: -9")
             .expect_err("Invalid concurrency setting didn't fail on negative number");
     }
 
@@ -457,7 +457,7 @@ mod tests {
         let settings = cfg.into_settings();
 
         assert_eq!(settings.concurrency, None);
-        assert_eq!(settings.timeout, Duration::from_secs(60));
+        assert_eq!(settings.timeout, Duration::from_mins(1));
         assert_eq!(settings.rate_limit_duration, Duration::from_secs(1));
         assert_eq!(settings.rate_limit_num, i64::MAX as u64);
         assert_eq!(settings.retry_attempts, isize::MAX as usize);
@@ -474,8 +474,8 @@ mod tests {
         const RATE_LIMIT_DURATION_SECS: u64 = 2;
         const RATE_LIMIT_NUM: u64 = 3;
         const RETRY_ATTEMPTS: usize = 4;
-        const RETRY_MAX_DURATION_SECS: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(5) };
-        const RETRY_INITIAL_BACKOFF_SECS: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(6) };
+        const RETRY_MAX_DURATION_SECS: NonZeroU64 = NonZeroU64::new(5).unwrap();
+        const RETRY_INITIAL_BACKOFF_SECS: NonZeroU64 = NonZeroU64::new(6).unwrap();
     }
 
     #[test]
@@ -495,16 +495,15 @@ mod tests {
     #[test]
     fn into_settings_with_populated_config() {
         // Populate with values not equal to the global defaults.
-        let cfg = toml::from_str::<TowerRequestConfig>(
-            r#" concurrency = 16
-            timeout_secs = 1
-            rate_limit_duration_secs = 2
-            rate_limit_num = 3
-            retry_attempts = 4
-            retry_max_duration_secs = 5
-            retry_initial_backoff_secs = 6
-        "#,
-        )
+        let cfg = serde_yaml::from_str::<TowerRequestConfig>(indoc::indoc! {"
+            concurrency: 16
+            timeout_secs: 1
+            rate_limit_duration_secs: 2
+            rate_limit_num: 3
+            retry_attempts: 4
+            retry_max_duration_secs: 5
+            retry_initial_backoff_secs: 6
+        "})
         .expect("Config failed to parse");
 
         // Merge with defaults
@@ -534,11 +533,11 @@ mod tests {
         let svc = {
             let sent_requests = Arc::clone(&sent_requests);
             let delay = Arc::new(AtomicBool::new(true));
-            tower::service_fn(move |req: PartitionInnerBuffer<_, _>| {
+            tower::service_fn(move |req: PartitionInnerBuffer<Vec<usize>, Vec<usize>>| {
                 let (req, _) = req.into_parts();
                 if delay.swap(false, AcqRel) {
                     // Error on first request
-                    future::err::<(), _>(std::io::Error::new(std::io::ErrorKind::Other, "")).boxed()
+                    future::err::<(), _>(std::io::Error::other("")).boxed()
                 } else {
                     sent_requests.lock().unwrap().push(req);
                     future::ok::<_, std::io::Error>(()).boxed()
@@ -558,7 +557,7 @@ mod tests {
         );
         sink.ordered();
 
-        let input = (0..20).map(|i| PartitionInnerBuffer::new(i, 0));
+        let input = (0..20).map(|i| PartitionInnerBuffer::new(i, vec![0]));
         sink.sink_map_err(drop)
             .send_all(
                 &mut stream::iter(input)
@@ -579,13 +578,14 @@ mod tests {
 
     impl RetryLogic for RetryAlways {
         type Error = std::io::Error;
+        type Request = PartitionInnerBuffer<Vec<usize>, Vec<usize>>;
         type Response = ();
 
         fn is_retriable_error(&self, _: &Self::Error) -> bool {
             true
         }
 
-        fn should_retry_response(&self, _response: &Self::Response) -> RetryAction {
+        fn should_retry_response(&self, _response: &Self::Response) -> RetryAction<Self::Request> {
             // Treat the default as the request is successful
             RetryAction::Successful
         }

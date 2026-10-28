@@ -1,14 +1,15 @@
-use metrics::counter;
-use vector_lib::internal_event::InternalEvent;
-use vector_lib::internal_event::{error_stage, error_type};
+use vector_lib::{
+    NamedInternalEvent, counter,
+    internal_event::{CounterName, InternalEvent, error_stage, error_type},
+};
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct PostgresqlMetricsCollectError<'a> {
     pub error: String,
     pub endpoint: &'a str,
 }
 
-impl<'a> InternalEvent for PostgresqlMetricsCollectError<'a> {
+impl InternalEvent for PostgresqlMetricsCollectError<'_> {
     fn emit(self) {
         error!(
             message = "PostgreSQL query error.",
@@ -16,10 +17,9 @@ impl<'a> InternalEvent for PostgresqlMetricsCollectError<'a> {
             error_type = error_type::REQUEST_FAILED,
             stage = error_stage::RECEIVING,
             endpoint = %self.endpoint,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_type" => error_type::REQUEST_FAILED,
             "stage" => error_stage::RECEIVING,
         )

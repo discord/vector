@@ -1,27 +1,30 @@
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, SinkExt};
 use http::{Request, Uri};
 use hyper::Body;
 use indoc::indoc;
-use serde_json::{json, Value};
-use snafu::{ResultExt, Snafu};
+use serde_json::{Value, json};
+use snafu::Snafu;
 use tokio_util::codec::Encoder as _;
 use vector_lib::configurable::configurable_component;
 
 use crate::{
     codecs::{Encoder, EncodingConfig, Transformer},
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, ValidatedSink,
+    },
     event::Event,
-    gcp::{GcpAuthConfig, GcpAuthenticator, Scope, PUBSUB_URL},
+    gcp::{GcpAuthConfig, GcpAuthenticator, PUBSUB_URL, Scope},
     http::HttpClient,
     sinks::{
+        Healthcheck, VectorSink,
         gcs_common::config::healthcheck_response,
         util::{
+            BatchConfig, BatchSettings, BoxedRawValue, HttpEndpoint, JsonArrayBuffer,
+            SinkBatchSettings, TowerRequestConfig,
             http::{BatchedHttpSink, HttpEventEncoder, HttpSink},
-            BatchConfig, BoxedRawValue, JsonArrayBuffer, SinkBatchSettings, TowerRequestConfig,
         },
-        Healthcheck, UriParseSnafu, VectorSink,
     },
     tls::{TlsConfig, TlsSettings},
 };
@@ -69,27 +72,22 @@ pub struct PubsubConfig {
     /// [pubsub_api]: https://cloud.google.com/pubsub/docs/reference/rest
     #[serde(default = "default_endpoint")]
     #[configurable(metadata(docs::examples = "https://us-central1-pubsub.googleapis.com"))]
-    pub endpoint: String,
+    pub endpoint: HttpEndpoint,
 
     #[serde(default, flatten)]
     pub auth: GcpAuthConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<PubsubDefaultBatchSettings>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub request: TowerRequestConfig,
 
-    #[configurable(derived)]
     encoding: EncodingConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -98,17 +96,18 @@ pub struct PubsubConfig {
     acknowledgements: AcknowledgementsConfig,
 }
 
-fn default_endpoint() -> String {
-    PUBSUB_URL.to_string()
+fn default_endpoint() -> HttpEndpoint {
+    HttpEndpoint::parse(PUBSUB_URL).expect("static default endpoint should be a valid http(s) URL")
 }
 
 impl GenerateConfig for PubsubConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(indoc! {r#"
-            project = "my-project"
-            topic = "my-topic"
-            encoding.codec = "json"
-        "#})
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc! {r"
+            project: my-project
+            topic: my-topic
+            encoding:
+              codec: json
+        "})
         .unwrap()
     }
 }
@@ -116,15 +115,67 @@ impl GenerateConfig for PubsubConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "gcp_pubsub")]
 impl SinkConfig for PubsubConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let sink = PubsubSink::from_config(self).await?;
+    fn input(&self) -> Input {
+        Input::new(self.encoding.config().input_type())
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for PubsubConfig {
+    type Validated = ValidatedPubsub;
+
+    fn validate(&self) -> crate::Result<ValidatedPubsub> {
+        let uri_base = self.endpoint.append_path(&format!(
+            "/v1/projects/{}/topics/{}",
+            self.project, self.topic,
+        ))?;
+
         let batch_settings = self
             .batch
             .validate()?
             .limit_max_bytes(MAX_BATCH_PAYLOAD_SIZE)?
             .into_batch_settings()?;
+        self.encoding.validate()?;
+
+        let transformer = self.encoding.transformer();
+
+        Ok(ValidatedPubsub {
+            uri_base,
+            batch_settings,
+            transformer,
+        })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedPubsub,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedPubsub {
+            uri_base,
+            batch_settings,
+            transformer,
+        } = validated.clone();
+
+        // We only need to load the credentials if we are not targeting an emulator.
+        let auth = self.auth.build(Scope::PubSub).await?;
+
+        let serializer = self.encoding.build()?;
+        let encoder = Encoder::<()>::new(serializer);
+
+        let sink = PubsubSink {
+            auth,
+            uri_base,
+            transformer,
+            encoder,
+        };
+
         let request_settings = self.request.into_settings();
-        let tls_settings = TlsSettings::from_options(&self.tls)?;
+        let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls_settings, cx.proxy())?;
 
         let healthcheck = healthcheck(client.clone(), sink.uri("")?, sink.auth.clone()).boxed();
@@ -133,57 +184,36 @@ impl SinkConfig for PubsubConfig {
         let sink = BatchedHttpSink::new(
             sink,
             JsonArrayBuffer::new(batch_settings.size),
-            request_settings,
+            &request_settings,
             batch_settings.timeout,
             client,
         )
-        .sink_map_err(|error| error!(message = "Fatal gcp_pubsub sink error.", %error));
+        .sink_map_err(|error| error!(message = "Fatal gcp_pubsub sink error.", %error, internal_log_rate_limit = false));
 
         #[allow(deprecated)]
         Ok((VectorSink::from_event_sink(sink), healthcheck))
     }
+}
 
-    fn input(&self) -> Input {
-        Input::new(self.encoding.config().input_type() & DataType::Log)
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
+#[derive(Clone, Debug)]
+pub struct ValidatedPubsub {
+    uri_base: HttpEndpoint,
+    batch_settings: BatchSettings<JsonArrayBuffer>,
+    transformer: Transformer,
 }
 
 struct PubsubSink {
     auth: GcpAuthenticator,
-    uri_base: String,
+    uri_base: HttpEndpoint,
     transformer: Transformer,
     encoder: Encoder<()>,
 }
 
 impl PubsubSink {
-    async fn from_config(config: &PubsubConfig) -> crate::Result<Self> {
-        // We only need to load the credentials if we are not targeting an emulator.
-        let auth = config.auth.build(Scope::PubSub).await?;
-
-        let uri_base = format!(
-            "{}/v1/projects/{}/topics/{}",
-            config.endpoint, config.project, config.topic,
-        );
-
-        let transformer = config.encoding.transformer();
-        let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
-
-        Ok(Self {
-            auth,
-            uri_base,
-            transformer,
-            encoder,
-        })
-    }
-
     fn uri(&self, suffix: &str) -> crate::Result<Uri> {
-        let uri = format!("{}{}", self.uri_base, suffix);
-        let mut uri = uri.parse::<Uri>().context(UriParseSnafu)?;
+        // The suffix is a Google API method (for example `:publish`) that
+        // attaches directly to the topic path without a separator.
+        let mut uri = self.uri_base.append_raw_suffix(suffix)?.into_uri();
         self.auth.apply_uri(&mut uri);
         Ok(uri)
     }
@@ -237,7 +267,7 @@ async fn healthcheck(client: HttpClient, uri: Uri, auth: GcpAuthenticator) -> cr
     auth.apply(&mut request);
 
     let response = client.send(request).await?;
-    healthcheck_response(response, HealthcheckError::TopicNotFound.into())
+    healthcheck_response(&response, HealthcheckError::TopicNotFound.into())
 }
 
 #[cfg(test)]
@@ -251,15 +281,38 @@ mod tests {
         crate::test_util::test_generate_config::<PubsubConfig>();
     }
 
+    #[test]
+    fn validate_produces_usable_values() {
+        use crate::config::ValidatedSink;
+
+        let config: PubsubConfig = serde_yaml::from_str(indoc! {r"
+                project: project
+                topic: topic
+                encoding:
+                  codec: json
+            "})
+        .unwrap();
+
+        let validated = config.validate().expect("validation should succeed");
+        assert_eq!(
+            validated.uri_base.to_string(),
+            "https://pubsub.googleapis.com/v1/projects/project/topics/topic"
+        );
+    }
+
     #[tokio::test]
     async fn fails_missing_creds() {
-        let config: PubsubConfig = toml::from_str(indoc! {r#"
-                project = "project"
-                topic = "topic"
-                encoding.codec = "json"
-            "#})
+        let config: PubsubConfig = serde_yaml::from_str(indoc! {r"
+                project: project
+                topic: topic
+                encoding:
+                  codec: json
+            "})
         .unwrap();
-        if config.build(SinkContext::default()).await.is_ok() {
+        if SinkConfig::build(&config, SinkContext::default())
+            .await
+            .is_ok()
+        {
             panic!("config.build failed to error");
         }
     }
@@ -269,16 +322,22 @@ mod tests {
 mod integration_tests {
     use reqwest::{Client, Method, Response};
     use serde::{Deserialize, Serialize};
-    use serde_json::{json, Value};
-    use vector_lib::codecs::JsonSerializerConfig;
-    use vector_lib::event::{BatchNotifier, BatchStatus};
+    use serde_json::{Value, json};
+    use vector_lib::{
+        codecs::JsonSerializerConfig,
+        event::{BatchNotifier, BatchStatus},
+    };
 
     use super::*;
-    use crate::gcp;
-    use crate::test_util::components::{run_and_assert_sink_error, COMPONENT_ERROR_TAGS};
-    use crate::test_util::{
-        components::{run_and_assert_sink_compliance, HTTP_SINK_TAGS},
-        random_events_with_stream, random_string, trace_init,
+    use crate::{
+        gcp,
+        test_util::{
+            components::{
+                COMPONENT_ERROR_TAGS, HTTP_SINK_TAGS, run_and_assert_sink_compliance,
+                run_and_assert_sink_error,
+            },
+            random_events_with_stream, random_metrics_with_stream, random_string, trace_init,
+        },
     };
 
     const PROJECT: &str = "testproject";
@@ -287,22 +346,52 @@ mod integration_tests {
         PubsubConfig {
             project: PROJECT.into(),
             topic: topic.into(),
-            endpoint: gcp::PUBSUB_ADDRESS.clone(),
+            endpoint: HttpEndpoint::parse(&gcp::PUBSUB_ADDRESS).unwrap(),
             auth: GcpAuthConfig {
                 skip_authentication: true,
                 ..Default::default()
             },
-            batch: Default::default(),
-            request: Default::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
             encoding: JsonSerializerConfig::default().into(),
-            tls: Default::default(),
-            acknowledgements: Default::default(),
+            tls: Option::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
         }
     }
 
     async fn config_build(topic: &str) -> (VectorSink, crate::sinks::Healthcheck) {
         let cx = SinkContext::default();
-        config(topic).build(cx).await.expect("Building sink failed")
+        SinkConfig::build(&config(topic), cx)
+            .await
+            .expect("Building sink failed")
+    }
+
+    #[tokio::test]
+    async fn publish_metrics() {
+        trace_init();
+
+        let (topic, subscription) = create_topic_subscription().await;
+        let (sink, healthcheck) = config_build(&topic).await;
+
+        healthcheck.await.expect("Health check failed");
+
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+        let (input, events) = random_metrics_with_stream(100, Some(batch), None);
+        run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+
+        let response = pull_messages(&subscription, 1000).await;
+        let messages = response
+            .receivedMessages
+            .as_ref()
+            .expect("Response is missing messages");
+        assert_eq!(input.len(), messages.len());
+        for i in 0..input.len() {
+            let data = messages[i].message.decode_data_as_value();
+            let data = serde_json::to_value(data).unwrap();
+            let expected = serde_json::to_value(input[i].as_metric()).unwrap();
+            assert_eq!(data, expected);
+        }
     }
 
     #[tokio::test]
@@ -339,7 +428,7 @@ mod integration_tests {
         trace_init();
 
         let (topic, _subscription) = create_topic_subscription().await;
-        let (sink, _healthcheck) = config_build(&format!("BREAK{}BREAK", topic)).await;
+        let (sink, _healthcheck) = config_build(&format!("BREAK{topic}BREAK")).await;
         // Explicitly skip healthcheck
 
         let (batch, mut receiver) = BatchNotifier::new_with_receiver();
@@ -353,7 +442,7 @@ mod integration_tests {
         trace_init();
 
         let (topic, _subscription) = create_topic_subscription().await;
-        let topic = format!("BAD{}", topic);
+        let topic = format!("BAD{topic}");
         let (_sink, healthcheck) = config_build(&topic).await;
         healthcheck.await.expect_err("Health check did not fail");
     }
@@ -361,15 +450,15 @@ mod integration_tests {
     async fn create_topic_subscription() -> (String, String) {
         let topic = format!("topic-{}", random_string(10));
         let subscription = format!("subscription-{}", random_string(10));
-        request(Method::PUT, &format!("topics/{}", topic), json!({}))
+        request(Method::PUT, &format!("topics/{topic}"), json!({}))
             .await
             .json::<Value>()
             .await
             .expect("Creating new topic failed");
         request(
             Method::PUT,
-            &format!("subscriptions/{}", subscription),
-            json!({ "topic": format!("projects/{}/topics/{}", PROJECT, topic) }),
+            &format!("subscriptions/{subscription}"),
+            json!({ "topic": format!("projects/{PROJECT}/topics/{topic}") }),
         )
         .await
         .json::<Value>()
@@ -379,19 +468,19 @@ mod integration_tests {
     }
 
     async fn request(method: Method, path: &str, json: Value) -> Response {
-        let url = format!("{}/v1/projects/{}/{}", *gcp::PUBSUB_ADDRESS, PROJECT, path);
+        let url = format!("{}/v1/projects/{PROJECT}/{path}", *gcp::PUBSUB_ADDRESS);
         Client::new()
             .request(method.clone(), &url)
             .json(&json)
             .send()
             .await
-            .unwrap_or_else(|_| panic!("Sending {} request to {} failed", method, url))
+            .unwrap_or_else(|_| panic!("Sending {method} request to {url} failed"))
     }
 
     async fn pull_messages(subscription: &str, count: usize) -> PullResponse {
         request(
             Method::POST,
-            &format!("subscriptions/{}:pull", subscription),
+            &format!("subscriptions/{subscription}:pull"),
             json!({
                 "returnImmediately": true,
                 "maxMessages": count
@@ -433,6 +522,14 @@ mod integration_tests {
                 .expect("Invalid base64 data");
             let data = String::from_utf8_lossy(&data);
             serde_json::from_str(&data).expect("Invalid message structure")
+        }
+
+        fn decode_data_as_value(&self) -> Value {
+            let data = BASE64_STANDARD
+                .decode(&self.data)
+                .expect("Invalid base64 data");
+            let data = String::from_utf8_lossy(&data);
+            serde_json::from_str(&data).expect("Invalid json")
         }
     }
 

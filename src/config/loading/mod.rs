@@ -1,18 +1,25 @@
 mod config_builder;
+pub(crate) mod interpolation;
 mod loader;
+mod representation;
+pub mod schema_coercion;
 mod secret;
 mod source;
+
+#[cfg(test)]
+mod tests;
 
 use std::{
     collections::HashMap,
     fmt::Debug,
     fs::{File, ReadDir},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
-use config_builder::ConfigBuilderLoader;
+pub use config_builder::ConfigBuilderLoader;
 use glob::glob;
+pub use interpolation::interpolate_config_map_with_env_vars;
 use loader::process::Process;
 pub use loader::*;
 pub use secret::*;
@@ -20,24 +27,42 @@ pub use source::*;
 use vector_lib::configurable::NamedComponent;
 
 use super::{
-    builder::ConfigBuilder, format, validation, vars, Config, ConfigPath, Format, FormatHint,
+    Config, ConfigPath, Format, FormatHint, ProviderConfig, builder::ConfigBuilder, validation,
 };
-use crate::{config::ProviderConfig, signal};
+use crate::signal;
 
 pub static CONFIG_PATHS: Mutex<Vec<ConfigPath>> = Mutex::new(Vec::new());
+
+static ALLOW_ENV_VAR_INTERPOLATION: OnceLock<bool> = OnceLock::new();
+
+/// Sets whether environment variable interpolation is enabled for the process.
+/// Must be called exactly once at startup before any config loading.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_panics_doc, reason = "Panic documentation deferred")]
+pub fn set_env_var_interpolation(allow: bool) {
+    ALLOW_ENV_VAR_INTERPOLATION
+        .set(allow)
+        .expect("set_env_var_interpolation must only be called once");
+}
+
+/// Returns whether environment variable interpolation is currently enabled.
+/// Defaults to `false` if [`set_env_var_interpolation`] has not been called.
+pub fn env_var_interpolation_enabled() -> bool {
+    *ALLOW_ENV_VAR_INTERPOLATION.get().unwrap_or(&false)
+}
 
 pub(super) fn read_dir<P: AsRef<Path> + Debug>(path: P) -> Result<ReadDir, Vec<String>> {
     path.as_ref()
         .read_dir()
-        .map_err(|err| vec![format!("Could not read config dir: {:?}, {}.", path, err)])
+        .map_err(|err| vec![format!("Could not read config dir: {path:?}, {err}.")])
 }
 
 pub(super) fn component_name<P: AsRef<Path> + Debug>(path: P) -> Result<String, Vec<String>> {
     path.as_ref()
         .file_stem()
         .and_then(|name| name.to_str())
-        .map(|name| name.to_string())
-        .ok_or_else(|| vec![format!("Couldn't get component name for file: {:?}", path)])
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| vec![format!("Couldn't get component name for file: {path:?}")])
 }
 
 pub(super) fn open_file<P: AsRef<Path> + Debug>(path: P) -> Option<File> {
@@ -45,10 +70,14 @@ pub(super) fn open_file<P: AsRef<Path> + Debug>(path: P) -> Option<File> {
         Ok(f) => Some(f),
         Err(error) => {
             if let std::io::ErrorKind::NotFound = error.kind() {
-                error!(message = "Config file not found in path.", ?path);
+                error!(
+                    message = "Config file not found in path.",
+                    ?path,
+                    internal_log_rate_limit = false
+                );
                 None
             } else {
-                error!(message = "Error opening config file.", %error, ?path);
+                error!(message = "Error opening config file.", %error, ?path, internal_log_rate_limit = false);
                 None
             }
         }
@@ -67,11 +96,13 @@ pub fn merge_path_lists(
 
 /// Expand a list of paths (potentially containing glob patterns) into real
 /// config paths, replacing it with the default paths when empty.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_panics_doc, reason = "Panic documentation deferred")]
 pub fn process_paths(config_paths: &[ConfigPath]) -> Option<Vec<ConfigPath>> {
-    let starting_paths = if !config_paths.is_empty() {
-        config_paths.to_owned()
-    } else {
+    let starting_paths = if config_paths.is_empty() {
         default_config_paths()
+    } else {
+        config_paths.to_owned()
     };
 
     let mut paths = Vec::new();
@@ -89,7 +120,7 @@ pub fn process_paths(config_paths: &[ConfigPath]) -> Option<Vec<ConfigPath>> {
         };
 
         if matches.is_empty() {
-            error!(message = "Config file not found in path.", path = ?config_pattern);
+            error!(message = "Config file not found in path.", path = ?config_pattern, internal_log_rate_limit = false);
             std::process::exit(exitcode::CONFIG);
         }
 
@@ -101,7 +132,7 @@ pub fn process_paths(config_paths: &[ConfigPath]) -> Option<Vec<ConfigPath>> {
             }
             ConfigPath::Dir(_) => {
                 for path in matches {
-                    paths.push(ConfigPath::Dir(path))
+                    paths.push(ConfigPath::Dir(path));
                 }
             }
         }
@@ -119,12 +150,14 @@ pub fn process_paths(config_paths: &[ConfigPath]) -> Option<Vec<ConfigPath>> {
     Some(paths)
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub fn load_from_paths(config_paths: &[ConfigPath]) -> Result<Config, Vec<String>> {
-    let builder = load_builder_from_paths(config_paths)?;
+    let builder = ConfigBuilderLoader::default().load_from_paths(config_paths)?;
     let (config, build_warnings) = builder.build_with_warnings()?;
 
     for warning in build_warnings {
-        warn!("{}", warning);
+        warn!("{warning}");
     }
 
     Ok(config)
@@ -133,27 +166,15 @@ pub fn load_from_paths(config_paths: &[ConfigPath]) -> Result<Config, Vec<String
 /// Loads a configuration from paths. Handle secret replacement and if a provider is present
 /// in the builder, the config is used as bootstrapping for a remote source. Otherwise,
 /// provider instantiation is skipped.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub async fn load_from_paths_with_provider_and_secrets(
     config_paths: &[ConfigPath],
     signal_handler: &mut signal::SignalHandler,
     allow_empty: bool,
 ) -> Result<Config, Vec<String>> {
-    // Load secret backends first
-    let mut secrets_backends_loader = load_secret_backends_from_paths(config_paths)?;
-    // And then, if needed, retrieve secrets from configured backends
-    let mut builder = if secrets_backends_loader.has_secrets_to_retrieve() {
-        debug!(message = "Secret placeholders found, retrieving secrets from configured backends.");
-        let resolved_secrets = secrets_backends_loader
-            .retrieve(&mut signal_handler.subscribe())
-            .await
-            .map_err(|e| vec![e])?;
-        load_builder_from_paths_with_secrets(config_paths, resolved_secrets)?
-    } else {
-        debug!(message = "No secret placeholder found, skipping secret resolution.");
-        load_builder_from_paths(config_paths)?
-    };
-
-    builder.allow_empty = allow_empty;
+    let mut builder =
+        load_builder_from_paths_with_secrets(config_paths, signal_handler, allow_empty).await?;
 
     validation::check_provider(&builder)?;
     signal_handler.clear();
@@ -164,19 +185,82 @@ pub async fn load_from_paths_with_provider_and_secrets(
         debug!(message = "Provider configured.", provider = ?provider.get_component_name());
     }
 
+    finalize_config(builder).await
+}
+
+/// Loads a `ConfigBuilder` from paths, resolving `SECRET[...]` placeholders
+/// from the configured backends first, like the run path does.
+pub(crate) async fn load_builder_from_paths_with_secrets(
+    config_paths: &[ConfigPath],
+    signal_handler: &mut signal::SignalHandler,
+    allow_empty: bool,
+) -> Result<ConfigBuilder, Vec<String>> {
+    let secrets_backends_loader = loader_from_paths(SecretBackendLoader::default(), config_paths)?;
+    let secrets = secrets_backends_loader
+        .retrieve_secrets(signal_handler)
+        .await
+        .map_err(|e| vec![e])?;
+
+    ConfigBuilderLoader::default()
+        .allow_empty(allow_empty)
+        .secrets(secrets)
+        .load_from_paths(config_paths)
+}
+
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
+pub async fn load_from_str_with_secrets(
+    input: &str,
+    format: Format,
+    signal_handler: &mut signal::SignalHandler,
+    allow_empty: bool,
+) -> Result<Config, Vec<String>> {
+    let secrets_backends_loader =
+        loader_from_input(SecretBackendLoader::default(), input.as_bytes(), format)?;
+    let secrets = secrets_backends_loader
+        .retrieve_secrets(signal_handler)
+        .await
+        .map_err(|e| vec![e])?;
+
+    let builder = ConfigBuilderLoader::default()
+        .allow_empty(allow_empty)
+        .secrets(secrets)
+        .load_from_input(input.as_bytes(), format)?;
+    signal_handler.clear();
+
+    finalize_config(builder).await
+}
+
+async fn finalize_config(builder: ConfigBuilder) -> Result<Config, Vec<String>> {
     let (new_config, build_warnings) = builder.build_with_warnings()?;
 
     validation::check_buffer_preconditions(&new_config).await?;
 
     for warning in build_warnings {
-        warn!("{}", warning);
+        warn!("{warning}");
     }
 
     Ok(new_config)
 }
 
+pub(super) fn loader_from_input<T, L, R>(
+    mut loader: L,
+    input: R,
+    format: Format,
+) -> Result<T, Vec<String>>
+where
+    T: serde::de::DeserializeOwned,
+    L: Loader<T> + Process,
+    R: std::io::Read,
+{
+    loader.load_from_str(input, format).map(|()| loader.take())
+}
+
 /// Iterators over `ConfigPaths`, and processes a file/dir according to a provided `Loader`.
-fn loader_from_paths<T, L>(mut loader: L, config_paths: &[ConfigPath]) -> Result<T, Vec<String>>
+pub(super) fn loader_from_paths<T, L>(
+    mut loader: L,
+    config_paths: &[ConfigPath],
+) -> Result<T, Vec<String>>
 where
     T: serde::de::DeserializeOwned,
     L: Loader<T> + Process,
@@ -194,14 +278,12 @@ where
                 ) {
                     Ok(()) => {}
                     Err(errs) => errors.extend(errs),
-                };
+                }
             }
-            ConfigPath::Dir(path) => {
-                match loader.load_from_dir(path) {
-                    Ok(()) => {}
-                    Err(errs) => errors.extend(errs),
-                };
-            }
+            ConfigPath::Dir(path) => match loader.load_from_dir(path) {
+                Ok(()) => {}
+                Err(errs) => errors.extend(errs),
+            },
         }
     }
 
@@ -212,39 +294,23 @@ where
     }
 }
 
-/// Uses `ConfigBuilderLoader` to process `ConfigPaths`, deserializing to a `ConfigBuilder`.
-pub fn load_builder_from_paths(config_paths: &[ConfigPath]) -> Result<ConfigBuilder, Vec<String>> {
-    loader_from_paths(ConfigBuilderLoader::new(), config_paths)
-}
-
-/// Uses `ConfigBuilderLoader` to process `ConfigPaths`, performing secret replacement and deserializing to a `ConfigBuilder`
-pub fn load_builder_from_paths_with_secrets(
-    config_paths: &[ConfigPath],
-    secrets: HashMap<String, String>,
-) -> Result<ConfigBuilder, Vec<String>> {
-    loader_from_paths(ConfigBuilderLoader::with_secrets(secrets), config_paths)
-}
-
-/// Uses `SourceLoader` to process `ConfigPaths`, deserializing to a toml `SourceMap`.
+/// Uses `SourceLoader` to process `ConfigPaths`, deserializing to a JSON object.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub fn load_source_from_paths(
     config_paths: &[ConfigPath],
-) -> Result<toml::value::Table, Vec<String>> {
+) -> Result<serde_json::Map<String, serde_json::Value>, Vec<String>> {
     loader_from_paths(SourceLoader::new(), config_paths)
 }
 
-/// Uses `SecretBackendLoader` to process `ConfigPaths`, deserializing to a `SecretBackends`.
-pub fn load_secret_backends_from_paths(
-    config_paths: &[ConfigPath],
-) -> Result<SecretBackendLoader, Vec<String>> {
-    loader_from_paths(SecretBackendLoader::new(), config_paths)
-}
-
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub fn load_from_str(input: &str, format: Format) -> Result<Config, Vec<String>> {
     let builder = load_from_inputs(std::iter::once((input.as_bytes(), format)))?;
     let (config, build_warnings) = builder.build_with_warnings()?;
 
     for warning in build_warnings {
-        warn!("{}", warning);
+        warn!("{warning}");
     }
 
     Ok(config)
@@ -259,7 +325,7 @@ fn load_from_inputs(
     for (input, format) in inputs {
         if let Err(errs) = load(input, format).and_then(|n| config.append(n)) {
             // TODO: add back paths
-            errors.extend(errs.iter().map(|e| e.to_string()));
+            errors.extend(errs.iter().cloned());
         }
     }
 
@@ -270,28 +336,46 @@ fn load_from_inputs(
     }
 }
 
-pub fn prepare_input<R: std::io::Read>(mut input: R) -> Result<String, Vec<String>> {
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
+pub fn prepare_input<R: std::io::Read>(
+    mut input: R,
+    interpolate_env: bool,
+) -> Result<String, Vec<String>> {
     let mut source_string = String::new();
     input
         .read_to_string(&mut source_string)
         .map_err(|e| vec![e.to_string()])?;
 
-    let mut vars = std::env::vars().collect::<HashMap<_, _>>();
-    if !vars.contains_key("HOSTNAME") {
-        if let Ok(hostname) = crate::get_hostname() {
+    if interpolate_env {
+        let mut vars: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| match (k.into_string(), v.into_string()) {
+                (Ok(k), Ok(v)) => Some((k, v)),
+                _ => None,
+            })
+            .collect();
+
+        if !vars.contains_key("HOSTNAME")
+            && let Ok(hostname) = crate::get_hostname()
+        {
             vars.insert("HOSTNAME".into(), hostname);
         }
+        interpolation::interpolate(&source_string, &vars)
+    } else {
+        Ok(source_string)
     }
-    vars::interpolate(&source_string, &vars)
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub fn load<R: std::io::Read, T>(input: R, format: Format) -> Result<T, Vec<String>>
 where
     T: serde::de::DeserializeOwned,
 {
-    let with_vars = prepare_input(input)?;
+    // Via configurations that load from raw string, skip interpolation of env
+    let with_vars = prepare_input(input, false)?;
 
-    format::deserialize(&with_vars, format)
+    representation::deserialize_config(&with_vars, format)
 }
 
 #[cfg(not(windows))]
@@ -303,7 +387,7 @@ fn default_path() -> PathBuf {
 fn default_path() -> PathBuf {
     let program_files =
         std::env::var("ProgramFiles").expect("%ProgramFiles% environment variable must be defined");
-    format!("{}\\Vector\\config\\vector.yaml", program_files).into()
+    format!("{program_files}\\Vector\\config\\vector.yaml").into()
 }
 
 fn default_config_paths() -> Vec<ConfigPath> {
@@ -313,79 +397,4 @@ fn default_config_paths() -> Vec<ConfigPath> {
     let default_path = default_path();
 
     vec![ConfigPath::File(default_path, Some(Format::Yaml))]
-}
-
-#[cfg(all(
-    test,
-    feature = "sinks-elasticsearch",
-    feature = "transforms-pipelines",
-    feature = "transforms-sample",
-    feature = "sources-demo_logs",
-    feature = "sinks-console"
-))]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::load_builder_from_paths;
-    use crate::config::{ComponentKey, ConfigPath};
-
-    #[test]
-    fn load_namespacing_folder() {
-        let path = PathBuf::from(".")
-            .join("tests")
-            .join("namespacing")
-            .join("success");
-        let configs = vec![ConfigPath::Dir(path)];
-        let builder = load_builder_from_paths(&configs).unwrap();
-        assert!(builder
-            .transforms
-            .contains_key(&ComponentKey::from("apache_parser")));
-        assert!(builder
-            .sources
-            .contains_key(&ComponentKey::from("apache_logs")));
-        assert!(builder
-            .sinks
-            .contains_key(&ComponentKey::from("es_cluster")));
-        assert_eq!(builder.tests.len(), 2);
-    }
-
-    #[test]
-    fn load_namespacing_ignore_invalid() {
-        let path = PathBuf::from(".")
-            .join("tests")
-            .join("namespacing")
-            .join("ignore-invalid");
-        let configs = vec![ConfigPath::Dir(path)];
-        load_builder_from_paths(&configs).unwrap();
-    }
-
-    #[test]
-    fn load_directory_ignores_unknown_file_formats() {
-        let path = PathBuf::from(".")
-            .join("tests")
-            .join("config-dir")
-            .join("ignore-unknown");
-        let configs = vec![ConfigPath::Dir(path)];
-        load_builder_from_paths(&configs).unwrap();
-    }
-
-    #[test]
-    fn load_directory_globals() {
-        let path = PathBuf::from(".")
-            .join("tests")
-            .join("config-dir")
-            .join("globals");
-        let configs = vec![ConfigPath::Dir(path)];
-        load_builder_from_paths(&configs).unwrap();
-    }
-
-    #[test]
-    fn load_directory_globals_duplicates() {
-        let path = PathBuf::from(".")
-            .join("tests")
-            .join("config-dir")
-            .join("globals-duplicate");
-        let configs = vec![ConfigPath::Dir(path)];
-        load_builder_from_paths(&configs).unwrap();
-    }
 }

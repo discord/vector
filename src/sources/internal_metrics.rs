@@ -4,19 +4,20 @@ use futures::StreamExt;
 use serde_with::serde_as;
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol,
+use vector_lib::{
+    ByteSizeOf, EstimatedJsonEncodedSizeOf,
+    config::LogNamespace,
+    configurable::configurable_component,
+    internal_event::{ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol},
+    lookup::lookup_v2::OptionalValuePath,
 };
-use vector_lib::lookup::lookup_v2::OptionalValuePath;
-use vector_lib::{config::LogNamespace, ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
 use crate::{
-    config::{log_schema, SourceConfig, SourceContext, SourceOutput},
+    SourceSender,
+    config::{SourceConfig, SourceContext, SourceOutput, log_schema},
     internal_events::{EventsReceived, StreamClosedError},
     metrics::Controller,
     shutdown::ShutdownSignal,
-    SourceSender,
 };
 
 /// Configuration for the `internal_metrics` source.
@@ -34,7 +35,6 @@ pub struct InternalMetricsConfig {
     #[configurable(metadata(docs::human_name = "Scrape Interval"))]
     pub scrape_interval_secs: Duration,
 
-    #[configurable(derived)]
     pub tags: TagsConfig,
 
     /// Overrides the default namespace for the metrics emitted by the source.
@@ -112,7 +112,7 @@ impl SourceConfig for InternalMetricsConfig {
             .as_deref()
             .and_then(|tag| (!tag.is_empty()).then(|| tag.to_owned()));
 
-        Ok(Box::pin(
+        Ok(crate::sources::source_with_error(
             InternalMetrics {
                 namespace,
                 host_key,
@@ -145,8 +145,8 @@ struct InternalMetrics<'a> {
     shutdown: ShutdownSignal,
 }
 
-impl<'a> InternalMetrics<'a> {
-    async fn run(mut self) -> Result<(), ()> {
+impl InternalMetrics<'_> {
+    async fn run(mut self) -> vector_lib::source_sender::SendResult {
         let events_received = register!(EventsReceived);
         let bytes_received = register!(BytesReceived::from(Protocol::INTERNAL));
         let mut interval =
@@ -170,10 +170,10 @@ impl<'a> InternalMetrics<'a> {
                     metric = metric.with_namespace(Some(self.namespace.clone()));
                 }
 
-                if let Some(host_key) = &self.host_key.path {
-                    if let Ok(hostname) = &hostname {
-                        metric.replace_tag(host_key.to_string(), hostname.to_owned());
-                    }
+                if let Some(host_key) = &self.host_key.path
+                    && let Ok(hostname) = &hostname
+                {
+                    metric.replace_tag(host_key.to_string(), hostname.to_owned());
                 }
                 if let Some(pid_key) = &self.pid_key {
                     metric.replace_tag(pid_key.to_owned(), pid.clone());
@@ -181,9 +181,9 @@ impl<'a> InternalMetrics<'a> {
                 metric
             });
 
-            if (self.out.send_batch(batch).await).is_err() {
+            if let Err(error) = self.out.send_batch(batch).await {
                 emit!(StreamClosedError { count });
-                return Err(());
+                return Err(error);
             }
         }
 
@@ -195,18 +195,23 @@ impl<'a> InternalMetrics<'a> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use metrics::{counter, gauge, histogram};
-    use vector_lib::{metric_tags, metrics::Controller};
+    use strum::IntoEnumIterator;
+    use vector_lib::{
+        counter, gauge, histogram,
+        internal_event::{CounterName, GaugeName, HistogramName},
+        metric_tags,
+        metrics::Controller,
+    };
 
     use super::*;
     use crate::{
         event::{
-            metric::{Metric, MetricValue},
             Event,
+            metric::{Metric, MetricValue},
         },
         test_util::{
             self,
-            components::{run_and_assert_source_compliance, SOURCE_TAGS},
+            components::{SOURCE_TAGS, run_and_assert_source_compliance},
         },
     };
 
@@ -215,6 +220,10 @@ mod tests {
         test_util::test_generate_config::<InternalMetricsConfig>();
     }
 
+    #[expect(
+        clippy::float_cmp,
+        reason = "These deterministic fixture values are compared exactly."
+    )]
     #[test]
     fn captures_internal_metrics() {
         test_util::trace_init();
@@ -222,14 +231,20 @@ mod tests {
         // There *seems* to be a race condition here (CI was flaky), so add a slight delay.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        gauge!("foo").set(1.0);
-        gauge!("foo").set(2.0);
-        counter!("bar").increment(3);
-        counter!("bar").increment(4);
-        histogram!("baz").record(5.0);
-        histogram!("baz").record(6.0);
-        histogram!("quux", "host" => "foo").record(8.0);
-        histogram!("quux", "host" => "foo").record(8.1);
+        let gauge_name = GaugeName::iter().next().unwrap();
+        let counter_name = CounterName::iter().next().unwrap();
+        let mut histogram_iter = HistogramName::iter();
+        let histogram_name = histogram_iter.next().unwrap();
+        let histogram_tagged_name = histogram_iter.next().unwrap();
+
+        gauge!(gauge_name).set(1.0);
+        gauge!(gauge_name).set(2.0);
+        counter!(counter_name).increment(3);
+        counter!(counter_name).increment(4);
+        histogram!(histogram_name).record(5.0);
+        histogram!(histogram_name).record(6.0);
+        histogram!(histogram_tagged_name, "host" => "foo").record(8.0);
+        histogram!(histogram_tagged_name, "host" => "foo").record(8.1);
 
         let controller = Controller::get().expect("no controller");
 
@@ -242,10 +257,16 @@ mod tests {
             .map(|metric| (metric.name().to_string(), metric))
             .collect::<BTreeMap<String, Metric>>();
 
-        assert_eq!(&MetricValue::Gauge { value: 2.0 }, output["foo"].value());
-        assert_eq!(&MetricValue::Counter { value: 7.0 }, output["bar"].value());
+        assert_eq!(
+            &MetricValue::Gauge { value: 2.0 },
+            output[gauge_name.as_str()].value()
+        );
+        assert_eq!(
+            &MetricValue::Counter { value: 7.0 },
+            output[counter_name.as_str()].value()
+        );
 
-        match &output["baz"].value() {
+        match &output[histogram_name.as_str()].value() {
             MetricValue::AggregatedHistogram {
                 buckets,
                 count,
@@ -255,14 +276,14 @@ mod tests {
                 // [`metrics::handle::Histogram::new`] are hard-coded. If this
                 // check fails you might look there and see if we've allowed
                 // users to set their own bucket widths.
-                assert_eq!(buckets[9].count, 2);
+                assert_eq!(buckets[15].count, 2);
                 assert_eq!(*count, 2);
                 assert_eq!(*sum, 11.0);
             }
             _ => panic!("wrong type"),
         }
 
-        match &output["quux"].value() {
+        match &output[histogram_tagged_name.as_str()].value() {
             MetricValue::AggregatedHistogram {
                 buckets,
                 count,
@@ -272,8 +293,8 @@ mod tests {
                 // [`metrics::handle::Histogram::new`] are hard-coded. If this
                 // check fails you might look there and see if we've allowed
                 // users to set their own bucket widths.
-                assert_eq!(buckets[9].count, 1);
-                assert_eq!(buckets[10].count, 1);
+                assert_eq!(buckets[15].count, 1);
+                assert_eq!(buckets[16].count, 1);
                 assert_eq!(*count, 2);
                 assert_eq!(*sum, 16.1);
             }
@@ -281,7 +302,7 @@ mod tests {
         }
 
         let labels = metric_tags!("host" => "foo");
-        assert_eq!(Some(&labels), output["quux"].tags());
+        assert_eq!(Some(&labels), output[histogram_tagged_name.as_str()].tags());
     }
 
     async fn event_from_config(config: InternalMetricsConfig) -> Event {

@@ -1,25 +1,31 @@
-use bytes::{Buf, Bytes};
-use flate2::read::{MultiGzDecoder, ZlibDecoder};
-use futures::{channel::mpsc, stream, FutureExt, SinkExt, TryFutureExt};
-use futures_util::StreamExt;
-use http::request::Parts;
-use hyper::{
-    body::HttpBody,
-    service::{make_service_fn, service_fn},
-    Body, Request, Response, Server, StatusCode,
-};
-use serde::Deserialize;
 use std::{
     io::{BufRead, BufReader},
     net::SocketAddr,
 };
+
+use bytes::{Buf, Bytes};
+use futures::{FutureExt, SinkExt, TryFutureExt, channel::mpsc, stream};
+use futures_util::StreamExt;
+use http::request::Parts;
+use hyper::{
+    Body, Request, Response, Server, StatusCode,
+    body::HttpBody,
+    service::{make_service_fn, service_fn},
+};
+use serde::Deserialize;
 use stream_cancel::{Trigger, Tripwire};
+use vector_common::decompression::CappedDecoder;
 
 use crate::{
-    config::{SinkConfig, SinkContext},
     Error,
+    config::{SinkConfig, SinkContext},
 };
 
+/// Load a sink configuration with a default test context.
+///
+/// # Errors
+///
+/// Returns an error if the TOML cannot be deserialized as the sink configuration.
 pub fn load_sink<T>(config: &str) -> crate::Result<(T, SinkContext)>
 where
     for<'a> T: Deserialize<'a> + SinkConfig,
@@ -30,6 +36,11 @@ where
     Ok((sink_config, cx))
 }
 
+/// Load a sink configuration with the supplied test context.
+///
+/// # Errors
+///
+/// Returns an error if the TOML cannot be deserialized as the sink configuration.
 pub fn load_sink_with_context<T>(config: &str, cx: SinkContext) -> crate::Result<(T, SinkContext)>
 where
     for<'a> T: Deserialize<'a> + SinkConfig,
@@ -65,6 +76,12 @@ pub fn build_test_server_status(
     })
 }
 
+/// Build a test server with a custom response factory.
+///
+/// # Panics
+///
+/// Panics if the address cannot be bound. The returned future panics on server
+/// errors; spawned request tasks panic if reading or forwarding a body fails.
 pub fn build_test_server_generic<B>(
     addr: SocketAddr,
     responder: impl Fn() -> Response<B> + Clone + Send + Sync + 'static,
@@ -92,7 +109,7 @@ where
                     let response = responder();
                     if response.status().is_success() {
                         tokio::spawn(async move {
-                            let bytes = hyper::body::to_bytes(body).await.unwrap();
+                            let bytes = http_body::Body::collect(body).await.unwrap().to_bytes();
                             tx.send((parts, bytes)).await.unwrap();
                         });
                     }
@@ -107,7 +124,7 @@ where
     let server = Server::bind(&addr)
         .serve(service)
         .with_graceful_shutdown(tripwire.then(crate::shutdown::tripwire_handler))
-        .map_err(|error| panic!("Server error: {}", error));
+        .map_err(|error| panic!("Server error: {error}"));
 
     (rx, trigger, server)
 }
@@ -116,14 +133,20 @@ pub async fn get_received_gzip(
     rx: mpsc::Receiver<(Parts, Bytes)>,
     assert_parts: impl Fn(Parts),
 ) -> Vec<String> {
-    get_received(rx, assert_parts, |body| MultiGzDecoder::new(body.reader())).await
+    get_received(rx, assert_parts, |body| {
+        CappedDecoder::gzip(body.reader()).into_reader()
+    })
+    .await
 }
 
 pub async fn get_received_zlib(
     rx: mpsc::Receiver<(Parts, Bytes)>,
     assert_parts: impl Fn(Parts),
 ) -> Vec<String> {
-    get_received(rx, assert_parts, |body| ZlibDecoder::new(body.reader())).await
+    get_received(rx, assert_parts, |body| {
+        CappedDecoder::zlib(body.reader()).into_reader()
+    })
+    .await
 }
 
 async fn get_received<D>(

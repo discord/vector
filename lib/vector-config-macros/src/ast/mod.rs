@@ -1,4 +1,4 @@
-use darling::{ast::NestedMeta, error::Accumulator, util::path_to_string, FromMeta};
+use darling::{FromMeta, ast::NestedMeta, error::Accumulator, util::path_to_string};
 use quote::ToTokens;
 use serde_derive_internals::{ast as serde_ast, attr as serde_attr};
 
@@ -170,7 +170,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn attributes(&self) -> impl Iterator<Item = LazyCustomAttribute> {
+    pub fn attributes(&self) -> impl Iterator<Item = LazyCustomAttribute> + use<> {
         self.items.clone().into_iter()
     }
 }
@@ -240,6 +240,10 @@ impl FromMeta for Metadata {
                 },
                 NestedMeta::Lit(_) => {
                     errors.push(darling::Error::unexpected_type("literal").with_span(nmeta));
+                    None
+                }
+                NestedMeta::NameValueInvalidExpr(invalid) => {
+                    errors.push(invalid.error.clone().with_span(nmeta));
                     None
                 }
             })

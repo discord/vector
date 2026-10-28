@@ -1,11 +1,13 @@
-use headers::Authorization;
-use http::uri::InvalidUri;
+use headers::{Authorization, authorization::Credentials};
+use http::{header::PROXY_AUTHORIZATION, uri::InvalidUri};
 use hyper_proxy::{Custom, Intercept, Proxy, ProxyConnector};
-use no_proxy::NoProxy;
 use url::Url;
 use vector_config::configurable_component;
 
 use crate::serde::is_default;
+
+mod no_proxy;
+pub use no_proxy::NoProxy;
 
 // suggestion of standardization coming from https://about.gitlab.com/blog/2021/01/27/we-need-to-talk-no-proxy/
 fn from_env(key: &str) -> Option<String> {
@@ -25,9 +27,9 @@ impl NoProxyInterceptor {
                 if scheme.is_some() && scheme != Some(expected_scheme) {
                     return false;
                 }
-                let matches = host.map_or(false, |host| {
+                let matches = host.is_some_and(|host| {
                     self.0.matches(host)
-                        || port.map_or(false, |port| {
+                        || port.is_some_and(|port| {
                             let url = format!("{host}:{port}");
                             self.0.matches(&url)
                         })
@@ -47,7 +49,6 @@ impl NoProxyInterceptor {
 /// to use based on the type of traffic being proxied. You can also set specific hosts that
 /// should not be proxied.
 #[configurable_component]
-#[configurable(metadata(docs::advanced))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
@@ -154,24 +155,24 @@ impl ProxyConfig {
     fn build_proxy(
         &self,
         proxy_scheme: &'static str,
-        proxy_url: &Option<String>,
+        proxy_url: Option<&String>,
     ) -> Result<Option<Proxy>, InvalidUri> {
         proxy_url
             .as_ref()
             .map(|url| {
                 url.parse().map(|parsed| {
                     let mut proxy = Proxy::new(self.interceptor().intercept(proxy_scheme), parsed);
-                    if let Ok(authority) = Url::parse(url) {
-                        if let Some(password) = authority.password() {
-                            let decoded_user = urlencoding::decode(authority.username())
-                                .expect("username must be valid UTF-8.");
-                            let decoded_pw = urlencoding::decode(password)
-                                .expect("Password must be valid UTF-8.");
-                            proxy.set_authorization(Authorization::basic(
-                                &decoded_user,
-                                &decoded_pw,
-                            ));
-                        }
+                    if let Ok(authority) = Url::parse(url)
+                        && let Some(password) = authority.password()
+                    {
+                        let decoded_user = urlencoding::decode(authority.username())
+                            .expect("username must be valid UTF-8.");
+                        let decoded_pw =
+                            urlencoding::decode(password).expect("Password must be valid UTF-8.");
+                        let mut authorization =
+                            Authorization::basic(&decoded_user, &decoded_pw).0.encode();
+                        authorization.set_sensitive(true);
+                        proxy.set_header(PROXY_AUTHORIZATION, authorization);
                     }
                     proxy
                 })
@@ -180,11 +181,11 @@ impl ProxyConfig {
     }
 
     fn http_proxy(&self) -> Result<Option<Proxy>, InvalidUri> {
-        self.build_proxy("http", &self.http)
+        self.build_proxy("http", self.http.as_ref())
     }
 
     fn https_proxy(&self) -> Result<Option<Proxy>, InvalidUri> {
-        self.build_proxy("https", &self.https)
+        self.build_proxy("https", self.https.as_ref())
     }
 
     /// Install the [`ProxyConnector<C>`] for this `ProxyConfig`
@@ -207,15 +208,10 @@ impl ProxyConfig {
 
 #[cfg(test)]
 mod tests {
-    use base64::prelude::{Engine as _, BASE64_STANDARD};
+    use base64::prelude::{BASE64_STANDARD, Engine as _};
     use env_test_util::TempEnvVar;
-    use http::{
-        header::{AUTHORIZATION, PROXY_AUTHORIZATION},
-        HeaderName, HeaderValue, Uri,
-    };
+    use http::{HeaderValue, Uri, header::AUTHORIZATION};
     use proptest::prelude::*;
-
-    const PROXY_HEADERS: [HeaderName; 2] = [AUTHORIZATION, PROXY_AUTHORIZATION];
 
     use super::*;
 
@@ -387,18 +383,22 @@ mod tests {
             Some(first.uri()),
             Uri::try_from("http://user:pass@1.2.3.4:5678").as_ref().ok()
         );
-        for h in &PROXY_HEADERS {
-            assert_eq!(first.headers().get(h), expected_header_value.as_ref().ok());
-        }
+        assert_eq!(
+            first.headers().get(PROXY_AUTHORIZATION),
+            expected_header_value.as_ref().ok()
+        );
+        assert!(!first.headers().contains_key(AUTHORIZATION));
         assert_eq!(
             Some(second.uri()),
             Uri::try_from("https://user:pass@2.3.4.5:9876")
                 .as_ref()
                 .ok()
         );
-        for h in &PROXY_HEADERS {
-            assert_eq!(second.headers().get(h), expected_header_value.as_ref().ok());
-        }
+        assert_eq!(
+            second.headers().get(PROXY_AUTHORIZATION),
+            expected_header_value.as_ref().ok()
+        );
+        assert!(!second.headers().contains_key(AUTHORIZATION));
     }
 
     #[test]
@@ -414,8 +414,10 @@ mod tests {
             .expect("should not be None");
         let encoded_header = format!("Basic {}", BASE64_STANDARD.encode("user:P@ssw0rd"));
         let expected_header_value = HeaderValue::from_str(encoded_header.as_str());
-        for h in &PROXY_HEADERS {
-            assert_eq!(first.headers().get(h), expected_header_value.as_ref().ok());
-        }
+        assert_eq!(
+            first.headers().get(PROXY_AUTHORIZATION),
+            expected_header_value.as_ref().ok()
+        );
+        assert!(!first.headers().contains_key(AUTHORIZATION));
     }
 }

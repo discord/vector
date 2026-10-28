@@ -1,10 +1,12 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     future::Future,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use aws_sdk_cloudwatchlogs::{
+    Client as CloudwatchLogsClient,
     operation::{
         create_log_group::CreateLogGroupError,
         create_log_stream::CreateLogStreamError,
@@ -13,19 +15,19 @@ use aws_sdk_cloudwatchlogs::{
         put_retention_policy::PutRetentionPolicyError,
     },
     types::InputLogEvent,
-    Client as CloudwatchLogsClient,
 };
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
-use futures::{future::BoxFuture, FutureExt};
-use http::{header::HeaderName, HeaderValue};
-use indexmap::IndexMap;
+use futures::{FutureExt, future::BoxFuture};
+use http::HeaderValue;
 use tokio::sync::oneshot;
 
-use crate::sinks::aws_cloudwatch_logs::config::Retention;
-use crate::sinks::aws_cloudwatch_logs::service::CloudwatchError;
+use crate::sinks::{
+    aws_cloudwatch_logs::{config::Retention, service::CloudwatchError},
+    util::http::OrderedHeaderName,
+};
 
 pub struct CloudwatchFuture {
-    client: Client,
+    client: RequestClient,
     state: State,
     create_missing_group: bool,
     create_missing_stream: bool,
@@ -34,12 +36,14 @@ pub struct CloudwatchFuture {
     token_tx: Option<oneshot::Sender<Option<String>>>,
 }
 
-struct Client {
+struct RequestClient {
     client: CloudwatchLogsClient,
     stream_name: String,
     group_name: String,
-    headers: IndexMap<HeaderName, HeaderValue>,
+    headers: BTreeMap<OrderedHeaderName, HeaderValue>,
     retention_days: u32,
+    kms_key: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 type ClientResult<T, E> = BoxFuture<'static, Result<T, SdkError<E, HttpResponse>>>;
@@ -53,27 +57,31 @@ enum State {
 }
 
 impl CloudwatchFuture {
-    /// Panics if events.is_empty()
+    /// Panics if `events.is_empty()`
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         client: CloudwatchLogsClient,
-        headers: IndexMap<HeaderName, HeaderValue>,
+        headers: BTreeMap<OrderedHeaderName, HeaderValue>,
         stream_name: String,
         group_name: String,
         create_missing_group: bool,
         create_missing_stream: bool,
-        retention: Retention,
+        retention: &Retention,
+        kms_key: Option<String>,
+        tags: Option<HashMap<String, String>>,
         mut events: Vec<Vec<InputLogEvent>>,
         token: Option<String>,
         token_tx: oneshot::Sender<Option<String>>,
     ) -> Self {
         let retention_days = retention.days;
-        let client = Client {
+        let client = RequestClient {
             client,
             stream_name,
             group_name,
             headers,
             retention_days,
+            kms_key,
+            tags,
         };
 
         let state = if let Some(token) = token {
@@ -99,6 +107,8 @@ impl CloudwatchFuture {
 impl Future for CloudwatchFuture {
     type Output = Result<(), CloudwatchError>;
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::too_many_lines, reason = "Keep state transitions together")]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         loop {
             match &mut self.state {
@@ -106,17 +116,17 @@ impl Future for CloudwatchFuture {
                     let response = match ready!(fut.poll_unpin(cx)) {
                         Ok(response) => response,
                         Err(err) => {
-                            if let SdkError::ServiceError(inner) = &err {
-                                if matches!(
+                            if let SdkError::ServiceError(inner) = &err
+                                && matches!(
                                     inner.err(),
                                     DescribeLogStreamsError::ResourceNotFoundException(_)
-                                ) && self.create_missing_group
-                                {
-                                    info!("Log group provided does not exist; creating a new one.");
+                                )
+                                && self.create_missing_group
+                            {
+                                info!("Log group provided does not exist; creating a new one.");
 
-                                    self.state = State::CreateGroup(self.client.create_log_group());
-                                    continue;
-                                }
+                                self.state = State::CreateGroup(self.client.create_log_group());
+                                continue;
                             }
                             return Poll::Ready(Err(CloudwatchError::DescribeLogStreams(err)));
                         }
@@ -151,7 +161,7 @@ impl Future for CloudwatchFuture {
 
                 State::CreateGroup(fut) => {
                     match ready!(fut.poll_unpin(cx)) {
-                        Ok(_) => {}
+                        Ok(()) => {}
                         Err(err) => {
                             let resource_already_exists = match &err {
                                 SdkError::ServiceError(inner) => matches!(
@@ -164,7 +174,7 @@ impl Future for CloudwatchFuture {
                                 return Poll::Ready(Err(CloudwatchError::CreateGroup(err)));
                             }
                         }
-                    };
+                    }
 
                     info!(message = "Group created.", name = %self.client.group_name);
 
@@ -181,7 +191,7 @@ impl Future for CloudwatchFuture {
 
                 State::CreateStream(fut) => {
                     match ready!(fut.poll_unpin(cx)) {
-                        Ok(_) => {}
+                        Ok(()) => {}
                         Err(err) => {
                             let resource_already_exists = match &err {
                                 SdkError::ServiceError(inner) => matches!(
@@ -194,7 +204,7 @@ impl Future for CloudwatchFuture {
                                 return Poll::Ready(Err(CloudwatchError::CreateStream(err)));
                             }
                         }
-                    };
+                    }
 
                     info!(message = "Stream created.", name = %self.client.stream_name);
 
@@ -225,9 +235,9 @@ impl Future for CloudwatchFuture {
 
                 State::PutRetentionPolicy(fut) => {
                     match ready!(fut.poll_unpin(cx)) {
-                        Ok(_) => {}
+                        Ok(()) => {}
                         Err(error) => {
-                            return Poll::Ready(Err(CloudwatchError::PutRetentionPolicy(error)))
+                            return Poll::Ready(Err(CloudwatchError::PutRetentionPolicy(error)));
                         }
                     }
 
@@ -240,7 +250,7 @@ impl Future for CloudwatchFuture {
     }
 }
 
-impl Client {
+impl RequestClient {
     pub fn put_logs(
         &self,
         sequence_token: Option<String>,
@@ -260,8 +270,9 @@ impl Client {
                 .log_stream_name(stream_name)
                 .customize()
                 .mutate_request(move |req| {
-                    for (header, value) in headers.iter() {
-                        req.headers_mut().insert(header.clone(), value.clone());
+                    for (header, value) in &headers {
+                        req.headers_mut()
+                            .insert(header.inner().clone(), value.clone());
                     }
                 })
                 .send()
@@ -288,10 +299,14 @@ impl Client {
     pub fn create_log_group(&self) -> ClientResult<(), CreateLogGroupError> {
         let client = self.client.clone();
         let group_name = self.group_name.clone();
+        let kms_key = self.kms_key.clone();
+        let tags = self.tags.clone();
         Box::pin(async move {
             client
                 .create_log_group()
                 .log_group_name(group_name)
+                .set_kms_key_id(kms_key)
+                .set_tags(tags)
                 .send()
                 .await?;
             Ok(())

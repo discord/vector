@@ -1,17 +1,16 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use vector::{
     config::{DataType, TransformOutput},
     event::{Event, LogEvent, Value},
     transforms::{
-        remap::{Remap, RemapConfig},
         SyncTransform, TransformOutputsBuf,
+        remap::{Remap, RemapConfig},
     },
 };
-use vrl::event_path;
-use vrl::prelude::*;
+use vrl::{event_path, prelude::*};
 
 criterion_group!(
     name = benches;
@@ -22,12 +21,21 @@ criterion_group!(
 );
 criterion_main!(benches);
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::default_trait_access,
+    reason = "Keep inferred defaults where concrete type names need a separate import or API cleanup."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the existing control flow intact during the lint rollout."
+)]
 fn benchmark_remap(c: &mut Criterion) {
     let mut group = c.benchmark_group("remap");
 
     let add_fields_runner = |tform: &mut Box<dyn SyncTransform>, event: Event| {
         let mut outputs = TransformOutputsBuf::new_with_capacity(
-            vec![TransformOutput::new(DataType::all(), HashMap::new())],
+            vec![TransformOutput::new(DataType::all_bits(), HashMap::new())],
             1,
         );
         tform.transform(event, &mut outputs);
@@ -53,7 +61,7 @@ fn benchmark_remap(c: &mut Criterion) {
     group.bench_function("add_fields/remap", |b| {
         let mut tform: Box<dyn SyncTransform> = Box::new(
             Remap::new_ast(
-                RemapConfig {
+                &RemapConfig {
                     source: Some(
                         indoc! {r#".foo = "bar"
                             .bar = "baz"
@@ -90,7 +98,7 @@ fn benchmark_remap(c: &mut Criterion) {
 
     let json_parser_runner = |tform: &mut Box<dyn SyncTransform>, event: Event| {
         let mut outputs = TransformOutputsBuf::new_with_capacity(
-            vec![TransformOutput::new(DataType::all(), HashMap::new())],
+            vec![TransformOutput::new(DataType::all_bits(), HashMap::new())],
             1,
         );
         tform.transform(event, &mut outputs);
@@ -112,7 +120,7 @@ fn benchmark_remap(c: &mut Criterion) {
     group.bench_function("parse_json/remap", |b| {
         let mut tform: Box<dyn SyncTransform> = Box::new(
             Remap::new_ast(
-                RemapConfig {
+                &RemapConfig {
                     source: Some(".bar = parse_json!(string!(.foo))".to_owned()),
                     file: None,
                     timezone: None,
@@ -130,7 +138,7 @@ fn benchmark_remap(c: &mut Criterion) {
             let mut event = Event::Log(LogEvent::from("parse me"));
             event
                 .as_mut_log()
-                .insert("foo", r#"{"key": "value"}"#.to_owned());
+                .insert(vrl::event_path!("foo"), r#"{"key": "value"}"#.to_owned());
             event
         };
 
@@ -144,7 +152,7 @@ fn benchmark_remap(c: &mut Criterion) {
     let coerce_runner =
         |tform: &mut Box<dyn SyncTransform>, event: Event, timestamp: DateTime<Utc>| {
             let mut outputs = TransformOutputsBuf::new_with_capacity(
-                vec![TransformOutput::new(DataType::all(), HashMap::new())],
+                vec![TransformOutput::new(DataType::all_bits(), HashMap::new())],
                 1,
             );
             tform.transform(event, &mut outputs);
@@ -169,7 +177,7 @@ fn benchmark_remap(c: &mut Criterion) {
 
     group.bench_function("coerce/remap", |b| {
         let mut tform: Box<dyn SyncTransform> = Box::new(
-            Remap::new_ast(RemapConfig {
+            Remap::new_ast(&RemapConfig {
                 source: Some(indoc! {r#"
                     .number = to_int!(.number)
                     .bool = to_bool!(.bool)

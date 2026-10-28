@@ -1,6 +1,7 @@
+#![allow(clippy::await_holding_lock)]
+
 use std::{
     collections::{BTreeMap, HashSet},
-    iter::FromIterator,
     str::FromStr,
 };
 
@@ -72,7 +73,7 @@ async fn default_agent() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -85,14 +86,14 @@ async fn default_agent() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -106,7 +107,7 @@ async fn default_agent() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -139,7 +140,7 @@ async fn default_agent() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -154,11 +155,8 @@ async fn default_agent() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure we got the marker.
         assert_eq!(val["message"], "MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;
@@ -197,7 +195,7 @@ async fn partial_merge() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -210,14 +208,14 @@ async fn partial_merge() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -231,7 +229,7 @@ async fn partial_merge() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -246,7 +244,7 @@ async fn partial_merge() -> Result<(), Box<dyn std::error::Error>> {
         .test_pod(test_pod::Config::from_pod(&make_test_pod(
             &pod_namespace,
             "test-pod",
-            &format!("echo {}", test_message),
+            &format!("echo {test_message}"),
             vec![],
             vec![],
         ))?)
@@ -265,7 +263,7 @@ async fn partial_merge() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -280,11 +278,8 @@ async fn partial_merge() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure the message we got matches the one we emitted.
         assert_eq!(val["message"], test_message);
 
-        if got_expected_line {
-            // We've already seen our expected line once! This is not good, we
-            // only emitted one.
-            panic!("Test message seen more than once");
-        }
+        // Only one test message was emitted, so reject duplicates.
+        assert!(!got_expected_line, "Test message seen more than once");
 
         // If we did, remember it.
         got_expected_line = true;
@@ -349,7 +344,7 @@ async fn preexisting() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -362,14 +357,14 @@ async fn preexisting() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -383,7 +378,7 @@ async fn preexisting() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -392,7 +387,7 @@ async fn preexisting() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -407,11 +402,8 @@ async fn preexisting() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure we got the marker.
         assert_eq!(val["message"], "MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;
@@ -451,7 +443,7 @@ async fn multiple_lines() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -464,14 +456,14 @@ async fn multiple_lines() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -485,7 +477,7 @@ async fn multiple_lines() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -519,7 +511,7 @@ async fn multiple_lines() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -564,6 +556,11 @@ async fn multiple_lines() -> Result<(), Box<dyn std::error::Error>> {
 /// This test validates that vector properly annotates log events with pod
 /// and namespace metadata obtained from the k8s API.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
     init();
@@ -578,7 +575,7 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -591,14 +588,14 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -612,7 +609,7 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -623,13 +620,14 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
         .namespace(namespace::Config::from_namespace(
             &namespace::make_namespace(
                 pod_namespace.clone(),
-                Some(BTreeMap::from_iter(
+                Some(
                     [
                         ("label3".to_string(), "foobar".to_string()),
                         ("label4".to_string(), "fizzbuzz".to_string()),
                     ]
-                    .into_iter(),
-                )),
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>(),
+                ),
             ),
         )?)
         .await?;
@@ -657,18 +655,20 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
     let k8s_version = framework.kubernetes_version().await?;
 
     // Replace all non numeric chars from the version number
-    let numeric_regex = regex::Regex::new(r#"[^\d]"#).unwrap();
+    let numeric_regex = regex::Regex::new(r"[^\d]").unwrap();
     let minor = k8s_version.minor();
     let numeric_minor = numeric_regex.replace(&minor, "");
-    let minor = u8::from_str(&numeric_minor).expect(&format!(
-        "Couldn't get u8 from String, received {} instead!",
-        k8s_version.minor()
-    ));
+    let minor = u8::from_str(&numeric_minor).unwrap_or_else(|_| {
+        panic!(
+            "Couldn't get u8 from String, received {} instead!",
+            k8s_version.minor()
+        )
+    });
 
     // Read the rest of the log lines.
     let mut got_marker = false;
@@ -682,11 +682,8 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure we got the marker.
         assert_eq!(val["message"], "MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;
@@ -706,22 +703,28 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
             assert!(val["kubernetes"]["pod_ip"].is_string());
         } else {
             assert!(val["kubernetes"]["pod_ip"].is_string());
-            assert!(!val["kubernetes"]["pod_ips"]
-                .as_array()
-                .expect("Couldn't take array from expected vec")
-                .is_empty());
+            assert!(
+                !val["kubernetes"]["pod_ips"]
+                    .as_array()
+                    .expect("Couldn't take array from expected vec")
+                    .is_empty()
+            );
         }
         // We don't have the node name to compare this to, so just assert it's
         // a non-empty string.
-        assert!(!val["kubernetes"]["pod_node_name"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !val["kubernetes"]["pod_node_name"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(val["kubernetes"]["container_name"], "test-pod");
-        assert!(!val["kubernetes"]["container_id"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !val["kubernetes"]["container_id"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(val["kubernetes"]["container_image"], BUSYBOX_IMAGE);
 
         // Request to stop the flow.
@@ -744,13 +747,18 @@ async fn metadata_annotation() -> Result<(), Box<dyn std::error::Error>> {
 /// This test validates that vector properly filters out the logs that are
 /// requested to be excluded from collection, based on k8s API `Pod` labels.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
     init();
 
     let namespace = get_namespace();
     let pod_namespace = get_namespace_appended(&namespace, "test-pod");
-    let affinity_label = format!("{}-affinity", pod_namespace);
+    let affinity_label = format!("{pod_namespace}-affinity");
     let framework = make_framework();
     let override_name = get_override_name(&namespace, "vector-agent");
 
@@ -759,7 +767,7 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -772,14 +780,14 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -793,7 +801,7 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -803,7 +811,7 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
         )?)
         .await?;
 
-    let affinity_ns_name = format!("{}-affinity", pod_namespace);
+    let affinity_ns_name = format!("{pod_namespace}-affinity");
     let affinity_ns = framework
         .namespace(namespace::Config::from_namespace(
             &namespace::make_namespace(affinity_ns_name.clone(), None),
@@ -864,7 +872,7 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the log lines until the reasonable amount of time passes for us
@@ -882,11 +890,8 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
             }
             line = log_reader.read_line() => line,
         };
-        let line = match line {
-            Some(line) => line,
-            None => break,
-        };
-        debug!("Got line: {:?}", line);
+        let Some(line) = line else { break };
+        debug!("Got line: {line:?}");
 
         lines_till_we_give_up -= 1;
         if lines_till_we_give_up == 0 {
@@ -915,11 +920,8 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
         // If we get an excluded marker here - it's an error.
         assert_eq!(val["message"], "CONTROL_MARKER");
 
-        if got_control_marker {
-            // We've already seen one control marker! This is not good, we only
-            // emitted one.
-            panic!("Control marker seen more than once");
-        }
+        // Only one control marker was emitted, so reject duplicates.
+        assert!(!got_control_marker, "Control marker seen more than once");
 
         // Remember that we've seen a control marker.
         got_control_marker = true;
@@ -936,7 +938,7 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
             // apply a reasonably big timeout before we stop waiting for the
             // logs to appear to have high confidence that Vector has enough
             // time to pick them up and spit them out.
-            let duration = std::time::Duration::from_secs(120);
+            let duration = std::time::Duration::from_mins(2);
             info!("Starting stop timer, due in {} seconds", duration.as_secs());
             tokio::time::sleep(duration).await;
             info!("Stop timer complete");
@@ -965,15 +967,12 @@ async fn pod_filtering() -> Result<(), Box<dyn std::error::Error>> {
 /// This test validates that vector properly filters out the logs by the
 /// custom selectors, based on k8s API `Pod` labels and annotations.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = lock();
-    init();
-
-    let namespace = get_namespace();
-    let pod_namespace = get_namespace_appended(&namespace, "test-pod");
-    let framework = make_framework();
-    let override_name = get_override_name(&namespace, "vector-agent");
-
     const CONFIG: &str = indoc! {r#"
         role: "Agent"
         customConfig:
@@ -997,12 +996,20 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
                     pretty: false
     "#};
 
+    let _guard = lock();
+    init();
+
+    let namespace = get_namespace();
+    let pod_namespace = get_namespace_appended(&namespace, "test-pod");
+    let framework = make_framework();
+    let override_name = get_override_name(&namespace, "vector-agent");
+
     let vector = framework
         .helm_chart(
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![&config_override_name(&override_name, true), CONFIG],
                 ..Default::default()
@@ -1012,7 +1019,7 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
@@ -1048,7 +1055,7 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
         excluded_test_pod_names.push(name);
     }
     for name in excluded_test_pod_names {
-        let name = format!("pods/{}", name);
+        let name = format!("pods/{name}");
         framework
             .wait(
                 &pod_namespace,
@@ -1087,7 +1094,7 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the log lines until the reasonable amount of time passes for us
@@ -1105,11 +1112,8 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
             }
             line = log_reader.read_line() => line,
         };
-        let line = match line {
-            Some(line) => line,
-            None => break,
-        };
-        debug!("Got line: {:?}", line);
+        let Some(line) = line else { break };
+        debug!("Got line: {line:?}");
 
         lines_till_we_give_up -= 1;
         if lines_till_we_give_up == 0 {
@@ -1138,11 +1142,8 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
         // If we get an excluded marker here - it's an error.
         assert_eq!(val["message"], "CONTROL_MARKER");
 
-        if got_control_marker {
-            // We've already seen one control marker! This is not good, we only
-            // emitted one.
-            panic!("Control marker seen more than once");
-        }
+        // Only one control marker was emitted, so reject duplicates.
+        assert!(!got_control_marker, "Control marker seen more than once");
 
         // Remember that we've seen a control marker.
         got_control_marker = true;
@@ -1159,7 +1160,7 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
             // apply a reasonably big timeout before we stop waiting for the
             // logs to appear to have high confidence that Vector has enough
             // time to pick them up and spit them out.
-            let duration = std::time::Duration::from_secs(120);
+            let duration = std::time::Duration::from_mins(2);
             info!("Starting stop timer, due in {} seconds", duration.as_secs());
             tokio::time::sleep(duration).await;
             info!("Stop timer complete");
@@ -1183,6 +1184,11 @@ async fn custom_selectors() -> Result<(), Box<dyn std::error::Error>> {
 /// particular containers that are requested to be excluded from collection,
 /// based on k8s API `Pod` annotations.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
     init();
@@ -1197,7 +1203,7 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -1210,14 +1216,14 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -1231,7 +1237,7 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -1268,7 +1274,7 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the log lines until the reasonable amount of time passes for us
@@ -1286,11 +1292,8 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
             }
             line = log_reader.read_line() => line,
         };
-        let line = match line {
-            Some(line) => line,
-            None => break,
-        };
-        debug!("Got line: {:?}", line);
+        let Some(line) = line else { break };
+        debug!("Got line: {line:?}");
 
         lines_till_we_give_up -= 1;
         if lines_till_we_give_up == 0 {
@@ -1322,11 +1325,8 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
         // If we get an excluded marker here - it's an error.
         assert_eq!(val["message"], "CONTROL_MARKER");
 
-        if got_control_marker {
-            // We've already seen one control marker! This is not good, we only
-            // emitted one.
-            panic!("Control marker seen more than once");
-        }
+        // Only one control marker was emitted, so reject duplicates.
+        assert!(!got_control_marker, "Control marker seen more than once");
 
         // Remember that we've seen a control marker.
         got_control_marker = true;
@@ -1372,14 +1372,6 @@ async fn container_filtering() -> Result<(), Box<dyn std::error::Error>> {
 /// configuration.
 #[tokio::test]
 async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = lock();
-    init();
-
-    let namespace = get_namespace();
-    let pod_namespace = get_namespace_appended(&namespace, "test-pod");
-    let framework = make_framework();
-    let override_name = get_override_name(&namespace, "vector-agent");
-
     const CONFIG: &str = indoc! {r#"
         role: "Agent"
         customConfig:
@@ -1401,12 +1393,20 @@ async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
                     pretty: false
     "#};
 
+    let _guard = lock();
+    init();
+
+    let namespace = get_namespace();
+    let pod_namespace = get_namespace_appended(&namespace, "test-pod");
+    let framework = make_framework();
+    let override_name = get_override_name(&namespace, "vector-agent");
+
     let vector = framework
         .helm_chart(
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![&config_override_name(&override_name, true), CONFIG],
                 ..Default::default()
@@ -1416,7 +1416,7 @@ async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
@@ -1454,7 +1454,7 @@ async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the log lines until the reasonable amount of time passes for us
@@ -1472,11 +1472,8 @@ async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
             }
             line = log_reader.read_line() => line,
         };
-        let line = match line {
-            Some(line) => line,
-            None => break,
-        };
-        debug!("Got line: {:?}", line);
+        let Some(line) = line else { break };
+        debug!("Got line: {line:?}");
 
         lines_till_we_give_up -= 1;
         if lines_till_we_give_up == 0 {
@@ -1508,11 +1505,8 @@ async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
         // If we get an excluded marker here - it's an error.
         assert_eq!(val["message"], "CONTROL_MARKER");
 
-        if got_control_marker {
-            // We've already seen one control marker! This is not good, we only
-            // emitted one.
-            panic!("Control marker seen more than once");
-        }
+        // Only one control marker was emitted, so reject duplicates.
+        assert!(!got_control_marker, "Control marker seen more than once");
 
         // Remember that we've seen a control marker.
         got_control_marker = true;
@@ -1551,13 +1545,18 @@ async fn glob_pattern_filtering() -> Result<(), Box<dyn std::error::Error>> {
 /// This test validates that vector properly collects logs from multiple
 /// `Namespace`s and `Pod`s.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
     init();
 
     let namespace = get_namespace();
     let pod_namespace = get_namespace_appended(&namespace, "test-pod");
-    let affinity_label = format!("{}-affinity", pod_namespace);
+    let affinity_label = format!("{pod_namespace}-affinity");
     let framework = make_framework();
     let override_name = get_override_name(&namespace, "vector-agent");
 
@@ -1566,7 +1565,7 @@ async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -1579,14 +1578,14 @@ async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -1600,14 +1599,14 @@ async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
     let mut test_namespaces = vec![];
     let mut expected_namespaces = HashSet::new();
     for i in 0..10 {
-        let name = format!("{}-{}", pod_namespace, i);
+        let name = format!("{pod_namespace}-{i}");
         test_namespaces.push(
             framework
                 .namespace(namespace::Config::from_namespace(
@@ -1620,7 +1619,7 @@ async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a pod for our other pods to have an affinity to ensure they are all deployed on
     // the same node.
-    let affinity_ns_name = format!("{}-affinity", pod_namespace);
+    let affinity_ns_name = format!("{pod_namespace}-affinity");
     let affinity_ns = framework
         .namespace(namespace::Config::from_namespace(
             &namespace::make_namespace(affinity_ns_name.clone(), None),
@@ -1630,7 +1629,7 @@ async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut test_pods = vec![];
     for ns in &expected_namespaces {
-        debug!("creating {}", ns);
+        debug!("creating {ns}");
         let test_pod = framework
             .test_pod(test_pod::Config::from_pod(&make_test_pod_with_affinity(
                 ns,
@@ -1663,7 +1662,7 @@ async fn multiple_ns() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -1728,7 +1727,7 @@ async fn existing_config_file() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -1741,7 +1740,7 @@ async fn existing_config_file() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
@@ -1775,7 +1774,7 @@ async fn existing_config_file() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -1790,11 +1789,8 @@ async fn existing_config_file() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure we got the marker.
         assert_eq!(val["message"], "MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;
@@ -1815,6 +1811,11 @@ async fn existing_config_file() -> Result<(), Box<dyn std::error::Error>> {
 /// This test validates that vector properly exposes metrics in
 /// a Prometheus scraping format.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
     init();
@@ -1829,7 +1830,7 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -1842,14 +1843,14 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -1863,7 +1864,7 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -1911,7 +1912,7 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
         .get_vector_pod_with_pod(&pod_namespace, "test-pod", &namespace, &override_name)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("pod/{}", vector_pod))?;
+    let mut log_reader = framework.logs(&namespace, &format!("pod/{vector_pod}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -1926,11 +1927,8 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure we got the marker.
         assert_eq!(val["message"], "MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;
@@ -1955,9 +1953,7 @@ async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure we did get at least one event since before deployed the test pod.
     assert!(
         processed_events_after > processed_events_before,
-        "before: {}, after: {}",
-        processed_events_before,
-        processed_events_after
+        "before: {processed_events_before}, after: {processed_events_after}"
     );
 
     metrics::assert_metrics_present(&vector_metrics_url, metrics::SOURCE_COMPLIANCE_METRICS)
@@ -1986,7 +1982,7 @@ async fn host_metrics() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![
                     &config_override_name(&override_name, true),
@@ -1999,14 +1995,14 @@ async fn host_metrics() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("daemonset/{}", override_name),
+            &format!("daemonset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
 
     let mut vector_metrics_port_forward = framework.port_forward(
         &namespace,
-        &format!("daemonset/{}", override_name),
+        &format!("daemonset/{override_name}"),
         9090,
         9090,
     )?;
@@ -2020,7 +2016,7 @@ async fn host_metrics() -> Result<(), Box<dyn std::error::Error>> {
     metrics::wait_for_vector_started(
         &vector_metrics_url,
         std::time::Duration::from_secs(5),
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .await?;
 
@@ -2052,7 +2048,7 @@ async fn simple_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
             "test-vector",
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![HELM_VALUES_AGENT],
                 ..Default::default()
@@ -2104,11 +2100,8 @@ async fn simple_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
         // Ensure we got the marker.
         assert_eq!(val["message"], "CHECKED_MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;
@@ -2134,17 +2127,15 @@ async fn simple_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
             return FlowControlCommand::GoOn;
         }
 
-        if val["message"].eq("CHECKED_MARKER") {
-            panic!("Checkpointed marker should not be found");
-        };
+        assert!(
+            !val["message"].eq("CHECKED_MARKER"),
+            "Checkpointed marker should not be found"
+        );
 
         assert_eq!(val["message"], "MARKER");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;

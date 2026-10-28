@@ -2,6 +2,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display, Formatter},
+    fs,
     hash::Hash,
     net::SocketAddr,
     path::PathBuf,
@@ -10,65 +11,113 @@ use std::{
 
 use indexmap::IndexMap;
 use serde::Serialize;
-pub use vector_lib::config::{
-    AcknowledgementsConfig, DataType, GlobalOptions, Input, LogNamespace,
-    SourceAcknowledgementsConfig, SourceOutput, TransformOutput,
+use vector_config::configurable_component;
+pub use vector_lib::{
+    config::{
+        AcknowledgementsConfig, DataType, GlobalOptions, Input, LogNamespace,
+        SourceAcknowledgementsConfig, SourceOutput, TransformOutput, WildcardMatching,
+    },
+    configurable::component::{GenerateConfig, SinkDescription, TransformDescription},
 };
-pub use vector_lib::configurable::component::{
-    GenerateConfig, SinkDescription, TransformDescription,
-};
-use vector_lib::configurable::configurable_component;
 
-use crate::{conditions, event::Metric, secrets::SecretBackends, serde::OneOrMany};
+use crate::{
+    conditions,
+    event::{Metric, Value},
+    secrets::SecretBackends,
+    serde::OneOrMany,
+};
 
 pub mod api;
 mod builder;
-mod cmd;
 mod compiler;
+mod component;
 mod diff;
-mod dot_graph;
+pub mod dot_graph;
 mod enrichment_table;
 pub mod format;
 mod graph;
-mod loading;
+mod graph_builder;
+pub mod loading;
 pub mod provider;
 pub mod schema;
 mod secret;
 mod sink;
+mod sink_validated;
 mod source;
 mod transform;
 pub mod unit_test;
+mod unix;
 mod validation;
-mod vars;
 pub mod watcher;
 
 pub use builder::ConfigBuilder;
-pub use cmd::{cmd, Opts};
+pub use component::{Component, ComponentKind};
 pub use diff::ConfigDiff;
 pub use enrichment_table::{EnrichmentTableConfig, EnrichmentTableOuter};
+pub(crate) use enrichment_table::{enrichment_table_sinks, enrichment_table_sources};
 pub use format::{Format, FormatHint};
+pub use loading::interpolation::{ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX, interpolate};
 pub use loading::{
-    load, load_builder_from_paths, load_from_paths, load_from_paths_with_provider_and_secrets,
-    load_from_str, load_source_from_paths, merge_path_lists, process_paths, COLLECTOR,
-    CONFIG_PATHS,
+    COLLECTOR, CONFIG_PATHS, env_var_interpolation_enabled, load, load_from_paths,
+    load_from_paths_with_provider_and_secrets, load_from_str, load_from_str_with_secrets,
+    load_source_from_paths, merge_path_lists, process_paths, set_env_var_interpolation,
 };
 pub use provider::ProviderConfig;
 pub use secret::SecretBackend;
 pub use sink::{BoxedSink, SinkConfig, SinkContext, SinkHealthcheckOptions, SinkOuter};
+pub use sink_validated::{DynValidatedSink, ValidatedSink};
 pub use source::{BoxedSource, SourceConfig, SourceContext, SourceOuter};
 pub use transform::{
-    get_transform_output_ids, BoxedTransform, TransformConfig, TransformContext, TransformOuter,
+    BoxedTransform, TransformConfig, TransformContext, TransformOuter, get_transform_output_ids,
 };
-pub use unit_test::{build_unit_tests, build_unit_tests_main, UnitTestResult};
+pub use unit_test::{UnitTestResult, build_unit_tests, build_unit_tests_main};
+pub use unix::UnixOnly;
 pub use validation::warnings;
-pub use vars::{interpolate, ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX};
 pub use vector_lib::{
     config::{
-        init_log_schema, init_telemetry, log_schema, proxy::ProxyConfig, telemetry, ComponentKey,
-        LogSchema, OutputId,
+        ComponentKey, LogSchema, OutputId, init_log_schema, init_telemetry, log_schema,
+        proxy::ProxyConfig, telemetry,
     },
     id::Inputs,
 };
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct ComponentConfig {
+    pub config_paths: Vec<PathBuf>,
+    pub component_key: ComponentKey,
+    pub component_type: ComponentKind,
+}
+
+impl ComponentConfig {
+    #[must_use]
+    pub fn new(
+        config_paths: Vec<PathBuf>,
+        component_key: ComponentKey,
+        component_type: ComponentKind,
+    ) -> Self {
+        let canonicalized_paths = config_paths
+            .into_iter()
+            .filter_map(|p| fs::canonicalize(p).ok())
+            .collect();
+
+        Self {
+            config_paths: canonicalized_paths,
+            component_key,
+            component_type,
+        }
+    }
+
+    #[must_use]
+    pub fn contains(
+        &self,
+        config_paths: &HashSet<PathBuf>,
+    ) -> Option<(ComponentKey, ComponentKind)> {
+        if config_paths.iter().any(|p| self.config_paths.contains(p)) {
+            return Some((self.component_key.clone(), self.component_type));
+        }
+        None
+    }
+}
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub enum ConfigPath {
@@ -77,6 +126,8 @@ pub enum ConfigPath {
 }
 
 impl<'a> From<&'a ConfigPath> for &'a PathBuf {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::match_same_arms, reason = "Preserve branch-specific context")]
     fn from(config_path: &'a ConfigPath) -> &'a PathBuf {
         match config_path {
             ConfigPath::File(path, _) => path,
@@ -86,6 +137,12 @@ impl<'a> From<&'a ConfigPath> for &'a PathBuf {
 }
 
 impl ConfigPath {
+    #[must_use]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::match_wildcard_for_single_variants,
+        reason = "Preserve existing control flow"
+    )]
     pub const fn as_dir(&self) -> Option<&PathBuf> {
         match self {
             Self::Dir(path) => Some(path),
@@ -104,17 +161,19 @@ pub struct Config {
     sources: IndexMap<ComponentKey, SourceOuter>,
     sinks: IndexMap<ComponentKey, SinkOuter<OutputId>>,
     transforms: IndexMap<ComponentKey, TransformOuter<OutputId>>,
-    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter>,
+    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter<OutputId>>,
     tests: Vec<TestDefinition>,
     secret: IndexMap<ComponentKey, SecretBackends>,
     pub graceful_shutdown_duration: Option<Duration>,
 }
 
 impl Config {
+    #[must_use]
     pub fn builder() -> builder::ConfigBuilder {
-        Default::default()
+        ConfigBuilder::default()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
@@ -123,6 +182,7 @@ impl Config {
         self.sources.iter()
     }
 
+    #[must_use]
     pub fn source(&self, id: &ComponentKey) -> Option<&SourceOuter> {
         self.sources.get(id)
     }
@@ -131,6 +191,7 @@ impl Config {
         self.transforms.iter()
     }
 
+    #[must_use]
     pub fn transform(&self, id: &ComponentKey) -> Option<&TransformOuter<OutputId>> {
         self.transforms.get(id)
     }
@@ -139,17 +200,48 @@ impl Config {
         self.sinks.iter()
     }
 
+    #[must_use]
     pub fn sink(&self, id: &ComponentKey) -> Option<&SinkOuter<OutputId>> {
         self.sinks.get(id)
+    }
+
+    pub fn enrichment_tables(
+        &self,
+    ) -> impl Iterator<Item = (&ComponentKey, &EnrichmentTableOuter<OutputId>)> {
+        self.enrichment_tables.iter()
+    }
+
+    #[must_use]
+    pub fn enrichment_table(&self, id: &ComponentKey) -> Option<&EnrichmentTableOuter<OutputId>> {
+        self.enrichment_tables.get(id)
+    }
+
+    /// Configured pipeline components in source, transform, sink, and table order.
+    ///
+    /// Enrichment tables retain their configured identity here. Their derived
+    /// sources and sinks are expanded separately when building the topology.
+    pub fn components(&self) -> impl Iterator<Item = (&ComponentKey, Component<'_>)> {
+        let sources = self.sources().map(|(key, c)| (key, Component::from(c)));
+        let transforms = self.transforms().map(|(key, c)| (key, Component::from(c)));
+        let sinks = self.sinks().map(|(key, c)| (key, Component::from(c)));
+        let tables = self
+            .enrichment_tables()
+            .map(|(key, c)| (key, Component::from(c)));
+
+        sources.chain(transforms).chain(sinks).chain(tables)
     }
 
     pub fn inputs_for_node(&self, id: &ComponentKey) -> Option<&[OutputId]> {
         self.transforms
             .get(id)
-            .map(|t| &t.inputs[..])
-            .or_else(|| self.sinks.get(id).map(|s| &s.inputs[..]))
+            .map(Component::from)
+            .or_else(|| self.sinks.get(id).map(Component::from))
+            .or_else(|| self.enrichment_tables.get(id).map(Component::from))
+            .and_then(|component| component.inputs())
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn propagate_acknowledgements(&mut self) -> Result<(), Vec<String>> {
         let inputs: Vec<_> = self
             .sinks
@@ -193,6 +285,20 @@ impl Config {
             }
         }
     }
+
+    #[must_use]
+    pub fn transform_keys_with_external_files(&self) -> HashSet<ComponentKey> {
+        self.transforms
+            .iter()
+            .filter_map(|(name, transform_outer)| {
+                if transform_outer.inner.files_to_watch().is_empty() {
+                    None
+                } else {
+                    Some(name.clone())
+                }
+            })
+            .collect()
+    }
 }
 
 /// Healthcheck options.
@@ -220,7 +326,7 @@ impl HealthcheckOptions {
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    const fn merge(&mut self, other: Self) {
         self.enabled &= other.enabled;
         self.require_healthy |= other.require_healthy;
     }
@@ -234,6 +340,8 @@ impl Default for HealthcheckOptions {
         }
     }
 }
+
+impl_generate_config_from_default!(HealthcheckOptions);
 
 /// Unique thing, like port, of which only one owner can be.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -251,10 +359,12 @@ pub enum Protocol {
 }
 
 impl Resource {
+    #[must_use]
     pub const fn tcp(addr: SocketAddr) -> Self {
         Self::Port(addr, Protocol::Tcp)
     }
 
+    #[must_use]
     pub const fn udp(addr: SocketAddr) -> Self {
         Self::Port(addr, Protocol::Udp)
     }
@@ -269,10 +379,10 @@ impl Resource {
         // Find equality based conflicts
         for (key, resources) in components {
             for resource in resources {
-                if let Resource::Port(address, protocol) = &resource {
-                    if address.ip().is_unspecified() {
-                        unspecified.push((key.clone(), *address, *protocol));
-                    }
+                if let Resource::Port(address, protocol) = &resource
+                    && address.ip().is_unspecified()
+                {
+                    unspecified.push((key.clone(), *address, *protocol));
                 }
 
                 resource_map
@@ -286,7 +396,7 @@ impl Resource {
         // so we have to check for all Port resources if they share the same
         // port.
         for (key, address0, protocol0) in unspecified {
-            for (resource, components) in resource_map.iter_mut() {
+            for (resource, components) in &mut resource_map {
                 if let Resource::Port(address, protocol) = resource {
                     // IP addresses can either be v4 or v6.
                     // Therefore we check if the ip version matches, the port matches and if the protocol (TCP/UDP) matches
@@ -316,10 +426,10 @@ impl Display for Protocol {
 impl Display for Resource {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
-            Resource::Port(address, protocol) => write!(fmt, "{} {}", protocol, address),
+            Resource::Port(address, protocol) => write!(fmt, "{protocol} {address}"),
             Resource::SystemFdOffset(offset) => write!(fmt, "systemd {}th socket", offset + 1),
-            Resource::Fd(fd) => write!(fmt, "file descriptor: {}", fd),
-            Resource::DiskBuffer(name) => write!(fmt, "disk buffer {:?}", name),
+            Resource::Fd(fd) => write!(fmt, "file descriptor: {fd}"),
+            Resource::DiskBuffer(name) => write!(fmt, "disk buffer {name:?}"),
         }
     }
 }
@@ -351,7 +461,7 @@ pub struct TestDefinition<T: 'static = OutputId> {
 impl TestDefinition<String> {
     fn resolve_outputs(
         self,
-        graph: &graph::Graph,
+        output_map: &HashMap<String, OutputId>,
     ) -> Result<TestDefinition<OutputId>, Vec<String>> {
         let TestDefinition {
             name,
@@ -362,27 +472,29 @@ impl TestDefinition<String> {
         } = self;
         let mut errors = Vec::new();
 
-        let output_map = graph.input_map().expect("ambiguous outputs");
-
         let outputs = outputs
             .into_iter()
             .map(|old| {
                 let TestOutput {
                     extract_from,
                     conditions,
+                    expected_event_count,
                 } = old;
 
-                (extract_from.to_vec(), conditions)
+                (extract_from.to_vec(), conditions, expected_event_count)
             })
-            .filter_map(|(extract_from, conditions)| {
+            .filter_map(|(extract_from, conditions, expected_event_count)| {
                 let mut outputs = Vec::new();
                 for from in extract_from {
-                    if let Some(output_id) = output_map.get(&from) {
+                    if no_outputs_from.contains(&from) {
+                        errors.push(format!(
+                            r"Invalid extract_from target in test '{name}': '{from}' listed in no_outputs_from"
+                        ));
+                    } else if let Some(output_id) = output_map.get(&from) {
                         outputs.push(output_id.clone());
                     } else {
                         errors.push(format!(
-                            r#"Invalid extract_from target in test '{}': '{}' does not exist"#,
-                            name, from
+                            r"Invalid extract_from target in test '{name}': '{from}' does not exist"
                         ));
                     }
                 }
@@ -392,6 +504,7 @@ impl TestDefinition<String> {
                     Some(TestOutput {
                         extract_from: outputs.into(),
                         conditions,
+                        expected_event_count,
                     })
                 }
             })
@@ -404,8 +517,7 @@ impl TestDefinition<String> {
                     Some(output_id.clone())
                 } else {
                     errors.push(format!(
-                        r#"Invalid no_outputs_from target in test '{}': '{}' does not exist"#,
-                        name, o
+                        r"Invalid no_outputs_from target in test '{name}': '{o}' does not exist"
                     ));
                     None
                 }
@@ -447,6 +559,7 @@ impl TestDefinition<OutputId> {
                     .collect::<Vec<_>>()
                     .into(),
                 conditions: old.conditions,
+                expected_event_count: old.expected_event_count,
             })
             .collect();
 
@@ -462,24 +575,6 @@ impl TestDefinition<OutputId> {
     }
 }
 
-/// Value for a log field.
-#[configurable_component]
-#[derive(Clone, Debug)]
-#[serde(untagged)]
-pub enum TestInputValue {
-    /// A string.
-    String(String),
-
-    /// An integer.
-    Integer(i64),
-
-    /// A floating-point number.
-    Float(f64),
-
-    /// A boolean.
-    Boolean(bool),
-}
-
 /// A unit test input.
 ///
 /// An input describes not only the type of event to insert, but also which transform within the
@@ -487,6 +582,8 @@ pub enum TestInputValue {
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::doc_markdown, reason = "Documentation formatting deferred")]
 pub struct TestInput {
     /// The name of the transform to insert the input event to.
     pub insert_at: ComponentKey,
@@ -511,7 +608,7 @@ pub struct TestInput {
     /// The set of log fields to use when creating a log input event.
     ///
     /// Only relevant when `type` is `log`.
-    pub log_fields: Option<IndexMap<String, TestInputValue>>,
+    pub log_fields: Option<IndexMap<String, Value>>,
 
     /// The metric to use as an input event.
     ///
@@ -536,16 +633,25 @@ pub struct TestOutput<T: 'static = OutputId> {
 
     /// The conditions to run against the output to validate that they were transformed as expected.
     pub conditions: Option<Vec<conditions::AnyCondition>>,
+
+    /// The expected number of events to be produced by the transform.
+    ///
+    /// If specified, the test will fail if the number of events emitted by the
+    /// transform does not match this value. This check is independent of
+    /// `conditions` -- the count is verified first, then each condition is
+    /// evaluated against the output events separately. This is useful for
+    /// transforms that may emit multiple events.
+    pub expected_event_count: Option<usize>,
 }
 
 #[cfg(all(test, feature = "sources-file", feature = "sinks-console"))]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::path::PathBuf;
 
-    use crate::{config, topology};
     use indoc::indoc;
 
-    use super::{builder::ConfigBuilder, format, load_from_str, ComponentKey, ConfigDiff, Format};
+    use super::{ComponentKey, ConfigDiff, Format, builder::ConfigBuilder, format, load_from_str};
+    use crate::{config, topology::builder::TopologyPiecesBuilder};
 
     async fn load(config: &str, format: config::Format) -> Result<Vec<String>, Vec<String>> {
         match config::load_from_str(config, format) {
@@ -554,8 +660,7 @@ mod tests {
                 let c2 = config::load_from_str(config, format).unwrap();
                 match (
                     config::warnings(&c2),
-                    topology::TopologyPieces::build(&c, &diff, HashMap::new(), Default::default())
-                        .await,
+                    TopologyPiecesBuilder::new(&c, &diff).build().await,
                 ) {
                     (warnings, Ok(_pieces)) => Ok(warnings),
                     (_, Err(errors)) => Err(errors),
@@ -687,22 +792,27 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "sources-file_descriptor"))]
     async fn no_conflict_fd_resources() {
+        use crate::sources::file_descriptors::file_descriptor::null_fd;
+        let fd1 = null_fd().unwrap();
+        let fd2 = null_fd().unwrap();
         let result = load(
-            r#"
+            &format!(
+                r#"
             [sources.file_descriptor1]
             type = "file_descriptor"
-            fd = 10
+            fd = {fd1}
 
             [sources.file_descriptor2]
             type = "file_descriptor"
-            fd = 20
+            fd = {fd2}
 
             [sinks.out]
             type = "test_basic"
             inputs = ["file_descriptor1", "file_descriptor2"]
-            "#,
+            "#
+            ),
             Format::Toml,
         )
         .await;
@@ -748,7 +858,7 @@ mod tests {
                 "Transform \"sample2\" has no consumers",
                 "Source \"in2\" has no consumers",
             ]
-        )
+        );
     }
 
     #[tokio::test]
@@ -794,7 +904,7 @@ mod tests {
         assert_eq!(
             errors,
             vec!["Cyclic dependency detected in the chain [ four -> two -> three -> four ]"]
-        )
+        );
     }
 
     #[test]
@@ -815,7 +925,7 @@ mod tests {
         assert_eq!(
             Some(PathBuf::from("/var/lib/vector")),
             config.global.data_dir
-        )
+        );
     }
 
     #[test]
@@ -1290,12 +1400,13 @@ mod resource_config_tests {
     use indoc::indoc;
     use vector_lib::configurable::schema::generate_root_schema;
 
-    use super::{load_from_str, Format};
+    use super::{Format, load_from_str};
 
     #[test]
     fn config_conflict_detected() {
-        assert!(load_from_str(
-            indoc! {r#"
+        assert!(
+            load_from_str(
+                indoc! {r#"
                 [sources.in0]
                   type = "stdin"
 
@@ -1307,20 +1418,26 @@ mod resource_config_tests {
                   inputs = ["in0","in1"]
                   encoding.codec = "json"
             "#},
-            Format::Toml,
-        )
-        .is_err());
+                Format::Toml,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     #[ignore]
     #[allow(clippy::print_stdout)]
     #[allow(clippy::print_stderr)]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::ignore_without_reason,
+        reason = "Ignored test needs documentation"
+    )]
     fn generate_component_config_schema() {
-        use crate::config::{SinkOuter, SourceOuter, TransformOuter};
         use indexmap::IndexMap;
-        use vector_lib::config::ComponentKey;
-        use vector_lib::configurable::configurable_component;
+        use vector_lib::{config::ComponentKey, configurable::configurable_component};
+
+        use crate::config::{SinkOuter, SourceOuter, TransformOuter};
 
         /// Top-level Vector configuration.
         #[configurable_component]
@@ -1344,9 +1461,9 @@ mod resource_config_tests {
                 let json = serde_json::to_string_pretty(&schema)
                     .expect("rendering root schema to JSON should not fail");
 
-                println!("{}", json);
+                println!("{json}");
             }
-            Err(e) => eprintln!("error while generating schema: {:?}", e),
+            Err(e) => eprintln!("error while generating schema: {e:?}"),
         }
     }
 }

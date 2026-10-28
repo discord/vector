@@ -1,16 +1,17 @@
 use std::io;
 
-use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::lookup_v2::OptionalValuePath;
+use vector_lib::{
+    codecs::decoding::{DeserializerConfig, FramingConfig},
+    config::LogNamespace,
+    configurable::configurable_component,
+    lookup::lookup_v2::OptionalValuePath,
+};
 
+use super::{FileDescriptorConfig, outputs};
 use crate::{
     config::{Resource, SourceConfig, SourceContext, SourceOutput},
     serde::default_decoding,
 };
-
-use super::{outputs, FileDescriptorConfig};
 
 /// Configuration for the `stdin` source.
 #[configurable_component(source("stdin", "Collect logs sent via stdin."))]
@@ -32,10 +33,8 @@ pub struct StdinConfig {
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
     pub host_key: Option<OptionalValuePath>,
 
-    #[configurable(derived)]
     pub framing: Option<FramingConfig>,
 
-    #[configurable(derived)]
     #[serde(default = "default_decoding")]
     pub decoding: DeserializerConfig,
 
@@ -67,7 +66,7 @@ impl Default for StdinConfig {
     fn default() -> Self {
         StdinConfig {
             max_length: crate::serde::default_max_length(),
-            host_key: Default::default(),
+            host_key: Option::default(),
             framing: None,
             decoding: default_decoding(),
             log_namespace: None,
@@ -93,7 +92,12 @@ impl SourceConfig for StdinConfig {
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
 
-        outputs(log_namespace, &self.host_key, &self.decoding, Self::NAME)
+        outputs(
+            log_namespace,
+            self.host_key.as_ref(),
+            &self.decoding,
+            Self::NAME,
+        )
     }
 
     fn resources(&self) -> Vec<Resource> {
@@ -109,15 +113,17 @@ impl SourceConfig for StdinConfig {
 mod tests {
     use std::io::Cursor;
 
-    use super::*;
-    use crate::{
-        config::log_schema, shutdown::ShutdownSignal,
-        test_util::components::assert_source_compliance, test_util::components::SOURCE_TAGS,
-        SourceSender,
-    };
     use futures::StreamExt;
     use vector_lib::lookup::path;
     use vrl::value;
+
+    use super::*;
+    use crate::{
+        SourceSender,
+        config::log_schema,
+        shutdown::ShutdownSignal,
+        test_util::components::{SOURCE_TAGS, assert_source_compliance},
+    };
 
     #[test]
     fn generate_config() {
@@ -190,10 +196,11 @@ mod tests {
                 meta.get(path!("vector", "source_type")).unwrap(),
                 &value!("stdin")
             );
-            assert!(meta
-                .get(path!("vector", "ingest_timestamp"))
-                .unwrap()
-                .is_timestamp());
+            assert!(
+                meta.get(path!("vector", "ingest_timestamp"))
+                    .unwrap()
+                    .is_timestamp()
+            );
 
             let event = stream.next().await;
             let event = event.unwrap();

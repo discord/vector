@@ -1,5 +1,7 @@
 #![allow(missing_docs)]
 
+use std::collections::HashSet;
+
 use snafu::Snafu;
 use tokio::{runtime::Runtime, sync::broadcast};
 use tokio_stream::{Stream, StreamExt};
@@ -14,17 +16,36 @@ pub type SignalRx = broadcast::Receiver<SignalTo>;
 /// Control messages used by Vector to drive topology and shutdown events.
 #[allow(clippy::large_enum_variant)] // discovered during Rust upgrade to 1.57; just allowing for now since we did previously
 pub enum SignalTo {
+    /// Signal to reload given components.
+    ReloadComponents(HashSet<ComponentKey>),
     /// Signal to reload config from a string.
     ReloadFromConfigBuilder(ConfigBuilder),
-    /// Signal to reload config from the filesystem.
+    /// Signal to reload config from the filesystem and reload components with external files.
     ReloadFromDisk,
+    /// Signal to reload all enrichment tables.
+    ReloadEnrichmentTables,
     /// Signal to shutdown process.
     Shutdown(Option<ShutdownError>),
     /// Shutdown process immediately.
     Quit,
 }
 
-#[derive(Clone, Debug, Snafu)]
+impl PartialEq for SignalTo {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ReloadComponents(a), Self::ReloadComponents(b)) => a == b,
+            (Self::Shutdown(a), Self::Shutdown(b)) => a == b,
+            // TODO: This will require a lot of plumbing but ultimately we can derive equality for config builders.
+            (Self::ReloadFromConfigBuilder(_), Self::ReloadFromConfigBuilder(_))
+            | (Self::ReloadFromDisk, Self::ReloadFromDisk)
+            | (Self::ReloadEnrichmentTables, Self::ReloadEnrichmentTables)
+            | (Self::Quit, Self::Quit) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Snafu, PartialEq, Eq)]
 pub enum ShutdownError {
     // For future work: It would be nice if we could keep the actual errors in here, but
     // `crate::Error` doesn't implement `Clone`, and adding `DynClone` for errors is tricky.
@@ -50,13 +71,21 @@ impl SignalPair {
     /// Create a new signal handler pair, and set them up to receive OS signals.
     pub fn new(runtime: &Runtime) -> Self {
         let (handler, receiver) = SignalHandler::new();
+
+        #[cfg(unix)]
         let signals = os_signals(runtime);
+
+        // If we passed `runtime` here, we would get the following:
+        // error[E0521]: borrowed data escapes outside of associated function
+        #[cfg(windows)]
+        let signals = os_signals();
+
         handler.forever(runtime, signals);
         Self { handler, receiver }
     }
 }
 
-/// SignalHandler is a general `ControlTo` message receiver and transmitter. It's used by
+/// `SignalHandler` is a general `ControlTo` message receiver and transmitter. It's used by
 /// OS signals and providers to surface control events to the root of the application.
 pub struct SignalHandler {
     tx: SignalTx,
@@ -66,7 +95,8 @@ pub struct SignalHandler {
 impl SignalHandler {
     /// Create a new signal handler with space for 128 control messages at a time, to
     /// ensure the channel doesn't overflow and drop signals.
-    fn new() -> (Self, SignalRx) {
+    #[must_use]
+    pub fn new() -> (Self, SignalRx) {
         let (tx, rx) = broadcast::channel(128);
         let handler = Self {
             tx,
@@ -77,11 +107,13 @@ impl SignalHandler {
     }
 
     /// Clones the transmitter.
+    #[must_use]
     pub fn clone_tx(&self) -> SignalTx {
         self.tx.clone()
     }
 
     /// Subscribe to the stream, and return a new receiver.
+    #[must_use]
     pub fn subscribe(&self) -> SignalRx {
         self.tx.subscribe()
     }
@@ -100,7 +132,10 @@ impl SignalHandler {
 
             while let Some(value) = stream.next().await {
                 if tx.send(value.into()).is_err() {
-                    error!(message = "Couldn't send signal.");
+                    error!(
+                        message = "Couldn't send signal.",
+                        internal_log_rate_limit = false
+                    );
                     break;
                 }
             }
@@ -130,12 +165,12 @@ impl SignalHandler {
                     _ = shutdown_rx.recv() => break,
                     Some(value) = stream.next() => {
                         if tx.send(value.into()).is_err() {
-                            error!(message = "Couldn't send signal.");
+                            error!(message = "Couldn't send signal.", internal_log_rate_limit = false);
                             break;
                         }
                     }
                     else => {
-                        error!(message = "Underlying stream is closed.");
+                        error!(message = "Underlying stream is closed.", internal_log_rate_limit = false);
                         break;
                     }
                 }
@@ -154,8 +189,8 @@ impl SignalHandler {
 
 /// Signals from OS/user.
 #[cfg(unix)]
-fn os_signals(runtime: &Runtime) -> impl Stream<Item = SignalTo> {
-    use tokio::signal::unix::{signal, SignalKind};
+fn os_signals(runtime: &Runtime) -> impl Stream<Item = SignalTo> + use<> {
+    use tokio::signal::unix::{SignalKind, signal};
 
     // The `signal` function must be run within the context of a Tokio runtime.
     runtime.block_on(async {
@@ -193,7 +228,7 @@ fn os_signals(runtime: &Runtime) -> impl Stream<Item = SignalTo> {
 
 /// Signals from OS/user.
 #[cfg(windows)]
-fn os_signals(_: &Runtime) -> impl Stream<Item = SignalTo> {
+fn os_signals() -> impl Stream<Item = SignalTo> {
     use futures::future::FutureExt;
 
     async_stream::stream! {

@@ -1,7 +1,6 @@
 #![allow(missing_docs)]
 use clap::Parser;
 use serde::Serialize;
-
 use vector_lib::configurable::component::{
     EnrichmentTableDescription, SinkDescription, SourceDescription, TransformDescription,
 };
@@ -29,6 +28,9 @@ pub struct EncodedList {
     enrichment_tables: Vec<&'static str>,
 }
 
+/// # Panics
+/// Panics if the component list cannot be serialized to JSON.
+#[must_use]
 pub fn cmd(opts: &Opts) -> exitcode::ExitCode {
     let sources = SourceDescription::types();
     let transforms = TransformDescription::types();
@@ -40,34 +42,25 @@ pub fn cmd(opts: &Opts) -> exitcode::ExitCode {
         Format::Text => {
             println!("Sources:");
             for name in sources {
-                println!("- {}", name);
+                println!("- {name}");
             }
 
             println!("\nTransforms:");
             for name in transforms {
-                println!("- {}", name);
+                println!("- {name}");
             }
 
             println!("\nSinks:");
             for name in sinks {
-                println!("- {}", name);
+                println!("- {name}");
             }
 
             println!("\nEnrichment tables:");
             for name in enrichment_tables {
-                println!("- {}", name);
+                println!("- {name}");
             }
         }
-        Format::Json => {
-            let list = EncodedList {
-                sources,
-                transforms,
-                sinks,
-                enrichment_tables,
-            };
-            println!("{}", serde_json::to_string(&list).unwrap());
-        }
-        Format::Avro => {
+        Format::Json | Format::Avro => {
             let list = EncodedList {
                 sources,
                 transforms,

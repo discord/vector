@@ -1,4 +1,4 @@
-FROM docker.io/alpine:3.20 AS builder
+FROM docker.io/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS builder
 
 WORKDIR /vector
 
@@ -12,13 +12,19 @@ RUN ARCH=$(if [ "$TARGETPLATFORM" = "linux/arm/v6" ]; then echo "arm"; else cat 
 
 RUN mkdir -p /var/lib/vector
 
-FROM docker.io/alpine:3.20
+FROM docker.io/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+
+# https://github.com/opencontainers/image-spec/blob/main/annotations.md
+LABEL org.opencontainers.image.url="https://vector.dev"
+LABEL org.opencontainers.image.source="https://github.com/vectordotdev/vector"
+LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
+
 # we want the latest versions of these
 # hadolint ignore=DL3018
 RUN apk --no-cache add ca-certificates tzdata
 
 COPY --from=builder /vector/bin/* /usr/local/bin/
-COPY --from=builder /vector/config/vector.yaml /etc/vector/vector.yaml
+COPY --from=builder /vector/config/vector.yaml /usr/share/vector/examples/vector.yaml
 COPY --from=builder /var/lib/vector /var/lib/vector
 
 # Smoke test

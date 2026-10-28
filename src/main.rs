@@ -1,18 +1,25 @@
 #![deny(warnings)]
 
 extern crate vector;
-use vector::{app::Application, extra_context::ExtraContext};
-
 use std::process::ExitCode;
 
+use vector::{app::Application, extra_context::ExtraContext};
+
 #[cfg(unix)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Preserve low-byte exit status"
+)]
 fn main() -> ExitCode {
-    #[cfg(feature = "allocation-tracing")]
+    #[cfg(all(unix, feature = "tikv-jemallocator"))]
     {
-        use crate::vector::internal_telemetry::allocations::{
-            init_allocation_tracing, REPORTING_INTERVAL_MS, TRACK_ALLOCATIONS,
-        };
         use std::sync::atomic::Ordering;
+
+        use crate::vector::internal_telemetry::allocations::{
+            REPORTING_INTERVAL_MS, TRACK_ALLOCATIONS, init_allocation_tracing,
+        };
         let opts = vector::cli::Opts::get_matches()
             .map_err(|error| {
                 // Printing to stdout/err can itself fail; ignore it.
@@ -44,7 +51,13 @@ fn main() -> ExitCode {
 }
 
 #[cfg(windows)]
-pub fn main() -> ExitCode {
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Preserve low-byte exit status"
+)]
+fn main() -> ExitCode {
     // We need to be able to run vector in User Interactive mode. We first try
     // to run vector as a service. If we fail, we consider that we are in
     // interactive mode and then fallback to console mode.  See

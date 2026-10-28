@@ -1,9 +1,19 @@
-use redis::{aio::ConnectionManager, RedisResult};
+use redis::{
+    ProtocolVersion, RedisConnectionInfo, TlsMode,
+    sentinel::{Sentinel, SentinelNodeConnectionInfo},
+};
 use snafu::prelude::*;
 
-use crate::sinks::{prelude::*, util::service::TowerRequestConfigDefaults};
-
-use super::{sink::RedisSink, RedisCreateFailedSnafu};
+use super::{
+    RedisCreateFailedSnafu,
+    sink::{RedisConnection, RedisSink},
+};
+use crate::{
+    config::ValidatedSink,
+    serde::OneOrMany,
+    sinks::{prelude::*, util::service::TowerRequestConfigDefaults},
+    template::ConfinementConfig,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RedisTowerRequestConfigDefaults;
@@ -14,8 +24,7 @@ impl TowerRequestConfigDefaults for RedisTowerRequestConfigDefaults {
 
 /// Redis data type to store messages in.
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DataTypeConfig {
     /// The Redis `list` type.
@@ -23,8 +32,14 @@ pub enum DataTypeConfig {
     /// This resembles a deque, where messages can be popped and pushed from either end.
     ///
     /// This is the default.
-    #[derivative(Default)]
+    #[default]
     List,
+
+    /// The Redis `sorted set` type.
+    ///
+    /// This resembles a priority queue, where messages can be pushed and popped with an
+    /// associated score.
+    SortedSet,
 
     /// The Redis `channel` type.
     ///
@@ -34,31 +49,63 @@ pub enum DataTypeConfig {
 
 /// List-specific options.
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub struct ListOption {
     /// The method to use for pushing messages into a `list`.
-    pub(super) method: Method,
+    pub method: ListMethod,
 }
 
 /// Method for pushing messages into a `list`.
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative, Eq, PartialEq)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum Method {
+pub enum ListMethod {
     /// Use the `rpush` method.
     ///
     /// This pushes messages onto the tail of the list.
     ///
     /// This is the default.
-    #[derivative(Default)]
+    #[default]
     RPush,
 
     /// Use the `lpush` method.
     ///
     /// This pushes messages onto the head of the list.
     LPush,
+}
+
+/// Sorted Set-specific options
+#[configurable_component]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub struct SortedSetOption {
+    /// The method to use for pushing messages into a `sorted set`.
+    pub method: Option<SortedSetMethod>,
+
+    /// The score to publish a message with to a `sorted set`.
+    ///
+    /// Examples:
+    /// - `%s`
+    /// - `%Y%m%d%H%M%S`
+    // Examples added in Rustdoc as `vector-config`'s metadata doesn't handle
+    // UnsignedIntTemplate's properly yet. TODO: Improve this.
+    #[configurable(validation(length(min = 1)))]
+    pub score: Option<UnsignedIntTemplate>,
+}
+
+/// Method for pushing messages into a `sorted set`.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortedSetMethod {
+    /// Use the `zadd` method.
+    ///
+    /// This adds messages onto a queue with a score.
+    ///
+    /// This is the default.
+    #[default]
+    ZAdd,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -75,16 +122,16 @@ impl SinkBatchSettings for RedisDefaultBatchSettings {
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RedisSinkConfig {
-    #[configurable(derived)]
     pub(super) encoding: EncodingConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub(super) data_type: DataTypeConfig,
 
-    #[configurable(derived)]
     #[serde(alias = "list")]
     pub(super) list_option: Option<ListOption>,
+
+    #[serde(alias = "sorted_set")]
+    pub(super) sorted_set_option: Option<SortedSetOption>,
 
     /// The URL of the Redis endpoint to connect to.
     ///
@@ -92,42 +139,55 @@ pub struct RedisSinkConfig {
     /// `redis` or `rediss` for connections secured via TLS.
     #[configurable(metadata(docs::examples = "redis://127.0.0.1:6379/0"))]
     #[serde(alias = "url")]
-    pub(super) endpoint: String,
+    pub(super) endpoint: OneOrMany<String>,
+
+    /// The service name to use for sentinel.
+    ///
+    /// If this is specified, `endpoint` will be used to reach sentinel instances instead of a
+    /// redis instance.
+    #[configurable]
+    pub(super) sentinel_service: Option<String>,
+
+    #[serde(default)]
+    pub(super) sentinel_connect: Option<SentinelConnectionSettings>,
 
     /// The Redis key to publish messages to.
     #[configurable(validation(length(min = 1)))]
     #[configurable(metadata(docs::examples = "syslog:{{ app }}", docs::examples = "vector"))]
     pub(super) key: Template,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub(super) batch: BatchConfig<RedisDefaultBatchSettings>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub(super) request: TowerRequestConfig<RedisTowerRequestConfigDefaults>,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
         skip_serializing_if = "crate::serde::is_default"
     )]
     pub(super) acknowledgements: AcknowledgementsConfig,
+
+    #[serde(flatten)]
+    pub confinement: ConfinementConfig,
 }
 
 impl GenerateConfig for RedisSinkConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc::indoc! {
             r#"
-            url = "redis://127.0.0.1:6379/0"
-            key = "vector"
-            data_type = "list"
-            list.method = "lpush"
-            encoding.codec = "json"
-            batch.max_events = 1
+            url: "redis://127.0.0.1:6379/0"
+            key: vector
+            data_type: list
+            list:
+              method: lpush
+            encoding:
+              codec: json
+            batch:
+              max_events: 1
             "#,
-        )
+        })
         .unwrap()
     }
 }
@@ -135,18 +195,12 @@ impl GenerateConfig for RedisSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "redis")]
 impl SinkConfig for RedisSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        if self.key.is_empty() {
-            return Err("`key` cannot be empty.".into());
-        }
-        let conn = self.build_client().await.context(RedisCreateFailedSnafu)?;
-        let healthcheck = RedisSinkConfig::healthcheck(conn.clone()).boxed();
-        let sink = RedisSink::new(self, conn)?;
-        Ok((super::VectorSink::from_event_streamsink(sink), healthcheck))
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
     }
 
     fn input(&self) -> Input {
-        Input::new(self.encoding.config().input_type() & DataType::Log)
+        Input::new(self.encoding.config().input_type())
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
@@ -154,16 +208,293 @@ impl SinkConfig for RedisSinkConfig {
     }
 }
 
-impl RedisSinkConfig {
-    pub(super) async fn build_client(&self) -> RedisResult<ConnectionManager> {
-        let client = redis::Client::open(self.endpoint.as_str())?;
-        client.get_connection_manager().await
+#[derive(Clone, Debug)]
+pub struct ValidatedRedisSink {
+    key: ConfinedTemplate,
+    batch_settings: BatcherSettings,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for RedisSinkConfig {
+    type Validated = ValidatedRedisSink;
+
+    fn validate(&self) -> crate::Result<ValidatedRedisSink> {
+        if self.key.is_empty() {
+            return Err("`key` cannot be empty.".into());
+        }
+        let key = self
+            .key
+            .clone()
+            .confine(&self.confinement, Self::NAME, "key")?;
+        if self.endpoint.clone().to_vec().is_empty() {
+            return Err("`endpoint` cannot be empty.".into());
+        }
+        for endpoint in self.endpoint.clone().to_vec() {
+            if redis::parse_redis_url(&endpoint).is_none() {
+                return Err(format!("`endpoint` is not a valid redis URL: {endpoint}").into());
+            }
+        }
+        self.encoding.validate()?;
+        let batch_settings = self.batch.into_batcher_settings()?;
+        Ok(ValidatedRedisSink {
+            key,
+            batch_settings,
+        })
     }
 
-    async fn healthcheck(mut conn: ConnectionManager) -> crate::Result<()> {
+    async fn build(
+        &self,
+        validated: &ValidatedRedisSink,
+        _cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedRedisSink {
+            key,
+            batch_settings,
+        } = validated.clone();
+        let conn = self.build_connection().await?;
+        let healthcheck = RedisSinkConfig::healthcheck(conn.clone()).boxed();
+        let sink = RedisSink::new(self, conn, key, batch_settings)?;
+        Ok((super::VectorSink::from_event_streamsink(sink), healthcheck))
+    }
+}
+
+impl RedisSinkConfig {
+    pub(super) async fn build_connection(&self) -> crate::Result<RedisConnection> {
+        let endpoints = self.endpoint.clone().to_vec();
+
+        if endpoints.is_empty() {
+            return Err("`endpoint` cannot be empty.".into());
+        }
+
+        if let Some(sentinel_service) = &self.sentinel_service {
+            let sentinel = Sentinel::build(endpoints).context(RedisCreateFailedSnafu)?;
+
+            Ok(RedisConnection::new_sentinel(
+                sentinel,
+                sentinel_service.clone(),
+                self.sentinel_connect.clone().unwrap_or_default().into(),
+            )
+            .await
+            .context(RedisCreateFailedSnafu)?)
+        } else {
+            // SAFETY: endpoints cannot be empty (checked above)
+            let client =
+                redis::Client::open(endpoints[0].as_str()).context(RedisCreateFailedSnafu)?;
+            let conn = client
+                .get_connection_manager()
+                .await
+                .context(RedisCreateFailedSnafu)?;
+
+            Ok(RedisConnection::new_direct(conn))
+        }
+    }
+
+    async fn healthcheck(mut conn: RedisConnection) -> crate::Result<()> {
         redis::cmd("PING")
-            .query_async(&mut conn)
+            .query_async(&mut conn.get_connection_manager().await?.connection)
             .await
             .map_err(Into::into)
+    }
+}
+
+/// Controls how Redis Sentinel will connect to the servers belonging to it.
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SentinelConnectionSettings {
+    #[serde(default)]
+    pub tls: MaybeTlsMode,
+
+    #[serde(default)]
+    pub connections: Option<RedisConnectionSettings>,
+}
+
+impl From<SentinelConnectionSettings> for SentinelNodeConnectionInfo {
+    fn from(value: SentinelConnectionSettings) -> Self {
+        SentinelNodeConnectionInfo {
+            tls_mode: value.tls.into(),
+            redis_connection_info: value.connections.map(Into::into),
+        }
+    }
+}
+
+/// How/if TLS should be established.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MaybeTlsMode {
+    /// Don't use TLS.
+    ///
+    /// This is the default.
+    #[default]
+    None,
+
+    /// Enable TLS with certificate verification.
+    Secure,
+
+    /// Enable TLS without certificate verification.
+    Insecure,
+}
+
+impl From<MaybeTlsMode> for Option<TlsMode> {
+    fn from(value: MaybeTlsMode) -> Self {
+        match value {
+            MaybeTlsMode::None => None,
+            MaybeTlsMode::Secure => Some(TlsMode::Secure),
+            MaybeTlsMode::Insecure => Some(TlsMode::Insecure),
+        }
+    }
+}
+
+/// Connection independent information used to establish a connection
+/// to a redis instance sentinel owns.
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
+pub struct RedisConnectionSettings {
+    /// The database number to use. Usually `0`.
+    pub db: i64,
+
+    /// Optionally, the username to connection with.
+    pub username: Option<String>,
+
+    /// Optionally, the password to connection with.
+    pub password: Option<String>,
+
+    /// The version of RESP to use.
+    pub protocol: RedisProtocolVersion,
+}
+
+impl From<RedisConnectionSettings> for RedisConnectionInfo {
+    fn from(value: RedisConnectionSettings) -> Self {
+        RedisConnectionInfo {
+            db: value.db,
+            username: value.username,
+            password: value.password,
+            protocol: value.protocol.into(),
+        }
+    }
+}
+
+/// The communication protocol to use with the redis server.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RedisProtocolVersion {
+    /// Use RESP2.
+    ///
+    /// This is the default.
+    #[default]
+    RESP2,
+
+    /// Use RESP3.
+    RESP3,
+}
+
+impl From<RedisProtocolVersion> for ProtocolVersion {
+    fn from(value: RedisProtocolVersion) -> Self {
+        match value {
+            RedisProtocolVersion::RESP2 => ProtocolVersion::RESP2,
+            RedisProtocolVersion::RESP3 => ProtocolVersion::RESP3,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ValidatedSink;
+    use crate::template::{ConfinementConfig, Template};
+
+    #[test]
+    fn validate_returns_confined_key() {
+        let config: RedisSinkConfig = serde_yaml::from_str(
+            r#"
+            endpoint: "redis://127.0.0.1:6379/0"
+            key: "test-key"
+            encoding:
+                codec: "json"
+            "#,
+        )
+        .unwrap();
+        let validated = config.validate().expect("validation should succeed");
+        assert_eq!(validated.key.to_string(), "test-key");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_batch_settings() {
+        let config: RedisSinkConfig = serde_yaml::from_str(
+            r#"
+            endpoint: "redis://127.0.0.1:6379/0"
+            key: "test-key"
+            encoding:
+                codec: "json"
+            batch:
+                max_events: 0
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_err(),
+            "batch.max_events = 0 should fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_endpoint() {
+        let config: RedisSinkConfig = serde_yaml::from_str(
+            r#"
+            endpoint: []
+            key: "test-key"
+            encoding:
+                codec: "json"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_err(),
+            "an empty endpoint list should fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_endpoint() {
+        let config: RedisSinkConfig = serde_yaml::from_str(
+            r#"
+            endpoint: "not a url"
+            key: "test-key"
+            encoding:
+                codec: "json"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_err(),
+            "an invalid endpoint URL should fail validation"
+        );
+    }
+
+    #[test]
+    fn confinement_rejects_unconfined_key() {
+        let template = Template::try_from("{{ key }}").unwrap();
+        let config = ConfinementConfig::default();
+        let result = template.confine(&config, "redis", "key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confinement_opt_out_allows_unconfined_key() {
+        let template = Template::try_from("{{ key }}").unwrap();
+        let config = ConfinementConfig {
+            dangerously_allow_unconfined_template_resolution: true,
+        };
+        let result = template.confine(&config, "redis", "key");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn confinement_allows_prefixed_key() {
+        let template = Template::try_from("events-{{ env }}").unwrap();
+        let config = ConfinementConfig::default();
+        let result = template.confine(&config, "redis", "key");
+        assert!(result.is_ok());
     }
 }

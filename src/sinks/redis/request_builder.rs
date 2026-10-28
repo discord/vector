@@ -2,13 +2,13 @@ use bytes::BytesMut;
 use tokio_util::codec::Encoder as _;
 use vector_lib::config::telemetry;
 
-use crate::sinks::{prelude::*, util::EncodedLength};
-
 use super::{RedisEvent, RedisKvEntry, RedisRequest};
+use crate::sinks::{prelude::*, util::EncodedLength};
 
 pub(super) fn encode_event(
     mut event: Event,
     key: String,
+    score: Option<u64>,
     transformer: &Transformer,
     encoder: &mut Encoder<()>,
     byte_size: &mut GroupedCountByteSize,
@@ -23,7 +23,7 @@ pub(super) fn encode_event(
 
     let value = bytes.freeze();
 
-    let event = RedisKvEntry { key, value };
+    let event = RedisKvEntry { key, value, score };
     Some(event)
 }
 
@@ -36,11 +36,18 @@ fn encode_events(
     let request = events
         .into_iter()
         .filter_map(|event| {
-            encode_event(event.event, event.key, transformer, encoder, &mut byte_size)
+            encode_event(
+                event.event,
+                event.key,
+                event.score,
+                transformer,
+                encoder,
+                &mut byte_size,
+            )
         })
         .collect::<Vec<_>>();
 
-    let uncompressed_byte_size = request.iter().map(|event| event.encoded_length()).sum();
+    let uncompressed_byte_size = request.iter().map(EncodedLength::encoded_length).sum();
 
     EncodeResult {
         payload: request,
@@ -61,11 +68,11 @@ pub(super) fn request_builder(
 ) -> RedisRequest {
     let finalizers = events.take_finalizers();
     let builder = RequestMetadataBuilder::from_events(&events);
-    let encoded = encode_events(events, transformer, encoder);
-    let metadata = builder.build(&encoded);
+    let payload = encode_events(events, transformer, encoder);
+    let metadata = builder.build(&payload);
 
     RedisRequest {
-        request: encoded.into_payload(),
+        request: payload.into_payload(),
         finalizers,
         metadata,
     }

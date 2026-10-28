@@ -1,16 +1,16 @@
 use chrono::{DateTime, Utc};
-use derivative::Derivative;
-use vector_lib::config::{log_schema, LegacyKey, LogNamespace};
-use vector_lib::conversion;
-use vector_lib::lookup::path;
+use vector_lib::{
+    config::{LegacyKey, LogNamespace, log_schema},
+    conversion,
+    lookup::path,
+};
 
-use crate::sources::kubernetes_logs::transform_utils::get_message_path;
 use crate::{
     event::{self, Event, Value},
     internal_events::{
-        ParserConversionError, ParserMatchError, ParserMissingFieldError, DROP_EVENT,
+        DROP_EVENT, ParserConversionError, ParserMatchError, ParserMissingFieldError,
     },
-    sources::kubernetes_logs::Config,
+    sources::kubernetes_logs::{Config, transform_utils::get_message_path},
     transforms::{FunctionTransform, OutputBuffer},
 };
 
@@ -27,8 +27,7 @@ const TIMESTAMP_KEY: &str = "timestamp";
 /// Normalizes parsed data for consistency.
 ///
 /// [cri_log_format]: https://github.com/kubernetes/community/blob/ee2abbf9dbfa4523b414f99a04ddc97bd38c74b2/contributors/design-proposals/node/kubelet-cri-logging.md
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Cri {
     log_namespace: LogNamespace,
 }
@@ -97,7 +96,7 @@ impl FunctionTransform for Cri {
                                 log_schema().timestamp_key().map(LegacyKey::Overwrite),
                                 path!(TIMESTAMP_KEY),
                                 Value::Timestamp(dt.with_timezone(&Utc)),
-                            )
+                            );
                         }
                         Err(e) => {
                             emit!(ParserConversionError {
@@ -143,7 +142,7 @@ const fn is_delimiter(c: &u8) -> bool {
 ///
 /// Equivalent to regex: `(?-u)^(?P<timestamp>.*) (?P<stream>(stdout|stderr)) (?P<multiline_tag>(P|F)) (?P<message>.*)(?P<new_line_tag>\n?)$`
 #[inline]
-fn parse_log_line(line: &[u8]) -> Option<ParsedLog> {
+fn parse_log_line(line: &[u8]) -> Option<ParsedLog<'_>> {
     let rest = line;
 
     let after_timestamp_pos = rest.iter().position(is_delimiter)?;
@@ -184,10 +183,10 @@ fn parse_log_line(line: &[u8]) -> Option<ParsedLog> {
 #[cfg(test)]
 pub mod tests {
     use bytes::Bytes;
+    use vrl::value;
 
     use super::{super::test_util, *};
     use crate::{event::LogEvent, test_util::trace_init};
-    use vrl::value;
 
     fn make_long_string(base: &str, len: usize) -> String {
         base.chars().cycle().take(len).collect()
@@ -244,7 +243,7 @@ pub mod tests {
             (
                 Bytes::from(
                     [
-                        r#"2016-10-06T00:17:10.113242941Z stdout P "#,
+                        r"2016-10-06T00:17:10.113242941Z stdout P ",
                         make_long_string("very long message ", 16 * 1024).as_str(),
                     ]
                     .join(""),

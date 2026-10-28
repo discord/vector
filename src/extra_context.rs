@@ -1,4 +1,4 @@
-//! ExtraContext is used for passing extra data to Vector's components when Vector is used as a library.
+//! `ExtraContext` is used for passing extra data to Vector's components when Vector is used as a library.
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -8,7 +8,7 @@ use std::{
 
 /// Structure containing any extra data.
 /// The data is held in an [`Arc`] so is cheap to clone.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExtraContext(Arc<HashMap<TypeId, ContextItem>>);
 
 type ContextItem = Box<dyn Any + Send + Sync>;
@@ -29,6 +29,7 @@ impl ExtraContext {
     }
 
     /// Get an object from the context.
+    #[must_use]
     pub fn get<T: 'static>(&self) -> Option<&T> {
         self.0
             .get(&TypeId::of::<T>())
@@ -36,6 +37,7 @@ impl ExtraContext {
     }
 
     /// Get an object from the context, if it doesn't exist return the default.
+    #[must_use]
     pub fn get_or_default<T: Clone + Default + 'static>(&self) -> T {
         self.get().cloned().unwrap_or_default()
     }

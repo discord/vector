@@ -1,34 +1,39 @@
 use std::{collections::HashMap, future::ready, task::Poll};
 
 use bytes::{Bytes, BytesMut};
-use futures::{future::BoxFuture, stream, FutureExt, SinkExt};
+use futures::{FutureExt, SinkExt, future::BoxFuture, stream};
 use http::{StatusCode, Uri};
 use hyper::{Body, Request};
 use indoc::indoc;
 use tower::Service;
-use vector_lib::configurable::configurable_component;
-use vector_lib::sensitive_string::SensitiveString;
-use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    ByteSizeOf, EstimatedJsonEncodedSizeOf, configurable::configurable_component,
+    sensitive_string::SensitiveString,
+};
 
 use super::Region;
 use crate::{
-    config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext},
+    Result,
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, ValidatedSink,
+    },
     event::{
-        metric::{Metric, MetricValue},
         Event, KeyString,
+        metric::{Metric, MetricValue},
     },
     http::HttpClient,
     internal_events::{SematextMetricsEncodeEventError, SematextMetricsInvalidMetricError},
     sinks::{
-        influxdb::{encode_timestamp, encode_uri, influx_line_protocol, Field, ProtocolVersion},
+        Healthcheck, HealthcheckError, VectorSink,
+        influxdb::{Field, ProtocolVersion, encode_timestamp, encode_uri, influx_line_protocol},
         util::{
+            BatchConfig, BatchSettings, EncodedEvent, HttpEndpoint, SinkBatchSettings,
+            TowerRequestConfig,
             buffer::metrics::{MetricNormalize, MetricNormalizer, MetricSet, MetricsBuffer},
             http::{HttpBatchService, HttpRetryLogic},
-            BatchConfig, EncodedEvent, SinkBatchSettings, TowerRequestConfig,
         },
-        Healthcheck, HealthcheckError, VectorSink,
     },
-    vector_version, Result,
+    vector_version,
 };
 
 #[derive(Clone)]
@@ -58,7 +63,6 @@ pub struct SematextMetricsConfig {
     pub default_namespace: String,
 
     #[serde(default = "super::default_region")]
-    #[configurable(derived)]
     pub region: Region,
 
     /// The endpoint to send data to.
@@ -73,15 +77,12 @@ pub struct SematextMetricsConfig {
     #[configurable(metadata(docs::examples = "some-sematext-token"))]
     pub token: SensitiveString,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub(self) batch: BatchConfig<SematextMetricsDefaultBatchSettings>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub request: TowerRequestConfig,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -91,17 +92,19 @@ pub struct SematextMetricsConfig {
 }
 
 impl GenerateConfig for SematextMetricsConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(indoc! {r#"
-            default_namespace = "vector"
-            token = "${SEMATEXT_TOKEN}"
-        "#})
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc! {r"
+            default_namespace: vector
+            token: ${SEMATEXT_TOKEN}
+        "})
         .unwrap()
     }
 }
 
 async fn healthcheck(endpoint: String, client: HttpClient) -> Result<()> {
-    let uri = format!("{}/health", endpoint);
+    let uri = HttpEndpoint::parse(&endpoint)?
+        .append_path("health")?
+        .into_uri();
 
     let request = Request::get(uri)
         .body(Body::empty())
@@ -110,8 +113,7 @@ async fn healthcheck(endpoint: String, client: HttpClient) -> Result<()> {
     let response = client.send(request).await?;
 
     match response.status() {
-        StatusCode::OK => Ok(()),
-        StatusCode::NO_CONTENT => Ok(()),
+        StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
         other => Err(HealthcheckError::UnexpectedStatus { status: other }.into()),
     }
 }
@@ -123,31 +125,60 @@ const EU_ENDPOINT: &str = "https://spm-receiver.eu.sematext.com";
 #[async_trait::async_trait]
 #[typetag::serde(name = "sematext_metrics")]
 impl SinkConfig for SematextMetricsConfig {
-    async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck)> {
-        let client = HttpClient::new(None, cx.proxy())?;
+    fn input(&self) -> Input {
+        Input::metric()
+    }
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
 
+#[derive(Clone, derive_more::Debug)]
+pub struct ValidatedSematextMetrics {
+    endpoint: String,
+    uri: Uri,
+    #[debug(skip)]
+    batch: BatchSettings<MetricsBuffer>,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for SematextMetricsConfig {
+    type Validated = ValidatedSematextMetrics;
+
+    fn validate(&self) -> Result<ValidatedSematextMetrics> {
         let endpoint = match (&self.endpoint, &self.region) {
             (Some(endpoint), _) => endpoint.clone(),
             (None, Region::Us) => US_ENDPOINT.to_owned(),
             (None, Region::Eu) => EU_ENDPOINT.to_owned(),
         };
 
+        let uri = write_uri(&HttpEndpoint::parse(&endpoint)?)?;
+        let batch = self.batch.into_batch_settings()?;
+
+        Ok(ValidatedSematextMetrics {
+            endpoint,
+            uri,
+            batch,
+        })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedSematextMetrics,
+        cx: SinkContext,
+    ) -> Result<(VectorSink, Healthcheck)> {
+        let ValidatedSematextMetrics { endpoint, .. } = validated;
+
+        let client = HttpClient::new(None, cx.proxy())?;
+
         let healthcheck = healthcheck(endpoint.clone(), client.clone()).boxed();
-        let sink = SematextMetricsService::new(self.clone(), write_uri(&endpoint)?, client)?;
+        let sink = SematextMetricsService::from_validated(self.clone(), validated, client);
 
         Ok((sink, healthcheck))
     }
-
-    fn input(&self) -> Input {
-        Input::metric()
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
 }
 
-fn write_uri(endpoint: &str) -> Result<Uri> {
+fn write_uri(endpoint: &HttpEndpoint) -> Result<Uri> {
     encode_uri(
         endpoint,
         "write",
@@ -160,14 +191,14 @@ fn write_uri(endpoint: &str) -> Result<Uri> {
 }
 
 impl SematextMetricsService {
-    pub fn new(
+    fn from_validated(
         config: SematextMetricsConfig,
-        endpoint: http::Uri,
+        validated: &ValidatedSematextMetrics,
         client: HttpClient,
-    ) -> Result<VectorSink> {
-        let batch = config.batch.into_batch_settings()?;
+    ) -> VectorSink {
+        let ValidatedSematextMetrics { uri, batch, .. } = validated;
         let request = config.request.into_settings();
-        let http_service = HttpBatchService::new(client, create_build_request(endpoint));
+        let http_service = HttpBatchService::new(client, create_build_request(uri.clone()));
         let sematext_service = SematextMetricsService {
             config,
             inner: http_service,
@@ -176,7 +207,7 @@ impl SematextMetricsService {
 
         let sink = request
             .batch_sink(
-                HttpRetryLogic,
+                HttpRetryLogic::default(),
                 sematext_service,
                 MetricsBuffer::new(batch.size),
                 batch.timeout,
@@ -190,10 +221,10 @@ impl SematextMetricsService {
                         .map(|item| Ok(EncodedEvent::new(item, byte_size, json_byte_size)))
                 })
             })
-            .sink_map_err(|error| error!(message = "Fatal sematext metrics sink error.", %error));
+            .sink_map_err(|error| error!(message = "Fatal sematext metrics sink error.", %error, internal_log_rate_limit = false));
 
         #[allow(deprecated)]
-        Ok(VectorSink::from_event_sink(sink))
+        VectorSink::from_event_sink(sink)
     }
 }
 
@@ -258,7 +289,7 @@ fn encode_events(
     let mut output = BytesMut::new();
     let byte_size = metrics.size_of();
     let json_byte_size = metrics.estimated_json_encoded_size_of();
-    for metric in metrics.into_iter() {
+    for metric in metrics {
         let (series, data, _metadata) = metric.into_parts();
         let namespace = series
             .name
@@ -287,7 +318,7 @@ fn encode_events(
             &mut output,
         ) {
             emit!(SematextMetricsEncodeEventError { error });
-        };
+        }
     }
 
     if !output.is_empty() {
@@ -304,18 +335,20 @@ fn to_fields(label: String, value: f64) -> HashMap<KeyString, Field> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{offset::TimeZone, Timelike, Utc};
+    use chrono::{Timelike, Utc, offset::TimeZone};
     use futures::StreamExt;
     use indoc::indoc;
     use vector_lib::metric_tags;
 
     use super::*;
     use crate::{
-        event::{metric::MetricKind, Event},
+        config::ValidatedSink,
+        event::{Event, metric::MetricKind},
         sinks::util::test::{build_test_server, load_sink},
         test_util::{
-            components::{assert_sink_compliance, HTTP_SINK_TAGS},
-            next_addr, test_generate_config,
+            addr::next_addr,
+            components::{HTTP_SINK_TAGS, assert_sink_compliance},
+            test_generate_config,
         },
     };
 
@@ -325,18 +358,64 @@ mod tests {
     }
 
     #[test]
+    fn prepares_valid_config() {
+        let config = SematextMetricsConfig {
+            default_namespace: "ns".to_string(),
+            region: Region::Us,
+            endpoint: Some("http://localhost:9999".to_string()),
+            token: "atoken".to_string().into(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        };
+
+        let validated = config.validate().expect("preparation should succeed");
+        assert_eq!(validated.endpoint, "http://localhost:9999");
+        assert!(
+            validated
+                .uri
+                .to_string()
+                .starts_with("http://localhost:9999/write?db=metrics&v=vector-")
+        );
+    }
+
+    #[test]
+    fn rejects_non_absolute_endpoint() {
+        let config = |endpoint: &str| SematextMetricsConfig {
+            default_namespace: "ns".to_string(),
+            region: Region::Us,
+            endpoint: Some(endpoint.to_string()),
+            token: "atoken".to_string().into(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        };
+
+        // Non-http(s) schemes are rejected by the HttpEndpoint type-level validation.
+        assert!(
+            config("ftp://spm-receiver.sematext.com")
+                .validate()
+                .is_err()
+        );
+        // Relative paths cannot be resolved to an absolute http(s) URL.
+        assert!(config("/write").validate().is_err());
+    }
+
+    #[test]
     fn test_encode_counter_event() {
-        let events = vec![Metric::new(
-            "pool.used",
-            MetricKind::Incremental,
-            MetricValue::Counter { value: 42.0 },
-        )
-        .with_namespace(Some("jvm"))
-        .with_timestamp(Some(
-            Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 0)
-                .single()
-                .expect("invalid timestamp"),
-        ))];
+        let events = vec![
+            Metric::new(
+                "pool.used",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 42.0 },
+            )
+            .with_namespace(Some("jvm"))
+            .with_timestamp(Some(
+                Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 0)
+                    .single()
+                    .expect("invalid timestamp"),
+            )),
+        ];
 
         assert_eq!(
             "jvm,metric_type=counter,token=aaa pool.used=42 1597784400000000000",
@@ -346,16 +425,18 @@ mod tests {
 
     #[test]
     fn test_encode_counter_event_no_namespace() {
-        let events = vec![Metric::new(
-            "used",
-            MetricKind::Incremental,
-            MetricValue::Counter { value: 42.0 },
-        )
-        .with_timestamp(Some(
-            Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 0)
-                .single()
-                .expect("invalid timestamp"),
-        ))];
+        let events = vec![
+            Metric::new(
+                "used",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 42.0 },
+            )
+            .with_timestamp(Some(
+                Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 0)
+                    .single()
+                    .expect("invalid timestamp"),
+            )),
+        ];
 
         assert_eq!(
             "ns,metric_type=counter,token=aaa used=42 1597784400000000000",
@@ -380,7 +461,9 @@ mod tests {
             Metric::new(
                 "pool.committed",
                 MetricKind::Incremental,
-                MetricValue::Counter { value: 18874368.0 },
+                MetricValue::Counter {
+                    value: 18_874_368.0,
+                },
             )
             .with_namespace(Some("jvm"))
             .with_timestamp(Some(
@@ -409,28 +492,28 @@ mod tests {
         "#})
         .unwrap();
 
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         // Swap out the endpoint so we can force send it
         // to our local server
-        let endpoint = format!("http://{}", addr);
+        let endpoint = format!("http://{addr}");
         config.endpoint = Some(endpoint.clone());
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let (sink, _) = SinkConfig::build(&config, cx).await.unwrap();
 
         let (rx, _trigger, server) = build_test_server(addr);
         tokio::spawn(server);
 
         // Make our test metrics.
         let metrics = vec![
-            ("os", "swap.size", 324292.0),
+            ("os", "swap.size", 324_292.0),
             ("os", "network.tx", 42000.0),
             ("os", "network.rx", 54293.0),
             ("process", "count", 12.0),
             ("process", "uptime", 32423.0),
-            ("process", "rss", 2342333.0),
-            ("jvm", "pool.used", 18874368.0),
-            ("jvm", "pool.committed", 18868584.0),
-            ("jvm", "pool.max", 18874368.0),
+            ("process", "rss", 2_342_333.0),
+            ("jvm", "pool.used", 18_874_368.0),
+            ("jvm", "pool.committed", 18_868_584.0),
+            ("jvm", "pool.max", 18_874_368.0),
         ];
 
         let mut events = Vec::new();
@@ -444,7 +527,7 @@ mod tests {
                 .with_namespace(Some(*namespace))
                 .with_tags(Some(metric_tags!("os.host" => "somehost")))
                     .with_timestamp(Some(Utc.with_ymd_and_hms(2020, 8, 18, 21, 0, 0).single()
-                                         .and_then(|t| t.with_nanosecond(i as u32))
+                                         .and_then(|t| t.with_nanosecond(u32::try_from(i).expect("test index fits in u32")))
                                          .expect("invalid timestamp"))),
             );
             events.push(event);

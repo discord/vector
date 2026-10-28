@@ -20,16 +20,16 @@ pub mod aws_cloudwatch_metrics;
 pub mod aws_kinesis;
 #[cfg(feature = "sinks-aws_s3")]
 pub mod aws_s3;
-#[cfg(any(feature = "sinks-aws_sqs", feature = "sinks-sinks-aws_sns"))]
+#[cfg(feature = "sinks-aws_sqs")]
 pub mod aws_s_s;
 #[cfg(feature = "sinks-axiom")]
 pub mod axiom;
 #[cfg(feature = "sinks-azure_blob")]
 pub mod azure_blob;
-#[cfg(feature = "sinks-azure_blob")]
+#[cfg(any(feature = "sinks-azure_blob", feature = "sinks-azure_logs_ingestion",))]
 pub mod azure_common;
-#[cfg(feature = "sinks-azure_monitor_logs")]
-pub mod azure_monitor_logs;
+#[cfg(feature = "sinks-azure_logs_ingestion")]
+pub mod azure_logs_ingestion;
 #[cfg(feature = "sinks-blackhole")]
 pub mod blackhole;
 #[cfg(feature = "sinks-clickhouse")]
@@ -38,6 +38,8 @@ pub mod clickhouse;
 pub mod console;
 #[cfg(feature = "sinks-databend")]
 pub mod databend;
+#[cfg(feature = "sinks-databricks_zerobus")]
+pub mod databricks_zerobus;
 #[cfg(any(
     feature = "sinks-datadog_events",
     feature = "sinks-datadog_logs",
@@ -45,6 +47,8 @@ pub mod databend;
     feature = "sinks-datadog_traces"
 ))]
 pub mod datadog;
+#[cfg(feature = "sinks-doris")]
+pub mod doris;
 #[cfg(feature = "sinks-elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "sinks-file")]
@@ -55,7 +59,10 @@ pub mod gcp;
 pub mod gcp_chronicle;
 #[cfg(any(feature = "sinks-gcp-chronicle", feature = "sinks-gcp"))]
 pub mod gcs_common;
-#[cfg(any(feature = "sinks-greptimedb_metrics", feature = "sink-greptimedb_logs"))]
+#[cfg(any(
+    feature = "sinks-greptimedb_metrics",
+    feature = "sinks-greptimedb_logs"
+))]
 pub mod greptimedb;
 #[cfg(feature = "sinks-honeycomb")]
 pub mod honeycomb;
@@ -67,6 +74,8 @@ pub mod humio;
 pub mod influxdb;
 #[cfg(feature = "sinks-kafka")]
 pub mod kafka;
+#[cfg(feature = "sinks-keep")]
+pub mod keep;
 #[cfg(feature = "sinks-loki")]
 pub mod loki;
 #[cfg(feature = "sinks-mezmo")]
@@ -79,8 +88,12 @@ pub mod nats;
 pub mod new_relic;
 #[cfg(feature = "sinks-webhdfs")]
 pub mod opendal_common;
+#[cfg(feature = "sinks-opentelemetry")]
+pub mod opentelemetry;
 #[cfg(feature = "sinks-papertrail")]
 pub mod papertrail;
+#[cfg(feature = "sinks-postgres")]
+pub mod postgres;
 #[cfg(feature = "sinks-prometheus")]
 pub mod prometheus;
 #[cfg(feature = "sinks-pulsar")]
@@ -103,6 +116,8 @@ pub mod vector;
 pub mod webhdfs;
 #[cfg(feature = "sinks-websocket")]
 pub mod websocket;
+#[cfg(feature = "sinks-websocket_server")]
+pub mod websocket_server;
 
 pub use vector_lib::{config::Input, sink::VectorSink};
 
@@ -121,6 +136,8 @@ pub enum BuildError {
     UriParseError { source: ::http::uri::InvalidUri },
     #[snafu(display("HTTP request build error: {}", source))]
     HTTPRequestBuilderError { source: ::http::Error },
+    #[snafu(display("HTTP request build error: {}", source))]
+    HTTPV1RequestBuilderError { source: ::http_1::Error },
 }
 
 /// Common healthcheck errors

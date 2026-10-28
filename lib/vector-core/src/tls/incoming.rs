@@ -1,4 +1,3 @@
-use ipnet::IpNet;
 use std::{
     collections::HashMap,
     future::Future,
@@ -8,52 +7,44 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{future::BoxFuture, stream, FutureExt, Stream};
-use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
-use openssl::x509::X509;
+use arc_swap::ArcSwap;
+use futures::{FutureExt, Stream, future::BoxFuture, stream};
+use ipnet::IpNet;
+use openssl::{
+    ssl::{Ssl, SslAcceptor, SslMethod},
+    x509::X509,
+};
 use snafu::ResultExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tokio_openssl::SslStream;
-use tonic::transport::{server::Connected, Certificate};
+use tonic::transport::{Certificate, server::Connected};
 
 use super::{
     CreateAcceptorSnafu, HandshakeSnafu, IncomingListenerSnafu, MaybeTlsSettings, MaybeTlsStream,
-    SslBuildSnafu, TcpBindSnafu, TlsError, TlsSettings,
+    SslBuildSnafu, TcpBindSnafu, TlsAcceptorReloader, TlsError, TlsSettings,
 };
 use crate::tcp::{self, TcpKeepaliveConfig};
 
 impl TlsSettings {
     pub fn acceptor(&self) -> crate::tls::Result<SslAcceptor> {
-        match self.identity {
-            None => Err(TlsError::MissingRequiredIdentity),
-            Some(_) => {
-                let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
-                    .context(CreateAcceptorSnafu)?;
-                self.apply_context_base(&mut acceptor, true)?;
-                Ok(acceptor.build())
-            }
+        if self.identity.is_none() {
+            Err(TlsError::MissingRequiredIdentity)
+        } else {
+            let mut acceptor =
+                SslAcceptor::mozilla_intermediate(SslMethod::tls()).context(CreateAcceptorSnafu)?;
+            self.apply_context_base(&mut acceptor, true)?;
+            Ok(acceptor.build())
         }
     }
 }
 
 impl MaybeTlsSettings {
     pub async fn bind(&self, addr: &SocketAddr) -> crate::tls::Result<MaybeTlsListener> {
-        let listener = TcpListener::bind(addr).await.context(TcpBindSnafu)?;
-
-        let acceptor = match self {
-            Self::Tls(tls) => Some(tls.acceptor()?),
-            Self::Raw(()) => None,
-        };
-
-        Ok(MaybeTlsListener {
-            listener,
-            acceptor,
-            origin_filter: None,
-        })
+        self.bind_reloadable(addr, None).await
     }
 
     pub async fn bind_with_allowlist(
@@ -61,37 +52,70 @@ impl MaybeTlsSettings {
         addr: &SocketAddr,
         allow_origin: Vec<IpNet>,
     ) -> crate::tls::Result<MaybeTlsListener> {
+        Ok(self
+            .bind_reloadable(addr, None)
+            .await?
+            .with_allowlist(Some(allow_origin)))
+    }
+
+    /// Bind a listener, optionally sharing a [`TlsAcceptorReloader`] so its acceptor can be swapped
+    /// at runtime. When `reloader` is `Some` and TLS is enabled, connections accepted by the
+    /// returned listener use the acceptor the reloader currently holds; otherwise the acceptor is
+    /// fixed for the lifetime of the listener.
+    pub async fn bind_reloadable(
+        &self,
+        addr: &SocketAddr,
+        reloader: Option<TlsAcceptorReloader>,
+    ) -> crate::tls::Result<MaybeTlsListener> {
         let listener = TcpListener::bind(addr).await.context(TcpBindSnafu)?;
 
-        let acceptor = match self {
-            Self::Tls(tls) => Some(tls.acceptor()?),
-            Self::Raw(()) => None,
+        let acceptor = match (self, reloader) {
+            (Self::Raw(()), _) => None,
+            (Self::Tls(_), Some(reloader)) => Some(reloader.shared()),
+            (Self::Tls(tls), None) => Some(Arc::new(ArcSwap::from_pointee(tls.acceptor()?))),
         };
 
         Ok(MaybeTlsListener {
             listener,
             acceptor,
-            origin_filter: Some(allow_origin),
+            origin_filter: None,
+            keepalive: None,
         })
     }
 }
 
 pub struct MaybeTlsListener {
     listener: TcpListener,
-    acceptor: Option<SslAcceptor>,
+    acceptor: Option<Arc<ArcSwap<SslAcceptor>>>,
     origin_filter: Option<Vec<IpNet>>,
+    keepalive: Option<TcpKeepaliveConfig>,
 }
 
 impl MaybeTlsListener {
     pub async fn accept(&mut self) -> crate::tls::Result<MaybeTlsIncomingStream<TcpStream>> {
-        let listener = self
+        let (stream, peer_addr) = self
             .listener
             .accept()
             .await
-            .map(|(stream, peer_addr)| {
-                MaybeTlsIncomingStream::new(stream, peer_addr, self.acceptor.clone())
-            })
             .context(IncomingListenerSnafu)?;
+
+        if let Some(keepalive) = self.keepalive
+            && let Some(time_secs) = keepalive.time_secs
+        {
+            let config =
+                socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(time_secs));
+            if let Err(error) = tcp::set_keepalive(&stream, &config) {
+                warn!(message = "Failed to set TCP keepalive on accepted connection.", %error);
+            }
+        }
+
+        let listener = MaybeTlsIncomingStream::new(
+            stream,
+            peer_addr,
+            self.acceptor
+                .as_ref()
+                .map(|accptr| accptr.load().as_ref().clone()),
+        );
 
         if let Some(origin_filter) = &self.origin_filter {
             if origin_filter
@@ -174,6 +198,12 @@ impl MaybeTlsListener {
         self.origin_filter = allowlist;
         self
     }
+
+    #[must_use]
+    pub fn with_keepalive(mut self, keepalive: Option<TcpKeepaliveConfig>) -> Self {
+        self.keepalive = keepalive;
+        self
+    }
 }
 
 impl From<TcpListener> for MaybeTlsListener {
@@ -182,6 +212,7 @@ impl From<TcpListener> for MaybeTlsListener {
             listener,
             acceptor: None,
             origin_filter: None,
+            keepalive: None,
         }
     }
 }
@@ -235,8 +266,8 @@ impl<S> MaybeTlsIncomingStream<S> {
         use super::MaybeTls;
 
         match &mut self.state {
-            StreamState::Accepted(ref mut stream) => Some(match stream {
-                MaybeTls::Raw(ref mut s) => s,
+            StreamState::Accepted(stream) => Some(match stream {
+                MaybeTls::Raw(s) => s,
                 MaybeTls::Tls(s) => s.get_mut(),
             }),
             StreamState::Accepting(_) | StreamState::AcceptError(_) | StreamState::Closed => None,
@@ -321,13 +352,13 @@ impl MaybeTlsIncomingStream<TcpStream> {
                         continue;
                     }
                     Err(error) => {
-                        let error = io::Error::new(io::ErrorKind::Other, error);
+                        let error = io::Error::other(error);
                         this.state = StreamState::AcceptError(error.to_string());
                         Poll::Ready(Err(error))
                     }
                 },
                 StreamState::AcceptError(error) => {
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error.clone())))
+                    Poll::Ready(Err(io::Error::other(error.clone())))
                 }
                 StreamState::Closed => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             };
@@ -370,14 +401,12 @@ impl AsyncWrite for MaybeTlsIncomingStream<TcpStream> {
                     Poll::Pending
                 }
                 Err(error) => {
-                    let error = io::Error::new(io::ErrorKind::Other, error);
+                    let error = io::Error::other(error);
                     this.state = StreamState::AcceptError(error.to_string());
                     Poll::Ready(Err(error))
                 }
             },
-            StreamState::AcceptError(error) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error.clone())))
-            }
+            StreamState::AcceptError(error) => Poll::Ready(Err(io::Error::other(error.clone()))),
             StreamState::Closed => Poll::Ready(Ok(())),
         }
     }
@@ -422,10 +451,7 @@ impl From<X509> for CertificateMetadata {
     fn from(cert: X509) -> Self {
         let mut subject_metadata: HashMap<String, String> = HashMap::new();
         for entry in cert.subject_name().entries() {
-            let data_string = match entry.data().as_utf8() {
-                Ok(data) => data.to_string(),
-                Err(_) => String::new(),
-            };
+            let data_string = entry.data().to_string().unwrap_or_default();
             subject_metadata.insert(entry.object().to_string(), data_string);
         }
         Self {

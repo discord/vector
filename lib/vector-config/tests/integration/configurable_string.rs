@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use indexmap::IndexMap;
-use vector_config::{configurable_component, schema::generate_root_schema, ConfigurableString};
+use vector_config::{ConfigurableString, configurable_component, schema::generate_root_schema};
 
 /// A type that pretends to be `ConfigurableString` but has a non-string-like schema.
 #[configurable_component]
@@ -19,7 +21,7 @@ impl fmt::Display for FakeString {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "MapKeyNotStringLike")]
 fn non_string_key_schema_stdlib_hashmap() {
     /// A HashMap-specific struct for testing fake string keys.
     #[derive(Clone)]
@@ -33,7 +35,7 @@ fn non_string_key_schema_stdlib_hashmap() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "MapKeyNotStringLike")]
 fn non_string_key_schema_stdlib_btreemap() {
     /// A BTreeMap-specific struct for testing fake string keys.
     #[derive(Clone)]
@@ -47,7 +49,7 @@ fn non_string_key_schema_stdlib_btreemap() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "MapKeyNotStringLike")]
 fn non_string_key_schema_stdlib_indexmap() {
     /// A IndexMap-specific struct for testing fake string keys.
     #[derive(Clone)]

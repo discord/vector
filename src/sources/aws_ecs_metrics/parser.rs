@@ -13,6 +13,10 @@ struct BlockIoStat {
     value: f64,
 }
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "Restructuring these source configuration fields is deferred to preserve the existing API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 #[derive(Deserialize)]
 struct BlockIoStats {
     io_merged_recursive: Option<Vec<BlockIoStat>>,
@@ -126,7 +130,7 @@ fn counter(
     tags: MetricTags,
 ) -> Metric {
     Metric::new(
-        format!("{}_{}", prefix, name),
+        format!("{prefix}_{name}"),
         MetricKind::Absolute,
         MetricValue::Counter { value },
     )
@@ -144,7 +148,7 @@ fn gauge(
     tags: MetricTags,
 ) -> Metric {
     Metric::new(
-        format!("{}_{}", prefix, name),
+        format!("{prefix}_{name}"),
         MetricKind::Absolute,
         MetricValue::Gauge { value },
     )
@@ -164,7 +168,7 @@ fn blkio_tags(item: &BlockIoStat, tags: &MetricTags) -> MetricTags {
 fn blkio_metrics(
     blkio: &BlockIoStats,
     timestamp: DateTime<Utc>,
-    namespace: &Option<String>,
+    namespace: Option<&str>,
     tags: &MetricTags,
 ) -> Vec<Metric> {
     let mut metrics = vec![];
@@ -173,7 +177,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_merged_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value,
             blkio_tags(s, tags),
@@ -183,7 +187,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_queued_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value,
             blkio_tags(s, tags),
@@ -193,7 +197,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_service_bytes_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value,
             blkio_tags(s, tags),
@@ -203,7 +207,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_service_time_seconds_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value / 1_000_000_000.0,
             blkio_tags(s, tags),
@@ -213,7 +217,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_serviced_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value,
             blkio_tags(s, tags),
@@ -223,7 +227,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_time_seconds_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value / 1_000.0,
             blkio_tags(s, tags),
@@ -233,7 +237,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_io_wait_time_seconds_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value / 1_000_000_000.0,
             blkio_tags(s, tags),
@@ -243,7 +247,7 @@ fn blkio_metrics(
         counter(
             "blkio",
             "recursive_sectors_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             s.value,
             blkio_tags(s, tags),
@@ -253,10 +257,14 @@ fn blkio_metrics(
     metrics
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Preserve the existing conversion of source counters to floating-point metrics. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn cpu_metrics(
     cpu: &CpuStats,
     timestamp: DateTime<Utc>,
-    namespace: &Option<String>,
+    namespace: Option<&str>,
     tags: &MetricTags,
     usage: &str,
 ) -> Vec<Metric> {
@@ -268,7 +276,7 @@ fn cpu_metrics(
         metrics.push(gauge(
             usage,
             "online_cpus",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             online_cpus as f64,
             tags.clone(),
@@ -279,7 +287,7 @@ fn cpu_metrics(
         metrics.push(counter(
             usage,
             "usage_system_jiffies_total",
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             system_cpu_usage,
             tags.clone(),
@@ -302,7 +310,7 @@ fn cpu_metrics(
                     counter(
                         usage,
                         name,
-                        namespace.clone(),
+                        namespace.map(str::to_owned),
                         timestamp,
                         value,
                         tags.clone(),
@@ -330,7 +338,7 @@ fn cpu_metrics(
                     counter(
                         usage,
                         name,
-                        namespace.clone(),
+                        namespace.map(str::to_owned),
                         timestamp,
                         value,
                         tags.clone(),
@@ -340,25 +348,24 @@ fn cpu_metrics(
         );
     }
 
-    if let Some(cpu_usage) = &cpu.cpu_usage {
-        if let (Some(percpu_usage), Some(online_cpus)) = (&cpu_usage.percpu_usage, cpu.online_cpus)
-        {
-            metrics.extend((0..online_cpus).filter_map(|index| {
-                percpu_usage.get(index).map(|value| {
-                    let mut tags = tags.clone();
-                    tags.replace("cpu".into(), index.to_string());
+    if let Some(cpu_usage) = &cpu.cpu_usage
+        && let (Some(percpu_usage), Some(online_cpus)) = (&cpu_usage.percpu_usage, cpu.online_cpus)
+    {
+        metrics.extend((0..online_cpus).filter_map(|index| {
+            percpu_usage.get(index).map(|value| {
+                let mut tags = tags.clone();
+                tags.replace("cpu".into(), index.to_string());
 
-                    counter(
-                        usage,
-                        "usage_percpu_jiffies_total",
-                        namespace.clone(),
-                        timestamp,
-                        *value,
-                        tags,
-                    )
-                })
-            }));
-        }
+                counter(
+                    usage,
+                    "usage_percpu_jiffies_total",
+                    namespace.map(str::to_owned),
+                    timestamp,
+                    *value,
+                    tags,
+                )
+            })
+        }));
     }
 
     metrics
@@ -367,7 +374,7 @@ fn cpu_metrics(
 fn memory_metrics(
     memory: &MemoryStats,
     timestamp: DateTime<Utc>,
-    namespace: &Option<String>,
+    namespace: Option<&str>,
     tags: &MetricTags,
 ) -> Vec<Metric> {
     let mut metrics = Vec::with_capacity(35);
@@ -384,7 +391,7 @@ fn memory_metrics(
                 gauge(
                     "memory",
                     name,
-                    namespace.clone(),
+                    namespace.map(str::to_owned),
                     timestamp,
                     value,
                     tags.clone(),
@@ -433,7 +440,7 @@ fn memory_metrics(
                     gauge(
                         "memory",
                         name,
-                        namespace.clone(),
+                        namespace.map(str::to_owned),
                         timestamp,
                         value,
                         tags.clone(),
@@ -459,7 +466,7 @@ fn memory_metrics(
                     counter(
                         "memory",
                         name,
-                        namespace.clone(),
+                        namespace.map(str::to_owned),
                         timestamp,
                         value,
                         tags.clone(),
@@ -476,7 +483,7 @@ fn network_metrics(
     interface: &str,
     network: &NetworkStats,
     timestamp: DateTime<Utc>,
-    namespace: &Option<String>,
+    namespace: Option<&str>,
     tags: &MetricTags,
 ) -> Vec<Metric> {
     let mut tags = tags.clone();
@@ -498,7 +505,7 @@ fn network_metrics(
         counter(
             "network",
             name,
-            namespace.clone(),
+            namespace.map(str::to_owned),
             timestamp,
             value.unwrap(),
             tags.clone(),
@@ -507,14 +514,27 @@ fn network_metrics(
     .collect()
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum StatsPayload {
+    Container(ContainerStats),
+    Empty {},
+    Null,
+}
+
 pub(super) fn parse(
     bytes: &[u8],
-    namespace: Option<String>,
+    namespace: Option<&str>,
 ) -> Result<Vec<Metric>, serde_json::Error> {
     let mut metrics = Vec::new();
-    let parsed = serde_json::from_slice::<BTreeMap<String, ContainerStats>>(bytes)?;
+    let parsed = serde_json::from_slice::<BTreeMap<String, StatsPayload>>(bytes)?;
 
-    for (id, container) in parsed {
+    for (id, payload) in parsed {
+        let StatsPayload::Container(container) = payload else {
+            continue;
+        };
+
         let mut tags = MetricTags::default();
         tags.replace("container_id".into(), id);
         if let Some(name) = container.name {
@@ -522,25 +542,25 @@ pub(super) fn parse(
         }
 
         if let Some(blkio) = container.blkio_stats {
-            metrics.extend(blkio_metrics(&blkio, container.ts, &namespace, &tags));
+            metrics.extend(blkio_metrics(&blkio, container.ts, namespace, &tags));
         }
 
         if let Some(cpu) = container.cpu_stats {
-            metrics.extend(cpu_metrics(&cpu, container.ts, &namespace, &tags, "cpu"));
+            metrics.extend(cpu_metrics(&cpu, container.ts, namespace, &tags, "cpu"));
         }
 
         if let Some(precpu) = container.precpu_stats {
             metrics.extend(cpu_metrics(
                 &precpu,
                 container.ts,
-                &namespace,
+                namespace,
                 &tags,
                 "precpu",
             ));
         }
 
         if let Some(memory) = container.memory_stats {
-            metrics.extend(memory_metrics(&memory, container.ts, &namespace, &tags));
+            metrics.extend(memory_metrics(&memory, container.ts, namespace, &tags));
         }
 
         for (interface, network) in container.networks.iter().flatten() {
@@ -548,7 +568,7 @@ pub(super) fn parse(
                 interface,
                 network,
                 container.ts,
-                &namespace,
+                namespace,
                 &tags,
             ));
         }
@@ -559,9 +579,8 @@ pub(super) fn parse(
 
 #[cfg(test)]
 mod test {
-    use chrono::{offset::TimeZone, DateTime, Timelike, Utc};
-    use vector_lib::assert_event_data_eq;
-    use vector_lib::metric_tags;
+    use chrono::{DateTime, Timelike, Utc, offset::TimeZone};
+    use vector_lib::{assert_event_data_eq, metric_tags};
 
     use super::parse;
     use crate::event::metric::{Metric, MetricKind, MetricValue};
@@ -608,18 +627,20 @@ mod test {
                     "io_time_recursive": [],
                     "sectors_recursive": []
                 }
-            }
+            },
+            "123456789": {},
+            "123456789": null
         }"#;
 
         assert_event_data_eq!(
-            parse(json.as_bytes(), Some(namespace())).unwrap(),
+            parse(json.as_bytes(), Some(&namespace())).unwrap(),
             vec![
                 Metric::new(
                     "blkio_recursive_io_service_bytes_total",
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "device" => "202:26368",
                     "op" => "read",
@@ -630,9 +651,9 @@ mod test {
                 Metric::new(
                     "blkio_recursive_io_service_bytes_total",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 520192.0 },
+                    MetricValue::Counter { value: 520_192.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "device" => "202:26368",
                     "op" => "write",
@@ -644,6 +665,10 @@ mod test {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn parse_cpu_metrics() {
         let json = r#"
@@ -672,18 +697,20 @@ mod test {
                         "throttled_time": 0
                     }
                 }
-            }
+            },
+            "2344": {},
+            "test": null
         }"#;
 
         assert_event_data_eq!(
-            parse(json.as_bytes(), Some(namespace())).unwrap(),
+            parse(json.as_bytes(), Some(&namespace())).unwrap(),
             vec![
                 Metric::new(
                     "cpu_online_cpus",
                     MetricKind::Absolute,
                     MetricValue::Gauge { value: 2.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2"
@@ -693,10 +720,10 @@ mod test {
                     "cpu_usage_system_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 2007130000000.0
+                        value: 2_007_130_000_000.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -705,9 +732,11 @@ mod test {
                 Metric::new(
                     "cpu_usage_usermode_jiffies_total",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 510000000.0 },
+                    MetricValue::Counter {
+                        value: 510_000_000.0
+                    },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -716,9 +745,11 @@ mod test {
                 Metric::new(
                     "cpu_usage_kernelmode_jiffies_total",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 190000000.0 },
+                    MetricValue::Counter {
+                        value: 190_000_000.0
+                    },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -728,10 +759,10 @@ mod test {
                     "cpu_usage_total_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 2324920942.0
+                        value: 2_324_920_942.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -742,7 +773,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -753,7 +784,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -764,7 +795,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -774,10 +805,10 @@ mod test {
                     "cpu_usage_percpu_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 1095931487.0
+                        value: 1_095_931_487.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "cpu" => "0",
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
@@ -788,10 +819,10 @@ mod test {
                     "cpu_usage_percpu_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 1228989455.0
+                        value: 1_228_989_455.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "cpu" => "1",
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
@@ -802,6 +833,10 @@ mod test {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn parse_precpu_metrics() {
         let json = r#"
@@ -834,14 +869,14 @@ mod test {
         }"#;
 
         assert_event_data_eq!(
-            parse(json.as_bytes(), Some(namespace())).unwrap(),
+            parse(json.as_bytes(), Some(&namespace())).unwrap(),
             vec![
                 Metric::new(
                     "precpu_online_cpus",
                     MetricKind::Absolute,
                     MetricValue::Gauge { value: 2.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2"
@@ -851,10 +886,10 @@ mod test {
                     "precpu_usage_system_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 2007130000000.0
+                        value: 2_007_130_000_000.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -863,9 +898,11 @@ mod test {
                 Metric::new(
                     "precpu_usage_usermode_jiffies_total",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 510000000.0 },
+                    MetricValue::Counter {
+                        value: 510_000_000.0
+                    },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -874,9 +911,11 @@ mod test {
                 Metric::new(
                     "precpu_usage_kernelmode_jiffies_total",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 190000000.0 },
+                    MetricValue::Counter {
+                        value: 190_000_000.0
+                    },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -886,10 +925,10 @@ mod test {
                     "precpu_usage_total_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 2324920942.0
+                        value: 2_324_920_942.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -900,7 +939,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -911,7 +950,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -922,7 +961,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 0.0 },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                     "container_name" => "vector2",
@@ -932,10 +971,10 @@ mod test {
                     "precpu_usage_percpu_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 1095931487.0
+                        value: 1_095_931_487.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "cpu" => "0",
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
@@ -946,10 +985,10 @@ mod test {
                     "precpu_usage_percpu_jiffies_total",
                     MetricKind::Absolute,
                     MetricValue::Counter {
-                        value: 1228989455.0
+                        value: 1_228_989_455.0
                     },
                 )
-                .with_namespace(Some(namespace()))
+                .with_namespace(Some(&namespace()))
                 .with_tags(Some(metric_tags!(
                     "cpu" => "1",
                     "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
@@ -960,6 +999,10 @@ mod test {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn parse_memory_metrics() {
         let json = r#"
@@ -1010,7 +1053,7 @@ mod test {
             }
         }"#;
 
-        let metrics = parse(json.as_bytes(), Some(namespace())).unwrap();
+        let metrics = parse(json.as_bytes(), Some(&namespace())).unwrap();
 
         assert_event_data_eq!(
             metrics
@@ -1020,9 +1063,11 @@ mod test {
             &Metric::new(
                 "memory_used_bytes",
                 MetricKind::Absolute,
-                MetricValue::Gauge { value: 40120320.0 },
+                MetricValue::Gauge {
+                    value: 40_120_320.0
+                },
             )
-            .with_namespace(Some(namespace()))
+            .with_namespace(Some(&namespace()))
             .with_tags(Some(metric_tags!(
                 "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                 "container_name" => "vector2",
@@ -1038,9 +1083,11 @@ mod test {
             &Metric::new(
                 "memory_max_used_bytes",
                 MetricKind::Absolute,
-                MetricValue::Gauge { value: 47177728.0 },
+                MetricValue::Gauge {
+                    value: 47_177_728.0
+                },
             )
-            .with_namespace(Some(namespace()))
+            .with_namespace(Some(&namespace()))
             .with_tags(Some(metric_tags!(
                 "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                 "container_name" => "vector2",
@@ -1056,9 +1103,11 @@ mod test {
             &Metric::new(
                 "memory_active_anonymous_bytes",
                 MetricKind::Absolute,
-                MetricValue::Gauge { value: 34885632.0 },
+                MetricValue::Gauge {
+                    value: 34_885_632.0
+                },
             )
-            .with_namespace(Some(namespace()))
+            .with_namespace(Some(&namespace()))
             .with_tags(Some(metric_tags!(
                 "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                 "container_name" => "vector2",
@@ -1076,7 +1125,7 @@ mod test {
                 MetricKind::Absolute,
                 MetricValue::Counter { value: 31131.0 },
             )
-            .with_namespace(Some(namespace()))
+            .with_namespace(Some(&namespace()))
             .with_tags(Some(metric_tags!(
                 "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
                 "container_name" => "vector2",
@@ -1108,7 +1157,7 @@ mod test {
             }
         }"#;
 
-        let metrics = parse(json.as_bytes(), Some(namespace())).unwrap();
+        let metrics = parse(json.as_bytes(), Some(&namespace())).unwrap();
 
         assert_event_data_eq!(
             metrics
@@ -1118,9 +1167,11 @@ mod test {
             &Metric::new(
                 "network_receive_bytes_total",
                 MetricKind::Absolute,
-                MetricValue::Counter { value: 329932716.0 },
+                MetricValue::Counter {
+                    value: 329_932_716.0
+                },
             )
-            .with_namespace(Some(namespace()))
+            .with_namespace(Some(&namespace()))
             .with_tags(Some(metric_tags!(
                 "device" => "eth1",
                 "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",
@@ -1137,9 +1188,9 @@ mod test {
             &Metric::new(
                 "network_transmit_bytes_total",
                 MetricKind::Absolute,
-                MetricValue::Counter { value: 2001229.0 },
+                MetricValue::Counter { value: 2_001_229.0 },
             )
-            .with_namespace(Some(namespace()))
+            .with_namespace(Some(&namespace()))
             .with_tags(Some(metric_tags!(
                 "device" => "eth1",
                 "container_id" => "0cf54b87-f0f0-4044-b9d6-20dc54d5c414-4057181352",

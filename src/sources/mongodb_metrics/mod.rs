@@ -2,21 +2,23 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::{
-    future::{join_all, try_join_all},
     StreamExt,
+    future::{join_all, try_join_all},
 };
 use mongodb::{
-    bson::{self, doc, from_document, Bson, Document},
+    Client,
+    bson::{self, Bson, Document, doc, from_document},
     error::Error as MongoError,
     options::ClientOptions,
-    Client,
 };
 use serde_with::serde_as;
 use snafu::{ResultExt, Snafu};
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
-use vector_lib::configurable::configurable_component;
-use vector_lib::{metric_tags, ByteSizeOf, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    ByteSizeOf, EstimatedJsonEncodedSizeOf, configurable::configurable_component, metric_tags,
+    source_sender::SendError,
+};
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -32,8 +34,8 @@ use types::{CommandBuildInfo, CommandIsMaster, CommandServerStatus, NodeType};
 use vector_lib::config::LogNamespace;
 
 macro_rules! tags {
-    ($tags:expr) => { $tags.clone() };
-    ($tags:expr, $($key:expr => $value:expr),*) => {
+    ($tags:expr_2021) => { $tags.clone() };
+    ($tags:expr_2021, $($key:expr_2021 => $value:expr_2021),*) => {
         {
             let mut tags = $tags.clone();
             $(
@@ -45,17 +47,29 @@ macro_rules! tags {
 }
 
 macro_rules! counter {
-    ($value:expr) => {
-        MetricValue::Counter {
-            value: $value as f64,
+    ($value:expr_2021) => {
+        {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_lossless,
+                reason = "The metric macro accepts integer and floating-point counters; preserve their existing conversion. https://github.com/vectordotdev/vector/issues/23659"
+            )]
+            let value = $value as f64;
+            MetricValue::Counter { value }
         }
     };
 }
 
 macro_rules! gauge {
-    ($value:expr) => {
-        MetricValue::Gauge {
-            value: $value as f64,
+    ($value:expr_2021) => {
+        {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_lossless,
+                reason = "The metric macro accepts integer and floating-point counters; preserve their existing conversion. https://github.com/vectordotdev/vector/issues/23659"
+            )]
+            let value = $value as f64;
+            MetricValue::Gauge { value }
         }
     };
 }
@@ -109,10 +123,12 @@ struct MongoDbMetrics {
     tags: MetricTags,
 }
 
+#[must_use]
 pub const fn default_scrape_interval_secs() -> Duration {
     Duration::from_secs(15)
 }
 
+#[must_use]
 pub fn default_namespace() -> String {
     "mongodb".to_string()
 }
@@ -134,11 +150,11 @@ impl SourceConfig for MongoDbMetricsConfig {
 
         let duration = self.scrape_interval_secs;
         let shutdown = cx.shutdown;
-        Ok(Box::pin(async move {
+        Ok(crate::sources::source_with_error(async move {
             let mut interval = IntervalStream::new(time::interval(duration)).take_until(shutdown);
             while interval.next().await.is_some() {
                 let start = Instant::now();
-                let metrics = join_all(sources.iter().map(|mongodb| mongodb.collect())).await;
+                let metrics = join_all(sources.iter().map(MongoDbMetrics::collect)).await;
                 emit!(CollectionCompleted {
                     start,
                     end: Instant::now()
@@ -147,13 +163,13 @@ impl SourceConfig for MongoDbMetricsConfig {
                 let metrics: Vec<Metric> = metrics.into_iter().flatten().collect();
                 let count = metrics.len();
 
-                if (cx.out.send_batch(metrics).await).is_err() {
-                    emit!(StreamClosedError { count });
-                    return Err(());
-                }
+                cx.out
+                    .send_batch(metrics)
+                    .await
+                    .inspect_err(|_| emit!(StreamClosedError { count }))?;
             }
 
-            Ok(())
+            Ok::<(), SendError>(())
         }))
     }
 
@@ -194,14 +210,14 @@ impl MongoDbMetrics {
         let doc = self
             .client
             .database("admin")
-            .run_command(doc! { "isMaster": 1 }, None)
+            .run_command(doc! { "isMaster": 1 })
             .await
             .map_err(CollectError::Mongo)?;
         let msg: CommandIsMaster = from_document(doc).map_err(CollectError::Bson)?;
 
         Ok(if msg.set_name.is_some() || msg.hosts.is_some() {
             NodeType::Replset
-        } else if msg.msg.map(|msg| msg == "isdbgrid").unwrap_or(false) {
+        } else if msg.msg.is_some_and(|msg| msg == "isdbgrid") {
             // Contains the value isdbgrid when isMaster returns from a mongos instance.
             // <https://docs.mongodb.com/manual/reference/command/isMaster/#isMaster.msg>
             // <https://docs.mongodb.com/manual/core/sharded-cluster-query-router/#confirm-connection-to-mongos-instances>
@@ -215,7 +231,7 @@ impl MongoDbMetrics {
         let doc = self
             .client
             .database("admin")
-            .run_command(doc! { "buildInfo": 1 }, None)
+            .run_command(doc! { "buildInfo": 1 })
             .await
             .map_err(CollectError::Mongo)?;
         from_document(doc).map_err(CollectError::Bson)
@@ -271,6 +287,10 @@ impl MongoDbMetrics {
         metrics
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     /// Collect metrics from `serverStatus` command.
     /// <https://docs.mongodb.com/manual/reference/command/serverStatus/>
     async fn collect_server_status(&self) -> Result<Vec<Metric>, CollectError> {
@@ -280,10 +300,7 @@ impl MongoDbMetrics {
 
         let command = doc! { "serverStatus": 1, "opLatencies": { "histograms": true }};
         let db = self.client.database("admin");
-        let doc = db
-            .run_command(command, None)
-            .await
-            .map_err(CollectError::Mongo)?;
+        let doc = db.run_command(command).await.map_err(CollectError::Mongo)?;
         let byte_size = document_size(&doc);
         emit!(EndpointBytesReceived {
             byte_size,
@@ -383,14 +400,14 @@ impl MongoDbMetrics {
                 "memory",
                 gauge!(value),
                 tags!(self.tags, "type" => "mapped"),
-            ))
+            ));
         }
         if let Some(value) = status.memory.mapped_with_journal {
             metrics.push(self.create_metric(
                 "memory",
                 gauge!(value),
                 tags!(self.tags, "type" => "mapped_with_journal"),
-            ))
+            ));
         }
 
         // mongod_global_lock_*
@@ -975,12 +992,11 @@ impl MongoDbMetrics {
 fn bson_size(value: &Bson) -> usize {
     match value {
         Bson::Double(value) => value.size_of(),
-        Bson::String(value) => value.size_of(),
+        Bson::String(value) | Bson::JavaScriptCode(value) | Bson::Symbol(value) => value.size_of(),
         Bson::Array(value) => value.iter().map(bson_size).sum(),
         Bson::Document(value) => document_size(value),
         Bson::Boolean(_) => std::mem::size_of::<bool>(),
         Bson::RegularExpression(value) => value.pattern.size_of(),
-        Bson::JavaScriptCode(value) => value.size_of(),
         Bson::JavaScriptCodeWithScope(value) => value.code.size_of() + document_size(&value.scope),
         Bson::Int32(value) => value.size_of(),
         Bson::Int64(value) => value.size_of(),
@@ -988,13 +1004,11 @@ fn bson_size(value: &Bson) -> usize {
         Bson::Binary(value) => value.bytes.size_of(),
         Bson::ObjectId(value) => value.bytes().size_of(),
         Bson::DateTime(_) => std::mem::size_of::<i64>(),
-        Bson::Symbol(value) => value.size_of(),
         Bson::Decimal128(value) => value.bytes().size_of(),
-        Bson::DbPointer(_) => {
+        Bson::DbPointer(_) | Bson::Null | Bson::Undefined | Bson::MaxKey | Bson::MinKey => {
             // DbPointer parts are not public and cannot be evaluated
             0
         }
-        Bson::Null | Bson::Undefined | Bson::MaxKey | Bson::MinKey => 0,
     }
 }
 
@@ -1010,7 +1024,11 @@ fn document_size(doc: &Document) -> usize {
 /// Would be nice to serialize [ClientOptions](https://docs.rs/mongodb/1.1.1/mongodb/options/struct.ClientOptions.html) to String, but it's not supported.
 /// `endpoint` argument would not be required, but field `original_uri` in `ClientOptions` is private.
 /// `.unwrap()` in function is safe because endpoint was already verified by `ClientOptions`.
-/// Based on ClientOptions::parse_uri -- <https://github.com/mongodb/mongo-rust-driver/blob/09e1193f93dcd850ebebb7fb82f6ab786fd85de1/src/client/options/mod.rs#L708>
+/// Based on `ClientOptions::parse_uri` -- <https://github.com/mongodb/mongo-rust-driver/blob/09e1193f93dcd850ebebb7fb82f6ab786fd85de1/src/client/options/mod.rs#L708>
+#[expect(
+    clippy::string_slice,
+    reason = "all indices come from find() on ASCII chars ('/', '?', '=', '@', ':'), guaranteed char boundaries"
+)]
 fn sanitize_endpoint(endpoint: &str, options: &ClientOptions) -> String {
     let mut endpoint = endpoint.to_owned();
     if options.credential.is_some() {
@@ -1043,11 +1061,8 @@ fn sanitize_endpoint(endpoint: &str, options: &ClientOptions) -> String {
                                 .join("&");
 
                             // Update options in endpoint
-                            endpoint = format!(
-                                "{}{}",
-                                &endpoint[..lstart + segments.0.len() + 1],
-                                &options
-                            );
+                            endpoint =
+                                format!("{}{}", &endpoint[..=lstart + segments.0.len()], &options);
                         }
                     }
                     segments = endpoint[start..].split_at(index);
@@ -1078,22 +1093,25 @@ mod tests {
         let endpoint = "mongodb://myDBReader:D1fficultP%40ssw0rd@mongos0.example.com:27017,mongos1.example.com:27017,mongos2.example.com:27017/?authSource=admin&tls=true";
         let client_options = ClientOptions::parse(endpoint).await.unwrap();
         let endpoint = sanitize_endpoint(endpoint, &client_options);
-        assert_eq!(&endpoint, "mongodb://mongos0.example.com:27017,mongos1.example.com:27017,mongos2.example.com:27017/?tls=true");
+        assert_eq!(
+            &endpoint,
+            "mongodb://mongos0.example.com:27017,mongos1.example.com:27017,mongos2.example.com:27017/?tls=true"
+        );
     }
 }
 
 #[cfg(all(test, feature = "mongodb_metrics-integration-tests"))]
 mod integration_tests {
     use futures::StreamExt;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     use super::*;
     use crate::{
+        SourceSender,
         test_util::{
-            components::{assert_source_compliance, PULL_SOURCE_TAGS},
+            components::{PULL_SOURCE_TAGS, assert_source_compliance},
             trace_init,
         },
-        SourceSender,
     };
 
     fn primary_mongo_address() -> String {
@@ -1131,7 +1149,7 @@ mod integration_tests {
                 .await
                 .unwrap()
                 .await
-                .unwrap()
+                .unwrap();
             });
 
             // TODO: We should have a simpler/cleaner method for this sort of collection, where we're essentially waiting
@@ -1143,12 +1161,8 @@ mod integration_tests {
                 .expect("fetch metrics timeout")
                 .expect("failed to get metrics from a stream");
             let mut events = vec![event];
-            loop {
-                match timeout(Duration::from_millis(10), recv.next()).await {
-                    Ok(Some(event)) => events.push(event),
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
+            while let Ok(Some(event)) = timeout(Duration::from_millis(10), recv.next()).await {
+                events.push(event);
             }
 
             let clean_endpoint = remove_creds(&endpoint);
@@ -1163,8 +1177,8 @@ mod integration_tests {
                 assert!((timestamp - Utc::now()).num_seconds() < 1);
                 // validate basic tags
                 let tags = metric.tags().expect("existed tags");
-                assert_eq!(tags.get("endpoint"), Some(&clean_endpoint[..]));
-                assert_eq!(tags.get("host"), Some(&host[..]));
+                assert_eq!(tags.get("endpoint"), Some(clean_endpoint.as_str()));
+                assert_eq!(tags.get("host"), Some(host.as_str()));
             }
         })
         .await;

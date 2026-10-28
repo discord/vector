@@ -1,13 +1,12 @@
 use bytes::Bytes;
 use lookup::OwnedTargetPath;
 use serde::{Deserialize, Serialize};
-use smallvec::{smallvec, SmallVec};
-use vector_core::config::LogNamespace;
-use vector_core::schema::meaning;
+use smallvec::{SmallVec, smallvec};
 use vector_core::{
-    config::{log_schema, DataType},
+    config::{DataType, LogNamespace, log_schema},
     event::{Event, LogEvent},
     schema,
+    schema::meaning,
 };
 use vrl::value::Kind;
 
@@ -19,21 +18,25 @@ pub struct BytesDeserializerConfig;
 
 impl BytesDeserializerConfig {
     /// Creates a new `BytesDeserializerConfig`.
+    #[must_use]
     pub const fn new() -> Self {
         Self
     }
 
     /// Build the `BytesDeserializer` from this configuration.
+    #[must_use]
     pub fn build(&self) -> BytesDeserializer {
         BytesDeserializer
     }
 
     /// Return the type of event build by this deserializer.
+    #[must_use]
     pub fn output_type(&self) -> DataType {
         DataType::Log
     }
 
     /// The schema produced by the deserializer.
+    #[must_use]
     pub fn schema_definition(&self, log_namespace: LogNamespace) -> schema::Definition {
         match log_namespace {
             LogNamespace::Legacy => {
@@ -89,8 +92,10 @@ impl Deserializer for BytesDeserializer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use vrl::event_path;
     use vrl::value::Value;
+
+    use super::*;
 
     #[test]
     fn deserialize_bytes_legacy_namespace() {
@@ -117,6 +122,9 @@ mod tests {
         let events = deserializer.parse(input, LogNamespace::Vector).unwrap();
         assert_eq!(events.len(), 1);
 
-        assert_eq!(events[0].as_log().get(".").unwrap(), &Value::from("foo"));
+        assert_eq!(
+            events[0].as_log().get(event_path!()).unwrap(),
+            &Value::from("foo")
+        );
     }
 }

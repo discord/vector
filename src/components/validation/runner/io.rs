@@ -4,26 +4,25 @@ use http::{Request, Response};
 use hyper::Body;
 use tokio::{pin, select, sync::mpsc};
 use tonic::{
+    Status,
     body::BoxBody,
     server::NamedService,
     transport::{Channel, Endpoint},
-    Status,
 };
 use tower::Service;
-use vector_lib::shutdown::ShutdownSignal;
-use vector_lib::{event::Event, tls::MaybeTlsSettings};
+use vector_lib::{event::Event, shutdown::ShutdownSignal, tls::MaybeTlsSettings};
 
 use crate::{
     components::validation::{
+        TestEvent,
         sync::{Configuring, TaskCoordinator},
         util::GrpcAddress,
-        TestEvent,
     },
     proto::vector::{
         Client as VectorClient, HealthCheckRequest, HealthCheckResponse, PushEventsRequest,
         PushEventsResponse, Server as VectorServer, Service as VectorService, ServingStatus,
     },
-    sources::util::grpc::run_grpc_server,
+    sources::util::grpc::{GrpcKeepaliveConfig, run_grpc_server},
 };
 
 #[derive(Clone)]
@@ -47,7 +46,9 @@ impl VectorService for EventForwardService {
             .into_inner()
             .events
             .into_iter()
-            .map(Event::from)
+            .map(|wrapper| {
+                Event::try_from(wrapper).expect("validation events are encoded by Vector")
+            })
             .collect();
 
         self.tx
@@ -82,6 +83,11 @@ pub struct OutputEdge {
 }
 
 impl InputEdge {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve ownership and drop timing"
+    )]
     pub fn from_address(address: GrpcAddress) -> Self {
         let channel = Endpoint::from(address.as_uri()).connect_lazy();
         Self {
@@ -160,13 +166,15 @@ pub fn spawn_grpc_server<S>(
 
         let (trigger_shutdown, shutdown_signal, _) = ShutdownSignal::new_wired();
         let mut trigger_shutdown = Some(trigger_shutdown);
-        let tls_settings = MaybeTlsSettings::from_config(&None, true)
+        let tls_settings = MaybeTlsSettings::from_config(None, true)
             .expect("should not fail to get empty TLS settings");
 
         let server = run_grpc_server(
             listen_addr.as_socket_addr(),
             tls_settings,
+            None,
             service,
+            GrpcKeepaliveConfig::default(),
             shutdown_signal,
         );
         pin!(server);
@@ -174,7 +182,7 @@ pub fn spawn_grpc_server<S>(
         loop {
             select! {
                 // Propagate our shutdown signal to the shutdown signal that `run_grpc_server` needs.
-                _ = shutdown_handle.wait(), if trigger_shutdown.is_some() => {
+                () = shutdown_handle.wait(), if trigger_shutdown.is_some() => {
                     trigger_shutdown.take().unwrap().cancel();
                 },
                 // TODO: Should we check the return value here to see if its an `Err`?

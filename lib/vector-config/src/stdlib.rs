@@ -2,10 +2,10 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::Hash,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     num::{
-        NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroU16, NonZeroU32, NonZeroU64,
-        NonZeroU8, NonZeroUsize,
+        NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroU8, NonZeroU16, NonZeroU32,
+        NonZeroU64, NonZeroUsize,
     },
     path::PathBuf,
     time::Duration,
@@ -17,14 +17,14 @@ use vector_config_common::{attributes::CustomAttribute, constants, validation::V
 use vrl::value::KeyString;
 
 use crate::{
+    Configurable, GenerateError, Metadata, ToValue,
     num::ConfigurableNumber,
     schema::{
-        assert_string_schema_for_map, generate_array_schema, generate_bool_schema,
-        generate_map_schema, generate_number_schema, generate_optional_schema, generate_set_schema,
-        generate_string_schema, SchemaGenerator, SchemaObject,
+        SchemaGenerator, SchemaObject, assert_string_schema_for_map, generate_array_schema,
+        generate_bool_schema, generate_map_schema, generate_number_schema,
+        generate_optional_schema, generate_set_schema, generate_string_schema,
     },
     str::ConfigurableString,
-    Configurable, GenerateError, Metadata, ToValue,
 };
 
 // Unit type.
@@ -67,8 +67,10 @@ where
         T::validate_metadata(&converted)
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
-        generate_optional_schema(&T::as_configurable_ref(), gen)
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
+        generate_optional_schema(&T::as_configurable_ref(), generator)
     }
 }
 
@@ -196,7 +198,7 @@ impl_configurable_numeric!(i16 => Into::into);
 impl_configurable_numeric!(i32 => Into::into);
 impl_configurable_numeric!(i64 => Into::into);
 impl_configurable_numeric!(isize => Into::into);
-impl_configurable_numeric!(f32 => |v| Number::from_f64(v as f64).expect("Could not convert number to JSON"));
+impl_configurable_numeric!(f32 => |v| Number::from_f64(f64::from(v)).expect("Could not convert number to JSON"));
 impl_configurable_numeric!(f64 => |v| Number::from_f64(v).expect("Could not convert number to JSON"));
 impl_configurable_numeric!(NonZeroU8 => |v: NonZeroU8| v.get().into());
 impl_configurable_numeric!(NonZeroU16 => |v: NonZeroU16| v.get().into());
@@ -222,8 +224,10 @@ where
         T::validate_metadata(&converted)
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
-        generate_array_schema(&T::as_configurable_ref(), gen)
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
+        generate_array_schema(&T::as_configurable_ref(), generator)
     }
 }
 
@@ -253,15 +257,17 @@ where
         V::validate_metadata(&converted)
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
         // Make sure our key type is _truly_ a string schema.
         assert_string_schema_for_map(
             &K::as_configurable_ref(),
-            gen,
+            generator,
             std::any::type_name::<Self>(),
         )?;
 
-        generate_map_schema(&V::as_configurable_ref(), gen)
+        generate_map_schema(&V::as_configurable_ref(), generator)
     }
 }
 
@@ -292,8 +298,10 @@ where
         V::validate_metadata(&converted)
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
-        generate_set_schema(&V::as_configurable_ref(), gen)
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
+        generate_set_schema(&V::as_configurable_ref(), generator)
     }
 }
 
@@ -303,6 +311,11 @@ impl<V: ToValue> ToValue for BTreeSet<V> {
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::implicit_hasher,
+    reason = "preserve the existing default-hasher API; broader hasher support is deferred"
+)]
 impl<K, V> Configurable for HashMap<K, V>
 where
     K: ConfigurableString + ToValue + Hash + Eq + 'static,
@@ -323,18 +336,25 @@ where
         V::validate_metadata(&converted)
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
         // Make sure our key type is _truly_ a string schema.
         assert_string_schema_for_map(
             &K::as_configurable_ref(),
-            gen,
+            generator,
             std::any::type_name::<Self>(),
         )?;
 
-        generate_map_schema(&V::as_configurable_ref(), gen)
+        generate_map_schema(&V::as_configurable_ref(), generator)
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::implicit_hasher,
+    reason = "preserve the existing default-hasher API; broader hasher support is deferred"
+)]
 impl<K, V> ToValue for HashMap<K, V>
 where
     K: ToString,
@@ -349,6 +369,11 @@ where
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::implicit_hasher,
+    reason = "preserve the existing default-hasher API; broader hasher support is deferred"
+)]
 impl<V> Configurable for HashSet<V>
 where
     V: Configurable + ToValue + Eq + Hash + 'static,
@@ -362,11 +387,18 @@ where
         V::validate_metadata(&converted)
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
-        generate_set_schema(&V::as_configurable_ref(), gen)
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
+        generate_set_schema(&V::as_configurable_ref(), generator)
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::implicit_hasher,
+    reason = "preserve the existing default-hasher API; broader hasher support is deferred"
+)]
 impl<V> ToValue for HashSet<V>
 where
     V: ToValue,
@@ -402,20 +434,46 @@ impl ToValue for SocketAddr {
     }
 }
 
+impl Configurable for Ipv4Addr {
+    fn referenceable_name() -> Option<&'static str> {
+        Some("stdlib::Ipv4Addr")
+    }
+
+    fn metadata() -> Metadata {
+        let mut metadata = Metadata::default();
+        metadata.set_description("An IPv4 address.");
+        metadata
+    }
+
+    fn generate_schema(_: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
+        // TODO: We don't need anything other than a string schema to (de)serialize a `Ipv4Addr`,
+        // but we eventually should have validation since the format for the possible permutations
+        // is well-known and can be easily codified.
+        Ok(generate_string_schema())
+    }
+}
+
+impl ToValue for Ipv4Addr {
+    fn to_value(&self) -> Value {
+        Value::String(self.to_string())
+    }
+}
+
 impl Configurable for PathBuf {
     fn referenceable_name() -> Option<&'static str> {
         Some("stdlib::PathBuf")
     }
 
     fn metadata() -> Metadata {
-        let mut metadata = Metadata::default();
-        metadata.set_description("A file path.");
-
         // Taken from
         // https://stackoverflow.com/questions/44289075/regular-expression-to-validate-windows-and-linux-path-with-extension
         // and manually checked against common Linux and Windows paths. It's probably not 100% correct, but it
         // definitely covers the most basic cases.
         const PATH_REGEX: &str = r#"(\/.*|[a-zA-Z]:\\(?:([^<>:"\/\\|?*]*[^<>:"\/\\|?*.]\\|..\\)*([^<>:"\/\\|?*]*[^<>:"\/\\|?*.]\\?|..\\))?)"#;
+
+        let mut metadata = Metadata::default();
+        metadata.set_description("A file path.");
+
         metadata.add_validation(Validation::Pattern(PATH_REGEX.to_string()));
 
         metadata

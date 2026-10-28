@@ -1,16 +1,21 @@
 use std::{error, fmt, mem};
 
 use bytes::{Buf, BufMut};
-use vector_common::byte_size_of::ByteSizeOf;
-use vector_common::finalization::{
-    AddBatchNotifier, BatchNotifier, EventFinalizer, EventFinalizers,
+use vector_common::{
+    byte_size_of::ByteSizeOf,
+    finalization::{
+        AddBatchNotifier, BatchNotifier, EventFinalizer, EventFinalizers, Finalizable,
+        MergeFinalizable,
+    },
 };
 
 use crate::{
+    Bufferable, EventCount,
     encoding::FixedEncodable,
     variants::disk_v2::{record::RECORD_HEADER_LEN, tests::align16},
-    EventCount,
 };
+
+impl Bufferable for Record {}
 
 #[derive(Debug)]
 pub struct EncodeError;
@@ -93,6 +98,18 @@ impl PartialEq for Record {
 impl AddBatchNotifier for Record {
     fn add_batch_notifier(&mut self, batch: BatchNotifier) {
         self.finalizers.add(EventFinalizer::new(batch));
+    }
+}
+
+impl Finalizable for Record {
+    fn take_finalizers(&mut self) -> EventFinalizers {
+        std::mem::take(&mut self.finalizers)
+    }
+}
+
+impl MergeFinalizable for Record {
+    fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
+        self.finalizers.merge(finalizers);
     }
 }
 

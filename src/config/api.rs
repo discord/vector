@@ -5,41 +5,36 @@ use vector_lib::configurable::configurable_component;
 
 /// API options.
 #[configurable_component]
+#[configurable(metadata(
+    docs::warnings = "The API currently does not support authentication. Only enable it in isolated environments or for debugging. It must not be exposed to untrusted clients."
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
-    /// Whether or not the API endpoint is available.
+    /// Whether the API is enabled for this Vector instance.
     #[serde(default = "default_enabled")]
+    #[configurable(metadata(docs::required = false))]
     pub enabled: bool,
 
-    /// The socket address to listen on for the API endpoint.
+    /// The network address to which the API should bind. If you're running
+    /// Vector in a Docker container, bind to `0.0.0.0`. Otherwise
+    /// the API will not be exposed outside the container.
     #[serde(default = "default_address")]
+    #[configurable(metadata(docs::examples = "0.0.0.0:8686"))]
+    #[configurable(metadata(docs::examples = "127.0.0.1:1234"))]
+    #[configurable(metadata(docs::required = false))]
     pub address: Option<SocketAddr>,
-
-    /// Whether or not to expose the GraphQL playground on the API endpoint.
-    #[serde(default = "default_playground")]
-    pub playground: bool,
-
-    /// Whether or not the GraphQL endpoint is enabled
-    #[serde(default = "default_graphql", skip_serializing_if = "is_true")]
-    pub graphql: bool,
 }
+
+impl_generate_config_from_default!(Options);
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            playground: default_playground(),
             address: default_address(),
-            graphql: default_graphql(),
         }
     }
-}
-
-// serde passes struct fields as reference
-#[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_true(value: &bool) -> bool {
-    *value
 }
 
 const fn default_enabled() -> bool {
@@ -49,26 +44,24 @@ const fn default_enabled() -> bool {
 /// By default, the API binds to 127.0.0.1:8686. This function should remain public;
 /// `vector top`  will use it to determine which to connect to by default, if no URL
 /// override is provided.
+#[must_use]
 pub fn default_address() -> Option<SocketAddr> {
     Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8686))
 }
 
-/// Default GraphQL API address
-pub fn default_graphql_url() -> Url {
+/// Default gRPC API address for `vector top` and other API clients
+#[must_use]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_panics_doc, reason = "Panic documentation deferred")]
+pub fn default_grpc_url() -> Url {
     let addr = default_address().unwrap();
-    Url::parse(&format!("http://{}/graphql", addr))
+    Url::parse(&format!("http://{addr}"))
         .expect("Couldn't parse default API URL. Please report this.")
 }
 
-const fn default_playground() -> bool {
-    true
-}
-
-const fn default_graphql() -> bool {
-    true
-}
-
 impl Options {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn merge(&mut self, other: Self) -> Result<(), String> {
         // Merge options
 
@@ -80,9 +73,7 @@ impl Options {
             // Prefer non default address
             (Some(a), Some(b)) => {
                 match (Some(a) == default_address(), Some(b) == default_address()) {
-                    (false, false) => {
-                        return Err(format!("Conflicting `api` address: {}, {} .", a, b))
-                    }
+                    (false, false) => return Err(format!("Conflicting `api` address: {a}, {b} .")),
                     (false, true) => Some(a),
                     (true, _) => Some(b),
                 }
@@ -92,8 +83,6 @@ impl Options {
         let options = Options {
             address,
             enabled: self.enabled | other.enabled,
-            playground: self.playground & other.playground,
-            graphql: self.graphql & other.graphql,
         };
 
         *self = options;
@@ -106,8 +95,6 @@ fn bool_merge() {
     let mut a = Options {
         enabled: true,
         address: None,
-        playground: false,
-        graphql: false,
     };
 
     a.merge(Options::default()).unwrap();
@@ -117,8 +104,6 @@ fn bool_merge() {
         Options {
             enabled: true,
             address: default_address(),
-            playground: false,
-            graphql: false
         }
     );
 }
@@ -129,8 +114,6 @@ fn bind_merge() {
     let mut a = Options {
         enabled: true,
         address: Some(address),
-        playground: true,
-        graphql: true,
     };
 
     a.merge(Options::default()).unwrap();
@@ -140,8 +123,6 @@ fn bind_merge() {
         Options {
             enabled: true,
             address: Some(address),
-            playground: true,
-            graphql: true,
         }
     );
 }

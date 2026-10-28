@@ -1,29 +1,30 @@
 use std::time::Duration;
 
 use http::response::Response;
-use metrics::{counter, histogram};
 use tonic::Code;
-use vector_lib::internal_event::InternalEvent;
-use vector_lib::internal_event::{error_stage, error_type};
+use vector_lib::{
+    NamedInternalEvent, counter, histogram,
+    internal_event::{CounterName, HistogramName, InternalEvent, error_stage, error_type},
+};
 
 const GRPC_STATUS_LABEL: &str = "grpc_status";
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct GrpcServerRequestReceived;
 
 impl InternalEvent for GrpcServerRequestReceived {
     fn emit(self) {
-        counter!("grpc_server_messages_received_total").increment(1);
+        counter!(CounterName::GrpcServerMessagesReceivedTotal).increment(1);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct GrpcServerResponseSent<'a, B> {
     pub response: &'a Response<B>,
     pub latency: Duration,
 }
 
-impl<'a, B> InternalEvent for GrpcServerResponseSent<'a, B> {
+impl<B> InternalEvent for GrpcServerResponseSent<'_, B> {
     fn emit(self) {
         let grpc_code = self
             .response
@@ -34,12 +35,12 @@ impl<'a, B> InternalEvent for GrpcServerResponseSent<'a, B> {
         let grpc_code = grpc_code_to_name(grpc_code);
 
         let labels = &[(GRPC_STATUS_LABEL, grpc_code)];
-        counter!("grpc_server_messages_sent_total", labels).increment(1);
-        histogram!("grpc_server_handler_duration_seconds", labels).record(self.latency);
+        counter!(CounterName::GrpcServerMessagesSentTotal, labels).increment(1);
+        histogram!(HistogramName::GrpcServerHandlerDurationSeconds, labels).record(self.latency);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct GrpcInvalidCompressionSchemeError<'a> {
     pub status: &'a tonic::Status,
 }
@@ -50,11 +51,10 @@ impl InternalEvent for GrpcInvalidCompressionSchemeError<'_> {
             message = "Invalid compression scheme.",
             error = ?self.status.message(),
             error_type = error_type::REQUEST_FAILED,
-            stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true
+            stage = error_stage::RECEIVING
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_type" => error_type::REQUEST_FAILED,
             "stage" => error_stage::RECEIVING,
         )
@@ -62,9 +62,39 @@ impl InternalEvent for GrpcInvalidCompressionSchemeError<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct GrpcError<E> {
     pub error: E,
+}
+
+/// A structurally valid gRPC event protobuf could not be converted into a Vector event.
+#[cfg(feature = "sources-vector")]
+#[derive(Debug, NamedInternalEvent)]
+pub struct GrpcEventDecodeError<E> {
+    pub error: E,
+}
+
+#[cfg(feature = "sources-vector")]
+impl<E> InternalEvent for GrpcEventDecodeError<E>
+where
+    E: std::fmt::Display,
+{
+    fn emit(self) {
+        error!(
+            message = "Failed to decode Vector protobuf event.",
+            error = %self.error,
+            error_code = "event_proto_decode",
+            error_type = error_type::PARSER_FAILED,
+            stage = error_stage::RECEIVING,
+        );
+        counter!(
+            CounterName::ComponentErrorsTotal,
+            "error_code" => "event_proto_decode",
+            "error_type" => error_type::PARSER_FAILED,
+            "stage" => error_stage::RECEIVING,
+        )
+        .increment(1);
+    }
 }
 
 impl<E> InternalEvent for GrpcError<E>
@@ -76,11 +106,10 @@ where
             message = "Grpc error.",
             error = %self.error,
             error_type = error_type::REQUEST_FAILED,
-            stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true
+            stage = error_stage::RECEIVING
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_type" => error_type::REQUEST_FAILED,
             "stage" => error_stage::RECEIVING,
         )

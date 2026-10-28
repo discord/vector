@@ -1,17 +1,18 @@
-use darling::{error::Accumulator, util::Flag, FromAttributes};
+use darling::{FromAttributes, error::Accumulator, util::Flag};
 use proc_macro2::{Ident, TokenStream};
 use quote::ToTokens;
 use serde_derive_internals::ast as serde_ast;
 
 use super::{
-    util::{try_extract_doc_title_description, DarlingResultIterator},
     Field, LazyCustomAttribute, Metadata, Style, Tagging,
+    util::{DarlingResultIterator, has_flag_attribute, try_extract_doc_title_description},
 };
 
 /// A variant in an enum.
 pub struct Variant<'a> {
     original: &'a syn::Variant,
     name: String,
+    aliases: Vec<String>,
     attrs: Attributes,
     fields: Vec<Field<'a>>,
     style: Style,
@@ -23,10 +24,16 @@ impl<'a> Variant<'a> {
     pub fn from_ast(
         serde: &serde_ast::Variant<'a>,
         tagging: Tagging,
-        is_virtual_newtype: bool,
     ) -> darling::Result<Variant<'a>> {
         let original = serde.original;
         let name = serde.attrs.name().deserialize_name().to_string();
+        let aliases = serde
+            .attrs
+            .aliases()
+            .iter()
+            .map(ToString::to_string)
+            .filter(|alias| alias != &name)
+            .collect();
         let style = serde.style.into();
         let is_newtype_wrapper_field = style == Style::Newtype;
 
@@ -37,12 +44,22 @@ impl<'a> Variant<'a> {
         let fields = serde
             .fields
             .iter()
-            .map(|field| Field::from_ast(field, is_virtual_newtype, is_newtype_wrapper_field))
+            .map(|field| Field::from_ast(field, is_newtype_wrapper_field))
             .collect_darling_results(&mut accumulator);
+
+        // If the enum overall is tagged (internal/adjacent) serde still allows one or more
+        // variants to be explicitly marked with `#[serde(untagged)]`. In that case, the
+        // variant itself is untagged; reflect that here so schema generation matches serde.
+        let tagging = if has_flag_attribute(&original.attrs, "serde", "untagged") {
+            Tagging::None
+        } else {
+            tagging
+        };
 
         let variant = Variant {
             original,
             name,
+            aliases,
             attrs,
             fields,
             style,
@@ -85,6 +102,11 @@ impl<'a> Variant<'a> {
     /// altered with `serde` helper attributes i.e. `#[serde(rename = "...")]`.
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    /// Alternative names accepted when deserializing this variant.
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     /// Title of the variant, if any.
@@ -166,9 +188,9 @@ impl<'a> Variant<'a> {
     }
 }
 
-impl<'a> ToTokens for Variant<'a> {
+impl ToTokens for Variant<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        self.original.to_tokens(tokens)
+        self.original.to_tokens(tokens);
     }
 }
 
@@ -185,6 +207,11 @@ struct Attributes {
 }
 
 impl Attributes {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "retain the fallible finalization interface used by the AST parsing pipeline"
+    )]
     fn finalize(
         mut self,
         variant: &serde_ast::Variant<'_>,
@@ -204,7 +231,7 @@ impl Attributes {
     }
 }
 
-impl<'a> PartialEq for Variant<'a> {
+impl PartialEq for Variant<'_> {
     fn eq(&self, other: &Self) -> bool {
         // Equality checking between variants is only used to drive conformance checks around making
         // sure no duplicate variants exist when in untagged mode, so all we care about is what

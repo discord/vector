@@ -1,6 +1,5 @@
-use ipnet::IpNet;
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::{
     convert::TryInto,
     fs,
@@ -8,21 +7,21 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
-    thread,
     time::Duration,
 };
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{
     executor::block_on,
-    future,
+    future::{self, OptionFuture},
     sink::{Sink, SinkExt},
     stream::{self, StreamExt, TryStreamExt},
 };
-use futures_util::{future::BoxFuture, Future, FutureExt};
+use futures_util::{Future, FutureExt, future::BoxFuture};
+use ipnet::IpNet;
 use listenfd::ListenFd;
 use tokio::{
     self,
@@ -32,15 +31,17 @@ use tokio::{
     time::sleep,
 };
 use tokio_stream::wrappers::UnixListenerStream;
-use tokio_util::codec::{length_delimited, Framed};
-use tracing::{field, Instrument, Span};
+use tokio_util::codec::{Framed, length_delimited};
+use tracing::{Instrument, Span, field};
 use vector_lib::{
     lookup::OwnedValuePath,
     tcp::TcpKeepaliveConfig,
     tls::{CertificateMetadata, MaybeTlsIncomingStream, MaybeTlsSettings},
 };
 
+use super::net::{RequestLimiter, SocketListenAddr};
 use crate::{
+    SourceSender,
     event::Event,
     internal_events::{
         ConnectionOpen, OpenGauge, SocketBindError, SocketMode, SocketReceiveError,
@@ -49,20 +50,23 @@ use crate::{
     },
     shutdown::ShutdownSignal,
     sources::{
-        util::{
-            net::{try_bind_tcp_listener, MAX_IN_FLIGHT_EVENTS_TARGET},
-            unix::remove_stale_socket,
-            AfterReadExt,
-        },
         Source,
+        util::{
+            AfterReadExt,
+            net::{MAX_IN_FLIGHT_EVENTS_TARGET, try_bind_tcp_listener},
+            unix::remove_stale_socket,
+        },
     },
-    SourceSender,
 };
-
-use super::net::{RequestLimiter, SocketListenAddr};
 
 const FSTRM_CONTROL_FRAME_LENGTH_MAX: usize = 512;
 const FSTRM_CONTROL_FIELD_CONTENT_TYPE_LENGTH_MAX: usize = 256;
+
+/// If a connection does not receive any data during this short timeout,
+/// it should release its permit (and try to obtain a new one) allowing other connections to read.
+/// It is very short because any incoming data will avoid this timeout,
+/// so it mainly prevents holding permits without consuming any data
+const PERMIT_HOLD_TIMEOUT_MS: u64 = 10;
 
 pub type FrameStreamSink = Box<dyn Sink<Bytes, Error = std::io::Error> + Send + Unpin>;
 
@@ -114,7 +118,7 @@ impl ControlHeader {
             0x04 => Ok(ControlHeader::Ready),
             0x05 => Ok(ControlHeader::Finish),
             _ => {
-                error!("Don't know header value {} (expected 0x01 - 0x05).", val);
+                error!("Don't know header value {val} (expected 0x01 - 0x05).");
                 Err(())
             }
         }
@@ -137,12 +141,11 @@ enum ControlField {
 
 impl ControlField {
     fn from_u32(val: u32) -> Result<Self, ()> {
-        match val {
-            0x01 => Ok(ControlField::ContentType),
-            _ => {
-                error!("Don't know field type {} (expected 0x01).", val);
-                Err(())
-            }
+        if val == 0x01 {
+            Ok(ControlField::ContentType)
+        } else {
+            error!("Don't know field type {val} (expected 0x01).");
+            Err(())
         }
     }
     const fn to_u32(&self) -> u32 {
@@ -162,6 +165,7 @@ fn advance_u32(b: &mut Bytes) -> Result<u32, ()> {
 }
 
 impl FrameStreamReader {
+    #[must_use]
     pub fn new(response_sink: FrameStreamSink, expected_content_type: String) -> Self {
         FrameStreamReader {
             response_sink: Mutex::new(response_sink),
@@ -225,32 +229,30 @@ impl FrameStreamReader {
                 }
             }
             ControlState::GotReady => {
-                match header {
-                    ControlHeader::Start => {
-                        //check for content type
-                        _ = self.process_fields(header, &mut frame)?;
-                        //if didn't error, then we are ok to change state
-                        self.state.control_state = ControlState::ReadingData;
-                    }
-                    _ => error!("Got wrong control frame, expected START."),
+                if let ControlHeader::Start = header {
+                    //check for content type
+                    _ = self.process_fields(header, &mut frame)?;
+                    //if didn't error, then we are ok to change state
+                    self.state.control_state = ControlState::ReadingData;
+                } else {
+                    error!("Got wrong control frame, expected START.");
                 }
             }
             ControlState::ReadingData => {
-                match header {
-                    ControlHeader::Stop => {
-                        //check there aren't any fields
-                        _ = self.process_fields(header, &mut frame)?;
-                        if self.state.is_bidirectional {
-                            //send FINISH frame -- but only if we are bidirectional
-                            self.send_control_frame(Self::make_frame(ControlHeader::Finish, None));
-                        }
-                        self.state.control_state = ControlState::Stopped; //stream is now done
+                if let ControlHeader::Stop = header {
+                    //check there aren't any fields
+                    _ = self.process_fields(header, &mut frame)?;
+                    if self.state.is_bidirectional {
+                        //send FINISH frame -- but only if we are bidirectional
+                        self.send_control_frame(Self::make_frame(ControlHeader::Finish, None));
                     }
-                    _ => error!("Got wrong control frame, expected STOP."),
+                    self.state.control_state = ControlState::Stopped; //stream is now done
+                } else {
+                    error!("Got wrong control frame, expected STOP.");
                 }
             }
             ControlState::Stopped => error!("Unexpected control frame, current state is STOPPED."),
-        };
+        }
         Ok(())
     }
 
@@ -280,11 +282,11 @@ impl FrameStreamReader {
             }
             ControlHeader::Stop => {
                 //check that there are no fields
-                if !frame.is_empty() {
+                if frame.is_empty() {
+                    Ok(None)
+                } else {
                     error!("Unexpected fields in STOP header.");
                     Err(())
-                } else {
-                    Ok(None)
                 }
             }
             _ => {
@@ -338,12 +340,16 @@ impl FrameStreamReader {
         }
 
         error!(
-            "Content types did not match up. Expected {} got {:?}.",
-            self.expected_content_type, content_types
+            "Content types did not match up. Expected {} got {content_types:?}.",
+            self.expected_content_type
         );
         Err(())
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing numeric representation of these protocol fixtures. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     fn make_frame(header: ControlHeader, content_type: Option<String>) -> Bytes {
         let mut frame = BytesMut::new();
         frame.extend(header.to_u32().to_be_bytes());
@@ -360,7 +366,7 @@ impl FrameStreamReader {
         let mut stream = stream::iter(vec![Ok(empty_frame), Ok(frame)]);
 
         if let Err(e) = block_on(self.response_sink.lock().unwrap().send_all(&mut stream)) {
-            error!("Encountered error '{:#?}' while sending control frame.", e);
+            error!("Encountered error '{e:#?}' while sending control frame.");
         }
     }
 }
@@ -368,9 +374,9 @@ impl FrameStreamReader {
 pub trait FrameHandler {
     fn content_type(&self) -> String;
     fn max_frame_length(&self) -> usize;
-    fn handle_event(&self, received_from: Option<Bytes>, frame: Bytes) -> Option<Event>;
+    fn handle_event(&self, received_from: Option<String>, frame: Bytes) -> Option<Event>;
     fn multithreaded(&self) -> bool;
-    fn max_frame_handling_tasks(&self) -> u32;
+    fn max_frame_handling_tasks(&self) -> usize;
     fn host_key(&self) -> &Option<OwnedValuePath>;
     fn timestamp_key(&self) -> Option<&OwnedValuePath>;
     fn source_type_key(&self) -> Option<&OwnedValuePath>;
@@ -396,8 +402,12 @@ pub trait TcpFrameHandler: FrameHandler {
     fn insert_tls_client_metadata(&mut self, metadata: Option<CertificateMetadata>);
 }
 
+///
+/// # Errors
+///
+/// Source execution returns an error if the listener cannot be bound or served.
 /**
- * Based off of the build_framestream_unix_source function.
+ * Based off of the `build_framestream_unix_source` function.
  * Functions similarly, just uses TCP socket instead of unix socket
  **/
 pub fn build_framestream_tcp_source(
@@ -407,8 +417,6 @@ pub fn build_framestream_tcp_source(
 ) -> crate::Result<Source> {
     let addr = frame_handler.address();
     let tls = frame_handler.tls();
-    let shutdown = shutdown.clone();
-    let out = out.clone();
 
     Ok(Box::pin(async move {
         let listenfd = ListenFd::from_env();
@@ -416,24 +424,23 @@ pub fn build_framestream_tcp_source(
             addr,
             listenfd,
             &tls,
-            frame_handler
-                .allowed_origins()
-                .map(|origins| origins.to_vec()),
+            None, // tls_reloader: not wired for this source
+            frame_handler.allowed_origins().map(<[IpNet]>::to_vec),
         )
         .await
         .map_err(|error| {
             emit!(SocketBindError {
                 mode: SocketMode::Tcp,
                 error: &error,
-            })
+            });
+            crate::sources::SourceError::from(error)
         })?;
 
         info!(
             message = "Listening.",
             addr = %listener
                 .local_addr()
-                .map(SocketListenAddr::SocketAddr)
-                .unwrap_or(addr)
+                .map_or(addr, SocketListenAddr::SocketAddr)
         );
 
         let tripwire = shutdown.clone();
@@ -447,8 +454,10 @@ pub fn build_framestream_tcp_source(
         let connection_gauge = OpenGauge::new();
         let shutdown_clone = shutdown.clone();
 
-        let request_limiter =
-            RequestLimiter::new(MAX_IN_FLIGHT_EVENTS_TARGET, crate::num_threads());
+        let request_limiter = RequestLimiter::new(
+            MAX_IN_FLIGHT_EVENTS_TARGET,
+            frame_handler.max_frame_handling_tasks(),
+        );
 
         listener
             .accept_stream_limited(frame_handler.max_connections())
@@ -477,7 +486,7 @@ pub fn build_framestream_tcp_source(
                     let span = info_span!("connection", %peer_addr);
 
                     let tripwire = tripwire
-                        .map(move |_| {
+                        .map(move |()| {
                             info!(
                                 message = "Resetting connection (still open after seconds).",
                                 seconds = ?shutdown_timeout_secs
@@ -516,20 +525,24 @@ pub fn build_framestream_tcp_source(
     }))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream(
     mut frame_handler: impl TcpFrameHandler + Send + Sync + Clone + 'static,
     mut shutdown_signal: ShutdownSignal,
     mut socket: MaybeTlsIncomingStream<TcpStream>,
-    _tripwire: BoxFuture<'static, ()>,
+    mut tripwire: BoxFuture<'static, ()>,
     peer_addr: SocketAddr,
     out: SourceSender,
-    _request_limiter: RequestLimiter,
+    request_limiter: RequestLimiter,
 ) {
     tokio::select! {
         result = socket.handshake() => {
             if let Err(error) = result {
-                emit!(TcpSocketTlsConnectionError { error });
+                emit!(TcpSocketTlsConnectionError { error, peer_addr });
                 return;
             }
         },
@@ -538,16 +551,16 @@ async fn handle_stream(
         }
     };
 
-    if let Some(keepalive) = frame_handler.keepalive() {
-        if let Err(error) = socket.set_keepalive(keepalive) {
-            warn!(message = "Failed configuring TCP keepalive.", %error);
-        }
+    if let Some(keepalive) = frame_handler.keepalive()
+        && let Err(error) = socket.set_keepalive(keepalive)
+    {
+        warn!(message = "Failed configuring TCP keepalive.", %error);
     }
 
-    if let Some(receive_buffer_bytes) = frame_handler.receive_buffer_bytes() {
-        if let Err(error) = socket.set_receive_buffer_bytes(receive_buffer_bytes) {
-            warn!(message = "Failed configuring receive buffer size on TCP socket.", %error);
-        }
+    if let Some(receive_buffer_bytes) = frame_handler.receive_buffer_bytes()
+        && let Err(error) = socket.set_receive_buffer_bytes(receive_buffer_bytes)
+    {
+        warn!(message = "Failed configuring receive buffer size on TCP socket.", %error);
     }
 
     let socket = socket.after_read(move |byte_size| {
@@ -566,30 +579,129 @@ async fn handle_stream(
     frame_handler.insert_tls_client_metadata(certificate_metadata);
 
     let span = info_span!("connection");
-    span.record("peer_addr", &field::debug(&peer_addr));
-    let received_from: Option<Bytes> = Some(peer_addr.to_string().into());
-    let active_parsing_task_nums = Arc::new(AtomicU32::new(0));
+    span.record("peer_addr", field::debug(&peer_addr));
+    let received_from = Some(peer_addr.to_string());
 
-    build_framestream_source(
-        frame_handler,
+    let connection_close_timeout = OptionFuture::from(
+        frame_handler
+            .max_connection_duration_secs()
+            .map(|timeout_secs| tokio::time::sleep(Duration::from_secs(timeout_secs))),
+    );
+    tokio::pin!(connection_close_timeout);
+
+    let content_type = frame_handler.content_type();
+    let mut event_sink = out.clone();
+    let (sock_sink, sock_stream) = Framed::new(
         socket,
-        received_from,
-        out,
-        shutdown_signal,
-        span,
-        active_parsing_task_nums,
-        move |error| {
+        length_delimited::Builder::new()
+            .max_frame_length(frame_handler.max_frame_length())
+            .new_codec(),
+    )
+    .split();
+    let mut reader = FrameStreamReader::new(Box::new(sock_sink), content_type);
+    let mut frames = sock_stream
+        .map_err(move |error| {
             emit!(TcpSocketError {
                 error: &error,
                 peer_addr,
             });
-        },
-    );
+        })
+        .filter_map(move |frame| {
+            future::ready(match frame {
+                Ok(f) => reader.handle_frame(Bytes::from(f)),
+                Err(()) => None,
+            })
+        });
+
+    let active_parsing_task_nums = Arc::new(AtomicUsize::new(0));
+    loop {
+        let mut permit = tokio::select! {
+            () = &mut tripwire => break,
+            Some(()) = &mut connection_close_timeout  => {
+                break;
+            },
+            _ = &mut shutdown_signal => {
+                break;
+            },
+            permit = request_limiter.acquire() => {
+                Some(permit)
+            }
+            else => break,
+        };
+
+        let timeout = tokio::time::sleep(Duration::from_millis(PERMIT_HOLD_TIMEOUT_MS));
+        tokio::pin!(timeout);
+
+        tokio::select! {
+            () = &mut tripwire => break,
+            _ = &mut shutdown_signal => break,
+            () = &mut timeout => {
+                // This connection is currently holding a permit, but has not received data for some time. Release
+                // the permit to let another connection try
+                continue;
+            }
+            res = frames.next() => {
+                if let Some(frame) = res {
+                    if let Some(permit) = &mut permit {
+                        // Note that this is intentionally not the "number of events in a single request", but rather
+                        // the "number of events currently available". This may contain events from multiple events,
+                        // but it should always contain all events from each request.
+                        permit.decoding_finished(1);
+                    }
+                    handle_tcp_frame(&mut frame_handler, frame, &mut event_sink, received_from.clone(), Arc::clone(&active_parsing_task_nums)).await;
+                } else {
+                    debug!("Connection closed.");
+                    break
+                }
+            }
+            else => break,
+        }
+
+        drop(permit);
+    }
 }
 
+async fn handle_tcp_frame<T>(
+    frame_handler: &mut T,
+    frame: Bytes,
+    event_sink: &mut SourceSender,
+    received_from: Option<String>,
+    active_parsing_task_nums: Arc<AtomicUsize>,
+) where
+    T: TcpFrameHandler + Send + Sync + Clone + 'static,
+{
+    if frame_handler.multithreaded() {
+        spawn_event_handling_tasks(
+            frame,
+            frame_handler.clone(),
+            event_sink.clone(),
+            received_from,
+            active_parsing_task_nums,
+            frame_handler.max_frame_handling_tasks(),
+        )
+        .await;
+    } else if let Some(event) = frame_handler.handle_event(received_from, frame)
+        && let Err(e) = event_sink.send_event(event).await
+    {
+        error!("Error sending event: {e:?}.");
+    }
+}
+
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be replaced, bound, or assigned the configured permissions.
+///
+/// # Panics
+///
+/// Panics if querying a configured socket buffer size fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
 /**
- * Based off of the build_unix_source function.
- * Functions similarly, but uses the FrameStreamReader to deal with
+ * Based off of the `build_unix_source` function.
+ * Functions similarly, but uses the `FrameStreamReader` to deal with
  * framestream control packets, and responds appropriately.
  **/
 pub fn build_framestream_unix_source(
@@ -606,12 +718,12 @@ pub fn build_framestream_unix_source(
     // system's 'net.core.rmem_max' might have to be changed if socket receive buffer is not updated properly
     if let Some(socket_receive_buffer_size) = frame_handler.socket_receive_buffer_size() {
         _ = nix::sys::socket::setsockopt(
-            listener.as_raw_fd(),
+            &listener,
             nix::sys::socket::sockopt::RcvBuf,
             &(socket_receive_buffer_size),
         );
         let rcv_buf_size =
-            nix::sys::socket::getsockopt(listener.as_raw_fd(), nix::sys::socket::sockopt::RcvBuf);
+            nix::sys::socket::getsockopt(&listener, nix::sys::socket::sockopt::RcvBuf);
         info!(
             "Unix socket receive buffer size modified to {}.",
             rcv_buf_size.unwrap()
@@ -621,12 +733,12 @@ pub fn build_framestream_unix_source(
     // system's 'net.core.wmem_max' might have to be changed if socket send buffer is not updated properly
     if let Some(socket_send_buffer_size) = frame_handler.socket_send_buffer_size() {
         _ = nix::sys::socket::setsockopt(
-            listener.as_raw_fd(),
+            &listener,
             nix::sys::socket::sockopt::SndBuf,
             &(socket_send_buffer_size),
         );
         let snd_buf_size =
-            nix::sys::socket::getsockopt(listener.as_raw_fd(), nix::sys::socket::sockopt::SndBuf);
+            nix::sys::socket::getsockopt(&listener, nix::sys::socket::sockopt::SndBuf);
         info!(
             "Unix socket buffer send size modified to {}.",
             snd_buf_size.unwrap()
@@ -637,27 +749,23 @@ pub fn build_framestream_unix_source(
     if let Some(socket_permission) = frame_handler.socket_file_mode() {
         if !(448..=511).contains(&socket_permission) {
             return Err(format!(
-                "Invalid Socket permission {:#o}. Must between 0o700 and 0o777.",
-                socket_permission
+                "Invalid Socket permission {socket_permission:#o}. Must between 0o700 and 0o777."
             )
             .into());
         }
         match fs::set_permissions(&path, fs::Permissions::from_mode(socket_permission)) {
-            Ok(_) => {
-                info!("Socket permissions updated to {:#o}.", socket_permission);
+            Ok(()) => {
+                info!("Socket permissions updated to {socket_permission:#o}.");
             }
             Err(e) => {
-                error!(
-                    "Failed to update listener socket permissions; error = {:?}.",
-                    e
-                );
+                error!("Failed to update listener socket permissions; error = {e:?}.");
                 return Err(Box::new(e));
             }
-        };
-    };
+        }
+    }
 
     let fut = async move {
-        let active_parsing_task_nums = Arc::new(AtomicU32::new(0));
+        let active_parsing_task_nums = Arc::new(AtomicUsize::new(0));
 
         info!(message = "Listening...", ?path, r#type = "unix");
 
@@ -665,7 +773,7 @@ pub fn build_framestream_unix_source(
         while let Some(socket) = stream.next().await {
             let socket = match socket {
                 Err(e) => {
-                    error!("Failed to accept socket; error = {:?}.", e);
+                    error!("Failed to accept socket; error = {e:?}.");
                     continue;
                 }
                 Ok(s) => s,
@@ -676,8 +784,8 @@ pub fn build_framestream_unix_source(
 
             let span = info_span!("connection");
             let path = if let Some(addr) = peer_addr {
-                if let Some(path) = addr.as_pathname().map(|e| e.to_owned()) {
-                    span.record("peer_path", &field::debug(&path));
+                if let Some(path) = addr.as_pathname().map(ToOwned::to_owned) {
+                    span.record("peer_path", field::debug(&path));
                     Some(path)
                 } else {
                     None
@@ -685,8 +793,7 @@ pub fn build_framestream_unix_source(
             } else {
                 None
             };
-            let received_from: Option<Bytes> =
-                path.map(|p| p.to_string_lossy().into_owned().into());
+            let received_from = path.map(|p| p.to_string_lossy().into_owned());
 
             build_framestream_source(
                 frame_handler.clone(),
@@ -719,19 +826,23 @@ pub fn build_framestream_unix_source(
     Ok(Box::pin(fut))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Borrowing frame-handler inputs where possible is deferred to keep this cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
 #[allow(clippy::too_many_arguments)]
 fn build_framestream_source<T: Send + 'static>(
     frame_handler: impl FrameHandler + Send + Sync + Clone + 'static,
     socket: impl AsyncRead + AsyncWrite + Send + 'static,
-    received_from: Option<Bytes>,
+    received_from: Option<String>,
     out: SourceSender,
     shutdown: impl Future<Output = T> + Unpin + Send + 'static,
     span: Span,
-    active_task_nums: Arc<AtomicU32>,
+    active_task_nums: Arc<AtomicUsize>,
     error_mapper: impl FnMut(std::io::Error) + Send + 'static,
 ) {
     let content_type = frame_handler.content_type();
-    let mut event_sink = out.clone();
+    let mut event_sink = out;
     let (sock_sink, sock_stream) = Framed::new(
         socket,
         length_delimited::Builder::new()
@@ -747,34 +858,20 @@ fn build_framestream_source<T: Send + 'static>(
         .filter_map(move |frame| {
             future::ready(match frame {
                 Ok(f) => fs_reader.handle_frame(Bytes::from(f)),
-                Err(_) => None,
+                Err(()) => None,
             })
         });
-    if !frame_handler.multithreaded() {
-        let mut events = frames.filter_map(move |f| {
-            future::ready(frame_handler_copy.handle_event(received_from.clone(), f))
-        });
-
-        let handler = async move {
-            if let Err(e) = event_sink.send_event_stream(&mut events).await {
-                error!("Error sending event: {:?}.", e);
-            }
-
-            info!("Finished sending.");
-        };
-        tokio::spawn(handler.instrument(span.or_current()));
-    } else {
+    if frame_handler.multithreaded() {
         let handler = async move {
             frames
                 .for_each(move |f| {
-                    future::ready({
-                        let max_frame_handling_tasks =
-                            frame_handler_copy.max_frame_handling_tasks();
-                        let f_handler = frame_handler_copy.clone();
-                        let received_from_copy = received_from.clone();
-                        let event_sink_copy = event_sink.clone();
-                        let active_task_nums_copy = Arc::clone(&active_task_nums);
+                    let max_frame_handling_tasks = frame_handler_copy.max_frame_handling_tasks();
+                    let f_handler = frame_handler_copy.clone();
+                    let received_from_copy = received_from.clone();
+                    let event_sink_copy = event_sink.clone();
+                    let active_task_nums_copy = Arc::clone(&active_task_nums);
 
+                    async move {
                         spawn_event_handling_tasks(
                             f,
                             f_handler,
@@ -782,32 +879,46 @@ fn build_framestream_source<T: Send + 'static>(
                             received_from_copy,
                             active_task_nums_copy,
                             max_frame_handling_tasks,
-                        );
-                    })
+                        )
+                        .await;
+                    }
                 })
                 .await;
+            info!("Finished sending.");
+        };
+        tokio::spawn(handler.instrument(span.or_current()));
+    } else {
+        let mut events = frames.filter_map(move |f| {
+            future::ready(frame_handler_copy.handle_event(received_from.clone(), f))
+        });
+
+        let handler = async move {
+            if let Err(e) = event_sink.send_event_stream(&mut events).await {
+                error!("Error sending event: {e:?}.");
+            }
+
             info!("Finished sending.");
         };
         tokio::spawn(handler.instrument(span.or_current()));
     }
 }
 
-fn spawn_event_handling_tasks(
+async fn spawn_event_handling_tasks(
     event_data: Bytes,
     event_handler: impl FrameHandler + Send + Sync + 'static,
     mut event_sink: SourceSender,
-    received_from: Option<Bytes>,
-    active_task_nums: Arc<AtomicU32>,
-    max_frame_handling_tasks: u32,
+    received_from: Option<String>,
+    active_task_nums: Arc<AtomicUsize>,
+    max_frame_handling_tasks: usize,
 ) -> JoinHandle<()> {
-    wait_for_task_quota(&active_task_nums, max_frame_handling_tasks);
+    wait_for_task_quota(&active_task_nums, max_frame_handling_tasks).await;
 
-    tokio::spawn(async move {
+    crate::spawn_in_current_span(async move {
         future::ready({
-            if let Some(evt) = event_handler.handle_event(received_from, event_data) {
-                if event_sink.send_event(evt).await.is_err() {
-                    error!("Encountered error while sending event.");
-                }
+            if let Some(evt) = event_handler.handle_event(received_from, event_data)
+                && event_sink.send_event(evt).await.is_err()
+            {
+                error!("Encountered error while sending event.");
             }
             active_task_nums.fetch_sub(1, Ordering::AcqRel);
         })
@@ -815,63 +926,59 @@ fn spawn_event_handling_tasks(
     })
 }
 
-fn wait_for_task_quota(active_task_nums: &Arc<AtomicU32>, max_tasks: u32) {
+async fn wait_for_task_quota(active_task_nums: &Arc<AtomicUsize>, max_tasks: usize) {
     while max_tasks > 0 && max_tasks < active_task_nums.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(3));
+        tokio::time::sleep(Duration::from_millis(3)).await;
     }
     active_task_nums.fetch_add(1, Ordering::AcqRel);
 }
 
 #[cfg(test)]
 mod test {
-    use futures_util::Stream;
     use std::net::SocketAddr;
     #[cfg(unix)]
     use std::{
         path::PathBuf,
         sync::{
-            atomic::{AtomicU32, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         thread,
     };
-    use tokio::net::TcpStream;
 
-    use bytes::{buf::Buf, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut, buf::Buf};
     use futures::{
         future,
         sink::{Sink, SinkExt},
         stream::{self, StreamExt},
     };
+    use futures_util::Stream;
     use ipnet::IpNet;
     use tokio::{
         self,
-        net::UnixStream,
+        net::{TcpStream, UnixStream},
         task::JoinHandle,
         time::{Duration, Instant},
     };
-    use tokio_util::codec::{length_delimited, Framed};
+    use tokio_util::codec::{Framed, length_delimited};
     use vector_lib::{
         config::{LegacyKey, LogNamespace},
+        lookup::{OwnedValuePath, owned_value_path, path},
         tcp::TcpKeepaliveConfig,
-        tls::{CertificateMetadata, MaybeTls},
-    };
-    use vector_lib::{
-        lookup::{owned_value_path, path, OwnedValuePath},
-        tls::MaybeTlsSettings,
+        tls::{CertificateMetadata, MaybeTls, MaybeTlsSettings},
     };
 
     use super::{
-        build_framestream_tcp_source, build_framestream_unix_source, spawn_event_handling_tasks,
         ControlField, ControlHeader, FrameHandler, TcpFrameHandler, UnixFrameHandler,
+        build_framestream_tcp_source, build_framestream_unix_source, spawn_event_handling_tasks,
     };
     use crate::{
-        config::{log_schema, ComponentKey},
+        SourceSender,
+        config::{ComponentKey, log_schema},
         event::{Event, LogEvent},
         shutdown::SourceShutdownCoordinator,
         sources::util::net::SocketListenAddr,
-        test_util::{collect_n, collect_n_stream, next_addr},
-        SourceSender,
+        test_util::{addr::next_addr, collect_n, collect_n_stream},
     };
 
     #[derive(Clone)]
@@ -879,7 +986,7 @@ mod test {
         content_type: String,
         max_frame_length: usize,
         multithreaded: bool,
-        max_frame_handling_tasks: u32,
+        max_frame_handling_tasks: usize,
         extra_task_handling_routine: F,
         host_key: Option<OwnedValuePath>,
         timestamp_key: Option<OwnedValuePath>,
@@ -937,7 +1044,7 @@ mod test {
         pub fn new(content_type: String, multithreaded: bool, extra_routine: F) -> Self {
             Self {
                 frame_handler: MockFrameHandler::new(content_type, multithreaded, extra_routine),
-                socket_path: tempfile::tempdir().unwrap().into_path().join("unix_test"),
+                socket_path: tempfile::tempdir().unwrap().keep().join("unix_test"),
                 socket_file_mode: None,
                 socket_receive_buffer_size: None,
                 socket_send_buffer_size: None,
@@ -946,6 +1053,10 @@ mod test {
     }
 
     impl<F: Send + Sync + Clone + FnOnce() + 'static> MockFrameHandler<F> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+        )]
         pub fn new(content_type: String, multithreaded: bool, extra_routine: F) -> Self {
             Self {
                 content_type,
@@ -969,7 +1080,7 @@ mod test {
             self.max_frame_length
         }
 
-        fn handle_event(&self, received_from: Option<Bytes>, frame: Bytes) -> Option<Event> {
+        fn handle_event(&self, received_from: Option<String>, frame: Bytes) -> Option<Event> {
             let mut log_event = LogEvent::from(frame);
 
             log_event.insert(
@@ -983,7 +1094,7 @@ mod test {
                     self.host_key.as_ref().map(LegacyKey::Overwrite),
                     path!("host"),
                     host,
-                )
+                );
             }
 
             (self.extra_task_handling_routine.clone())();
@@ -994,7 +1105,7 @@ mod test {
         fn multithreaded(&self) -> bool {
             self.multithreaded
         }
-        fn max_frame_handling_tasks(&self) -> u32 {
+        fn max_frame_handling_tasks(&self) -> usize {
             self.max_frame_handling_tasks
         }
 
@@ -1020,7 +1131,7 @@ mod test {
             self.frame_handler.max_frame_length()
         }
 
-        fn handle_event(&self, received_from: Option<Bytes>, frame: Bytes) -> Option<Event> {
+        fn handle_event(&self, received_from: Option<String>, frame: Bytes) -> Option<Event> {
             self.frame_handler.handle_event(received_from, frame)
         }
 
@@ -1028,7 +1139,7 @@ mod test {
             self.frame_handler.multithreaded()
         }
 
-        fn max_frame_handling_tasks(&self) -> u32 {
+        fn max_frame_handling_tasks(&self) -> usize {
             self.frame_handler.max_frame_handling_tasks()
         }
 
@@ -1072,7 +1183,7 @@ mod test {
             self.frame_handler.max_frame_length()
         }
 
-        fn handle_event(&self, received_from: Option<Bytes>, frame: Bytes) -> Option<Event> {
+        fn handle_event(&self, received_from: Option<String>, frame: Bytes) -> Option<Event> {
             self.frame_handler.handle_event(received_from, frame)
         }
 
@@ -1080,7 +1191,7 @@ mod test {
             self.frame_handler.multithreaded()
         }
 
-        fn max_frame_handling_tasks(&self) -> u32 {
+        fn max_frame_handling_tasks(&self) -> usize {
             self.frame_handler.max_frame_handling_tasks()
         }
 
@@ -1142,7 +1253,10 @@ mod test {
         addr: &SocketAddr,
         frame_handler: impl TcpFrameHandler + Send + Sync + Clone + 'static,
         pipeline: SourceSender,
-    ) -> (JoinHandle<Result<(), ()>>, SourceShutdownCoordinator) {
+    ) -> (
+        JoinHandle<Result<(), crate::sources::SourceError>>,
+        SourceShutdownCoordinator,
+    ) {
         let source_id = ComponentKey::from(source_id);
         let mut shutdown = SourceShutdownCoordinator::default();
         let (shutdown_signal, _) = shutdown.register_source(&source_id, false);
@@ -1164,7 +1278,7 @@ mod test {
         pipeline: SourceSender,
     ) -> (
         PathBuf,
-        JoinHandle<Result<(), ()>>,
+        JoinHandle<Result<(), crate::sources::SourceError>>,
         SourceShutdownCoordinator,
     ) {
         let source_id = ComponentKey::from(source_id);
@@ -1202,7 +1316,7 @@ mod test {
         sock_sink: &mut S,
         frames: Vec<Result<Bytes, std::io::Error>>,
     ) {
-        let mut stream = stream::iter(frames.into_iter());
+        let mut stream = stream::iter(frames);
         //send and send_all consume the sink
         _ = sock_sink.send_all(&mut stream).await;
     }
@@ -1218,6 +1332,10 @@ mod test {
         Bytes::from(header.to_u32().to_be_bytes().to_vec())
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing numeric representation of these protocol fixtures. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     fn create_control_frame_with_content(
         header: ControlHeader,
         content_types: Vec<Bytes>,
@@ -1231,6 +1349,14 @@ mod test {
         Bytes::from(frame)
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Preserve the owned frame handler lifetime while its clones process events."
+    )]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing numeric representation of these protocol fixtures. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     fn assert_accept_frame(frame: &mut BytesMut, expected_content_type: Bytes) {
         //frame should start with 4 bytes saying ACCEPT
 
@@ -1289,7 +1415,7 @@ mod test {
         mut sock_stream: U,
         rx: V,
         mut shutdown: SourceShutdownCoordinator,
-        source_handle: JoinHandle<Result<(), ()>>,
+        source_handle: JoinHandle<Result<(), crate::sources::SourceError>>,
     ) {
         //1 - send READY frame (with content_type)
         let content_type = Bytes::from(&b"test_content"[..]);
@@ -1318,12 +1444,16 @@ mod test {
         send_control_frame(&mut sock_sink, create_control_frame(ControlHeader::Stop)).await;
 
         let message_key = log_schema().message_key().unwrap().to_string();
-        assert!(events
-            .iter()
-            .any(|e| e.as_log()[&message_key] == "hello".into()));
-        assert!(events
-            .iter()
-            .any(|e| e.as_log()[&message_key] == "world".into()));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.as_log()[&message_key] == "hello".into())
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.as_log()[&message_key] == "world".into())
+        );
 
         drop(sock_stream); //explicitly drop the stream so we don't get warnings about not using it
 
@@ -1340,7 +1470,7 @@ mod test {
         mut sock_sink: T,
         mut sock_stream: U,
         mut shutdown: SourceShutdownCoordinator,
-        source_handle: JoinHandle<Result<(), ()>>,
+        source_handle: JoinHandle<Result<(), crate::sources::SourceError>>,
     ) {
         //1 - send READY frame (with content_type)
         let content_type = Bytes::from(&b"test_content"[..]);
@@ -1365,11 +1495,15 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::should_panic_without_expect,
+        reason = "A blocked peer may fail either stream reads or the subsequent handshake assertions."
+    )]
     #[should_panic]
     async fn blocked_framestream_tcp() {
         let source_name = "test_source";
         let (tx, rx) = SourceSender::new_test();
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let (source_handle, shutdown) = init_framestream_tcp(
             source_name,
             &addr,
@@ -1393,7 +1527,7 @@ mod test {
     async fn normal_framestream_singlethreaded_tcp() {
         let source_name = "test_source";
         let (tx, rx) = SourceSender::new_test();
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let (source_handle, shutdown) = init_framestream_tcp(
             source_name,
             &addr,
@@ -1436,7 +1570,7 @@ mod test {
     async fn normal_framestream_multithreaded_tcp() {
         let source_name = "test_source";
         let (tx, rx) = SourceSender::new_test();
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let (source_handle, shutdown) = init_framestream_tcp(
             source_name,
             &addr,
@@ -1479,7 +1613,7 @@ mod test {
     async fn multiple_content_types_tcp() {
         let source_name = "test_source";
         let (tx, _) = SourceSender::new_test();
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let (source_handle, shutdown) = init_framestream_tcp(
             source_name,
             &addr,
@@ -1640,9 +1774,9 @@ mod test {
         let (out, rx) = SourceSender::new_test();
 
         let max_frame_handling_tasks = 20;
-        let active_task_nums = Arc::new(AtomicU32::new(0));
+        let active_task_nums = Arc::new(AtomicUsize::new(0));
         let active_task_nums_copy = Arc::clone(&active_task_nums);
-        let max_task_nums_reached = Arc::new(AtomicU32::new(0));
+        let max_task_nums_reached = Arc::new(AtomicUsize::new(0));
         let max_task_nums_reached_copy = Arc::clone(&max_task_nums_reached);
 
         let mut join_handles = vec![];
@@ -1659,21 +1793,24 @@ mod test {
 
         join_handles.push(tokio::spawn(async move {
             future::ready({
-                let events = collect_n(rx, total_events as usize).await;
-                assert_eq!(total_events as usize, events.len(), "Missed events");
+                let events = collect_n(rx, total_events).await;
+                assert_eq!(total_events, events.len(), "Missed events");
             })
             .await;
         }));
 
         for i in 0..total_events {
-            join_handles.push(spawn_event_handling_tasks(
-                Bytes::from(format!("event_{}", i)),
-                MockFrameHandler::new("test_content".to_string(), true, extra_routine.clone()),
-                out.clone(),
-                None,
-                Arc::clone(&active_task_nums_copy),
-                max_frame_handling_tasks,
-            ));
+            join_handles.push(
+                spawn_event_handling_tasks(
+                    Bytes::from(format!("event_{i}")),
+                    MockFrameHandler::new("test_content".to_string(), true, extra_routine.clone()),
+                    out.clone(),
+                    None,
+                    Arc::clone(&active_task_nums_copy),
+                    max_frame_handling_tasks,
+                )
+                .await,
+            );
         }
 
         future::join_all(join_handles).await;
@@ -1689,6 +1826,9 @@ mod test {
             max_task_nums_reached_value > 1,
             "MultiThreaded mode does NOT work"
         );
-        assert!((max_task_nums_reached_value - max_frame_handling_tasks) < 2, "Max number of tasks at any given time should NOT Exceed max_frame_handling_tasks too much");
+        assert!(
+            (max_task_nums_reached_value - max_frame_handling_tasks) < 2,
+            "Max number of tasks at any given time should NOT Exceed max_frame_handling_tasks too much"
+        );
     }
 }

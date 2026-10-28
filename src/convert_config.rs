@@ -1,9 +1,13 @@
-use crate::config::{format, ConfigBuilder, Format};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+
 use clap::Parser;
-use colored::*;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use colored::Colorize;
+
+use crate::config::{ConfigBuilder, Format, format};
 
 #[derive(Parser, Debug)]
 #[command(rename_all = "kebab-case")]
@@ -20,6 +24,11 @@ pub struct Opts {
     pub(crate) output_format: Format,
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Preserve path escaping"
+)]
 fn check_paths(opts: &Opts) -> Result<(), String> {
     let in_metadata = fs::metadata(&opts.input_path)
         .unwrap_or_else(|_| panic!("Failed to get metadata for: {:?}", &opts.input_path));
@@ -48,6 +57,11 @@ fn check_paths(opts: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Preserve path escaping"
+)]
 pub(crate) fn cmd(opts: &Opts) -> exitcode::ExitCode {
     if let Err(e) = check_paths(opts) {
         #[allow(clippy::print_stderr)]
@@ -57,21 +71,23 @@ pub(crate) fn cmd(opts: &Opts) -> exitcode::ExitCode {
         return exitcode::SOFTWARE;
     }
 
-    return if opts.input_path.is_file() && opts.output_path.extension().is_some() {
-        if let Some(base_dir) = opts.output_path.parent() {
-            if !base_dir.exists() {
-                fs::create_dir_all(base_dir).unwrap_or_else(|_| {
-                    panic!("Failed to create output dir(s): {:?}", &opts.output_path)
-                });
-            }
+    if opts.input_path.is_file() && opts.output_path.extension().is_some() {
+        if let Some(base_dir) = opts.output_path.parent()
+            && !base_dir.exists()
+        {
+            fs::create_dir_all(base_dir).unwrap_or_else(|_| {
+                panic!("Failed to create output dir(s): {:?}", &opts.output_path)
+            });
         }
 
         match convert_config(&opts.input_path, &opts.output_path, opts.output_format) {
-            Ok(_) => exitcode::OK,
+            Ok(()) => exitcode::OK,
             Err(errors) => {
                 #[allow(clippy::print_stderr)]
                 {
-                    errors.iter().for_each(|e| eprintln!("{}", e.red()));
+                    for error in errors {
+                        eprintln!("{}", error.red());
+                    }
                 }
                 exitcode::SOFTWARE
             }
@@ -91,14 +107,21 @@ pub(crate) fn cmd(opts: &Opts) -> exitcode::ExitCode {
             Err(errors) => {
                 #[allow(clippy::print_stderr)]
                 {
-                    errors.iter().for_each(|e| eprintln!("{}", e.red()));
+                    for error in errors {
+                        eprintln!("{}", error.red());
+                    }
                 }
                 exitcode::SOFTWARE
             }
         }
-    };
+    }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Preserve path escaping"
+)]
 fn convert_config(
     input_path: &Path,
     output_path: &Path,
@@ -107,15 +130,14 @@ fn convert_config(
     if output_path.exists() {
         return Err(vec![format!("Output path {output_path:?} exists")]);
     }
-    let input_format = match Format::from_str(
+    let Ok(input_format) = Format::from_str(
         input_path
             .extension()
             .unwrap_or_else(|| panic!("Failed to get extension for: {input_path:?}"))
             .to_str()
             .unwrap_or_else(|| panic!("Failed to convert OsStr to &str for: {input_path:?}")),
-    ) {
-        Ok(format) => format,
-        Err(_) => return Ok(()), // skip irrelevant files
+    ) else {
+        return Ok(()); // skip irrelevant files
     };
 
     if input_format == output_format {
@@ -129,8 +151,7 @@ fn convert_config(
     let file_contents = fs::read_to_string(input_path).map_err(|e| vec![e.to_string()])?;
     let builder: ConfigBuilder = format::deserialize(&file_contents, input_format)?;
     let config = builder.build()?;
-    let output_string =
-        format::serialize(&config, output_format).map_err(|e| vec![e.to_string()])?;
+    let output_string = format::serialize(&config, output_format).map_err(|e| vec![e])?;
     fs::write(output_path, output_string).map_err(|e| vec![e.to_string()])?;
 
     #[allow(clippy::print_stdout)]
@@ -140,6 +161,11 @@ fn convert_config(
     Ok(())
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Preserve path escaping"
+)]
 fn walk_dir_and_convert(
     input_path: &Path,
     output_dir: &Path,
@@ -207,12 +233,18 @@ fn walk_dir_and_convert(
     feature = "sinks-console"
 ))]
 mod tests {
-    use crate::config::{format, ConfigBuilder, Format};
-    use crate::convert_config::{check_paths, walk_dir_and_convert, Opts};
-    use std::path::{Path, PathBuf};
-    use std::str::FromStr;
-    use std::{env, fs};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        str::FromStr,
+    };
+
     use tempfile::tempdir;
+
+    use crate::{
+        config::{ConfigBuilder, Format, format},
+        convert_config::{Opts, check_paths, walk_dir_and_convert},
+    };
 
     fn test_data_dir() -> PathBuf {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("tests/data/cmd/config")
@@ -271,7 +303,7 @@ mod tests {
         let input_path = test_data_dir();
         let output_dir = tempdir()
             .expect("Unable to create tempdir for config")
-            .into_path();
+            .keep();
         walk_dir_and_convert(&input_path, &output_dir, Format::Yaml).unwrap();
 
         let mut count: usize = 0;
@@ -283,7 +315,7 @@ mod tests {
                 let extension = path.extension().unwrap().to_str().unwrap();
                 if extension == Format::Yaml.to_string() {
                     // Note that here we read the converted string directly.
-                    let converted_config = fs::read_to_string(&output_dir.join(&path)).unwrap();
+                    let converted_config = fs::read_to_string(output_dir.join(&path)).unwrap();
                     assert_eq!(converted_config, original_config);
                     count += 1;
                 }

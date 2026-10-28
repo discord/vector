@@ -3,7 +3,7 @@ use core::fmt;
 use vector_common::byte_size_of::ByteSizeOf;
 use vector_config::configurable_component;
 
-use super::{write_list, write_word, MetricTags, TagValue};
+use super::{MetricTags, TagValue, write_list, write_word};
 
 /// Metrics series.
 #[configurable_component]
@@ -12,7 +12,6 @@ pub struct MetricSeries {
     #[serde(flatten)]
     pub name: MetricName,
 
-    #[configurable(derived)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<MetricTags>,
 }

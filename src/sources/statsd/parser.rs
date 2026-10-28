@@ -2,31 +2,43 @@ use std::{
     error, fmt,
     num::{ParseFloatError, ParseIntError},
     str::Utf8Error,
+    sync::LazyLock,
 };
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::{
     event::metric::{Metric, MetricKind, MetricTags, MetricValue, StatisticKind},
-    sources::util::extract_tag_key_and_value,
+    sources::{statsd::ConversionUnit, util::extract_tag_key_and_value},
 };
 
-static WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
-static NONALPHANUM: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^a-zA-Z_\-0-9\.]").unwrap());
+static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+static NONALPHANUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^a-zA-Z_\-0-9\.]").unwrap());
 
 #[derive(Clone)]
 pub struct Parser {
     sanitize: bool,
+    convert_to: ConversionUnit,
 }
 
 impl Parser {
-    pub const fn new(sanitize_keys: bool) -> Self {
+    #[must_use]
+    pub const fn new(sanitize_keys: bool, convert_to: ConversionUnit) -> Self {
         Self {
             sanitize: sanitize_keys,
+            convert_to,
         }
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet contains an invalid StatsD metric.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     pub fn parse(&self, packet: &str) -> Result<Metric, ParseError> {
         // https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/#datagram-format
         let key_and_body = packet.splitn(2, ':').collect::<Vec<_>>();
@@ -76,14 +88,24 @@ impl Parser {
                 )
                 .with_tags(tags)
             }
-            unit @ "h" | unit @ "ms" | unit @ "d" => {
+            unit @ ("h" | "ms" | "d") => {
                 let val: f64 = parts[0].parse()?;
+                let converted_val = match unit {
+                    "ms" => match self.convert_to {
+                        ConversionUnit::Seconds => val / 1000.0,
+                        ConversionUnit::Milliseconds => val,
+                    },
+                    _ => val,
+                };
                 Metric::new(
-                name, MetricKind::Incremental, MetricValue::Distribution {
-                    samples: vector_lib::samples![convert_to_base_units(unit, val) => sample_rate as u32],
-                    statistic: convert_to_statistic(unit),
-                },
-            ).with_tags(tags)
+                    name,
+                    MetricKind::Incremental,
+                    MetricValue::Distribution {
+                        samples: vector_lib::samples![converted_val => sample_rate as u32],
+                        statistic: convert_to_statistic(unit),
+                    },
+                )
+                .with_tags(tags)
             }
             "g" => {
                 let value = if parts[0]
@@ -94,7 +116,9 @@ impl Parser {
                 {
                     parts[0].parse()?
                 } else {
-                    parts[0][1..].parse()?
+                    let mut chars = parts[0].chars();
+                    chars.next();
+                    chars.as_str().parse()?
                 };
 
                 match parse_direction(parts[0])? {
@@ -125,13 +149,14 @@ impl Parser {
 }
 
 fn parse_sampling(input: &str) -> Result<f64, ParseError> {
-    if !input.starts_with('@') || input.len() < 2 {
-        return Err(ParseError::Malformed(
+    let rest = input
+        .strip_prefix('@')
+        .filter(|s| !s.is_empty())
+        .ok_or(ParseError::Malformed(
             "expected non empty '@'-prefixed sampling component",
-        ));
-    }
+        ))?;
 
-    let num: f64 = input[1..].parse()?;
+    let num: f64 = rest.parse()?;
     if num.is_sign_positive() {
         Ok(num)
     } else {
@@ -141,16 +166,14 @@ fn parse_sampling(input: &str) -> Result<f64, ParseError> {
 
 /// Statsd (and dogstatsd) support bare, single and multi-value tags.
 fn parse_tags(input: &&str) -> Result<MetricTags, ParseError> {
-    if !input.starts_with('#') || input.len() < 2 {
-        return Err(ParseError::Malformed(
+    let rest = input
+        .strip_prefix('#')
+        .filter(|s| !s.is_empty())
+        .ok_or(ParseError::Malformed(
             "expected non empty '#'-prefixed tags component",
-        ));
-    }
+        ))?;
 
-    Ok(input[1..]
-        .split(',')
-        .map(extract_tag_key_and_value)
-        .collect())
+    Ok(rest.split(',').map(extract_tag_key_and_value).collect())
 }
 
 fn parse_direction(input: &str) -> Result<Option<f64>, ParseError> {
@@ -167,29 +190,18 @@ fn parse_direction(input: &str) -> Result<Option<f64>, ParseError> {
 }
 
 fn sanitize_key(key: &str, sanitize: bool) -> String {
-    if !sanitize {
-        key.to_owned()
-    } else {
+    if sanitize {
         let s = key.replace('/', "'-");
         let s = WHITESPACE.replace_all(&s, "_");
         let s = NONALPHANUM.replace_all(&s, "");
         s.into()
+    } else {
+        key.to_owned()
     }
 }
 
 fn sanitize_sampling(sampling: f64) -> f64 {
-    if sampling == 0.0 {
-        1.0
-    } else {
-        sampling
-    }
-}
-
-fn convert_to_base_units(unit: &str, val: f64) -> f64 {
-    match unit {
-        "ms" => val / 1000.0,
-        _ => val,
-    }
+    if sampling == 0.0 { 1.0 } else { sampling }
 }
 
 fn convert_to_statistic(unit: &str) -> StatisticKind {
@@ -210,7 +222,7 @@ pub enum ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Statsd parse error: {:?}", self)
+        write!(f, "Statsd parse error: {self:?}")
     }
 }
 
@@ -232,18 +244,29 @@ impl From<ParseFloatError> for ParseError {
 
 #[cfg(test)]
 mod test {
-    use vector_lib::assert_event_data_eq;
-    use vector_lib::{event::metric::TagValue, metric_tags};
+    use vector_lib::{assert_event_data_eq, event::metric::TagValue, metric_tags};
 
-    use super::{sanitize_key, sanitize_sampling, ParseError, Parser};
-    use crate::event::metric::{Metric, MetricKind, MetricValue, StatisticKind};
+    use super::{ParseError, Parser, sanitize_key, sanitize_sampling};
+    use crate::{
+        event::metric::{Metric, MetricKind, MetricValue, StatisticKind},
+        sources::statsd::ConversionUnit,
+    };
 
-    const SANITIZING_PARSER: Parser = Parser::new(true);
+    const SANITIZING_PARSER: Parser = Parser::new(true, ConversionUnit::Seconds);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet contains an invalid StatsD metric.
     fn parse(packet: &str) -> Result<Metric, ParseError> {
         SANITIZING_PARSER.parse(packet)
     }
 
-    const NON_SANITIZING_PARSER: Parser = Parser::new(false);
+    const NON_CONVERTING_PARSER: Parser = Parser::new(true, ConversionUnit::Milliseconds);
+    fn parse_non_converting(packet: &str) -> Result<Metric, ParseError> {
+        NON_CONVERTING_PARSER.parse(packet)
+    }
+
+    const NON_SANITIZING_PARSER: Parser = Parser::new(false, ConversionUnit::Seconds);
     fn unsanitized_parse(packet: &str) -> Result<Metric, ParseError> {
         NON_SANITIZING_PARSER.parse(packet)
     }
@@ -352,6 +375,21 @@ mod test {
     }
 
     #[test]
+    fn sampled_timer_non_converting() {
+        assert_event_data_eq!(
+            parse_non_converting("glork:320|ms|@0.1"),
+            Ok(Metric::new(
+                "glork",
+                MetricKind::Incremental,
+                MetricValue::Distribution {
+                    samples: vector_lib::samples![320.0 => 10],
+                    statistic: StatisticKind::Histogram
+                },
+            )),
+        );
+    }
+
+    #[test]
     fn sampled_tagged_histogram() {
         assert_event_data_eq!(
             parse("glork:320|h|@0.1|#region:us-west1,production,e:"),
@@ -424,6 +462,15 @@ mod test {
     }
 
     #[test]
+    fn gauge_multibyte_utf8_prefix_is_error_not_panic() {
+        // A multi-byte UTF-8 character as the value prefix must return a parse
+        // error, not panic with "byte index 1 is not a char boundary".
+        let input = std::str::from_utf8(b"m:\xc3\xa9|g").unwrap();
+        assert!(parse(input).is_err());
+        assert!(parse("m:é|g").is_err());
+    }
+
+    #[test]
     fn sets() {
         assert_event_data_eq!(
             parse("uniques:765|s"),
@@ -449,6 +496,10 @@ mod test {
         );
     }
 
+    #[expect(
+        clippy::float_cmp,
+        reason = "These deterministic fixture values are compared exactly."
+    )]
     #[test]
     fn sanitizing_sampling() {
         assert_eq!(1.0, sanitize_sampling(0.0));

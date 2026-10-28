@@ -3,22 +3,34 @@
 use std::{collections::HashMap, io};
 
 use bytes::BytesMut;
-use serde_json::{json, to_vec, Map};
+use serde_json::{Map, json, to_vec};
 use vector_lib::lookup::lookup_v2::ConfigValuePath;
-use vrl::path::PathPrefix;
+use vrl::{event_path, path::PathPrefix};
 
+use super::config::{StackdriverLogName, default_labels_key};
 use crate::{
     sinks::{prelude::*, util::encoding::Encoder as SinkEncoder},
     template::TemplateRenderingError,
 };
 
-use super::config::{StackdriverLogName, StackdriverResource};
+#[derive(Clone, Debug)]
+pub(super) struct StackdriverLabelConfig {
+    pub(super) labels_key: Option<String>,
+    pub(super) labels: HashMap<String, UnconfinedTemplate>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StackdriverResource {
+    pub(super) type_: String,
+    pub(super) labels: HashMap<String, UnconfinedTemplate>,
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct StackdriverLogsEncoder {
     transformer: Transformer,
-    log_id: Template,
+    log_id: ConfinedTemplate,
     log_name: StackdriverLogName,
+    label_config: StackdriverLabelConfig,
     resource: StackdriverResource,
     severity_key: Option<ConfigValuePath>,
 }
@@ -27,8 +39,9 @@ impl StackdriverLogsEncoder {
     /// Creates a new `StackdriverLogsEncoder`.
     pub(super) const fn new(
         transformer: Transformer,
-        log_id: Template,
+        log_id: ConfinedTemplate,
         log_name: StackdriverLogName,
+        label_config: StackdriverLabelConfig,
         resource: StackdriverResource,
         severity_key: Option<ConfigValuePath>,
     ) -> Self {
@@ -36,13 +49,28 @@ impl StackdriverLogsEncoder {
             transformer,
             log_id,
             log_name,
+            label_config,
             resource,
             severity_key,
         }
     }
 
     pub(super) fn encode_event(&self, event: Event) -> Option<serde_json::Value> {
-        let mut labels = HashMap::with_capacity(self.resource.labels.len());
+        let mut labels = HashMap::with_capacity(self.label_config.labels.len());
+        for (key, template) in &self.label_config.labels {
+            let value = template
+                .render_string(&event)
+                .map_err(|error| {
+                    emit!(crate::internal_events::TemplateRenderingError {
+                        error,
+                        field: Some("labels"),
+                        drop_event: true,
+                    });
+                })
+                .ok()?;
+            labels.insert(key.clone(), value);
+        }
+        let mut resource_labels = HashMap::with_capacity(self.resource.labels.len());
         for (key, template) in &self.resource.labels {
             let value = template
                 .render_string(&event)
@@ -54,7 +82,7 @@ impl StackdriverLogsEncoder {
                     });
                 })
                 .ok()?;
-            labels.insert(key.clone(), value);
+            resource_labels.insert(key.clone(), value);
         }
         let log_name = self
             .log_name(&event)
@@ -72,8 +100,24 @@ impl StackdriverLogsEncoder {
             .severity_key
             .as_ref()
             .and_then(|key| log.remove((PathPrefix::Event, &key.0)))
-            .map(remap_severity)
-            .unwrap_or_else(|| 0.into());
+            .map_or_else(|| 0.into(), remap_severity);
+
+        let default_labels_key = default_labels_key();
+        let labels_key = self
+            .label_config
+            .labels_key
+            .as_deref()
+            .or(default_labels_key.as_deref())
+            .unwrap();
+
+        // merge log_labels in the specified labels_key into the labels map.
+        if let Some(Value::Object(log_labels)) = log.remove(event_path!(labels_key)) {
+            labels.extend(
+                log_labels
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string_lossy().into_owned())),
+            );
+        }
 
         let mut event = Event::Log(log);
         self.transformer.transform(&mut event);
@@ -84,11 +128,12 @@ impl StackdriverLogsEncoder {
         entry.insert("logName".into(), json!(log_name));
         entry.insert("jsonPayload".into(), json!(log));
         entry.insert("severity".into(), json!(severity));
+        entry.insert("labels".into(), json!(labels));
         entry.insert(
             "resource".into(),
             json!({
                 "type": self.resource.type_,
-                "labels": labels,
+                "labels": resource_labels,
             }),
         );
 
@@ -101,24 +146,29 @@ impl StackdriverLogsEncoder {
     }
 
     fn log_name(&self, event: &Event) -> Result<String, TemplateRenderingError> {
-        use StackdriverLogName::*;
+        use StackdriverLogName::{BillingAccount, Folder, Organization, Project};
 
         let log_id = self.log_id.render_string(event)?;
 
         Ok(match &self.log_name {
-            BillingAccount(acct) => format!("billingAccounts/{}/logs/{}", acct, log_id),
-            Folder(folder) => format!("folders/{}/logs/{}", folder, log_id),
-            Organization(org) => format!("organizations/{}/logs/{}", org, log_id),
-            Project(project) => format!("projects/{}/logs/{}", project, log_id),
+            BillingAccount(acct) => format!("billingAccounts/{acct}/logs/{log_id}"),
+            Folder(folder) => format!("folders/{folder}/logs/{log_id}"),
+            Organization(org) => format!("organizations/{org}/logs/{log_id}"),
+            Project(project) => format!("projects/{project}/logs/{log_id}"),
         })
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "Preserve severity conversion for out-of-range input."
+)]
 pub(super) fn remap_severity(severity: Value) -> Value {
     let n = match severity {
         Value::Integer(n) => n - n % 100,
-        Value::Bytes(s) => {
-            let s = String::from_utf8_lossy(&s);
+        value @ (Value::Bytes(_) | Value::String(_)) => {
+            let s = value.to_string_lossy();
             match s.parse::<usize>() {
                 Ok(n) => (n - n % 100) as i64,
                 Err(_) => match s.to_uppercase() {
@@ -134,8 +184,7 @@ pub(super) fn remap_severity(severity: Value) -> Value {
                     _ => {
                         warn!(
                             message = "Unknown severity value string, using DEFAULT.",
-                            value = %s,
-                            internal_log_rate_limit = true
+                            value = %s
                         );
                         0
                     }
@@ -145,8 +194,7 @@ pub(super) fn remap_severity(severity: Value) -> Value {
         value => {
             warn!(
                 message = "Unknown severity value type, using DEFAULT.",
-                ?value,
-                internal_log_rate_limit = true
+                ?value
             );
             0
         }
@@ -169,7 +217,7 @@ impl SinkEncoder<Vec<Event>> for StackdriverLogsEncoder {
             let size = event.estimated_json_encoded_size_of();
             if let Some(data) = self.encode_event(event.clone()) {
                 byte_size.add_event(event, size);
-                entries.push(data)
+                entries.push(data);
             } else {
                 // encode_event() emits the `TemplateRenderingError` internal event,
                 // which emits an `EventsDropped`, so no need to here.

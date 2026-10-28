@@ -19,13 +19,18 @@ pub struct SnappyEncoder<W: io::Write> {
 }
 
 impl<W: io::Write> SnappyEncoder<W> {
-    pub fn new(writer: W) -> Self {
+    pub const fn new(writer: W) -> Self {
         Self {
             writer,
             buffer: Vec::new(),
         }
     }
 
+    /// Compresses the buffered data and returns the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compression or writing fails.
     pub fn finish(mut self) -> io::Result<W> {
         let mut encoder = Encoder::new();
         let compressed = encoder.compress_vec(&self.buffer)?;
@@ -39,7 +44,7 @@ impl<W: io::Write> SnappyEncoder<W> {
         &self.writer
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 }

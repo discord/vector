@@ -1,14 +1,19 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
-use pulsar::producer::Message;
-use pulsar::{Error as PulsarError, Executor, MultiTopicProducer, ProducerOptions, Pulsar};
+use pulsar::{
+    Error as PulsarError, Executor, MultiTopicProducer, ProducerOptions, Pulsar, producer::Message,
+};
 use tokio::sync::Mutex;
 
-use crate::internal_events::PulsarSendingError;
-use crate::sinks::{prelude::*, pulsar::request_builder::PulsarMetadata};
+use crate::{
+    internal_events::PulsarSendingError,
+    sinks::{prelude::*, pulsar::request_builder::PulsarMetadata},
+};
 
 #[derive(Clone)]
 pub(super) struct PulsarRequest {
@@ -60,7 +65,7 @@ pub struct PulsarService<Exe: Executor> {
 
 impl<Exe: Executor> PulsarService<Exe> {
     pub(crate) fn new(
-        pulsar_client: Pulsar<Exe>,
+        pulsar_client: &Pulsar<Exe>,
         producer_options: ProducerOptions,
         producer_name: Option<String>,
     ) -> PulsarService<Exe> {
@@ -93,11 +98,7 @@ impl<Exe: Executor> Service<PulsarRequest> for PulsarService<Exe> {
     fn call(&mut self, request: PulsarRequest) -> Self::Future {
         let producer = Arc::clone(&self.producer);
         let topic = request.metadata.topic.clone();
-        let event_time = request
-            .metadata
-            .timestamp_millis
-            .to_owned()
-            .map(|t| t as u64);
+        let event_time = request.metadata.timestamp_millis.map(i64::cast_unsigned);
 
         Box::pin(async move {
             let body = request.body.clone();
@@ -129,11 +130,7 @@ impl<Exe: Executor> Service<PulsarRequest> for PulsarService<Exe> {
             // `poll_ready()`. This sink is already limited to sequential request handling due to
             // the pulsar API, so this shouldn't impact performance from a concurrent requests
             // standpoint.
-            let fut = producer
-                .lock()
-                .await
-                .send_non_blocking(topic, message)
-                .await;
+            let fut = Box::pin(producer.lock().await.send_non_blocking(topic, message)).await;
 
             match fut {
                 Ok(resp) => match resp.await {

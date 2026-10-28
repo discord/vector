@@ -23,7 +23,6 @@ mod tests {
     use vector_lib::event::MetricKind;
 
     use super::StatsdNormalizer;
-
     use crate::test_util::metrics::{
         assert_normalize, generate_f64s, get_aggregated_histogram, get_distribution, get_gauge,
         tests,
@@ -52,7 +51,7 @@ mod tests {
     #[test]
     fn incremental_gauge() {
         let first_value = 3.14;
-        let second_value = 8.675309;
+        let second_value = 8.675_309;
 
         let gauges = vec![
             get_gauge(first_value, MetricKind::Incremental),
@@ -71,7 +70,7 @@ mod tests {
     #[test]
     fn mixed_gauge() {
         let first_value = 3.14;
-        let second_value = 8.675309;
+        let second_value = 8.675_309;
         let third_value = 16.19;
 
         let gauges = vec![

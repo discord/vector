@@ -1,39 +1,44 @@
-use crate::encoding::format::common::get_serializer_schema_requirement;
 use bytes::{BufMut, BytesMut};
 use tokio_util::codec::Encoder;
+use vector_config_macros::configurable_component;
 use vector_core::{config::DataType, event::Event, schema};
 
-use crate::MetricTagValues;
+use crate::{MetricTagValues, encoding::format::common::get_serializer_schema_requirement};
 
 /// Config used to build a `TextSerializer`.
-#[crate::configurable_component]
+#[configurable_component]
 #[derive(Debug, Clone, Default)]
 pub struct TextSerializerConfig {
     /// Controls how metric tag values are encoded.
     ///
     /// When set to `single`, only the last non-bare value of tags are displayed with the
     /// metric.  When set to `full`, all metric tags are exposed as separate assignments.
+    /// When set to `auto`, tag values are encoded using their underlying shape.
     #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub metric_tag_values: MetricTagValues,
 }
 
 impl TextSerializerConfig {
     /// Creates a new `TextSerializerConfig`.
+    #[must_use]
     pub const fn new(metric_tag_values: MetricTagValues) -> Self {
         Self { metric_tag_values }
     }
 
     /// Build the `TextSerializer` from this configuration.
+    #[must_use]
     pub const fn build(&self) -> TextSerializer {
         TextSerializer::new(self.metric_tag_values)
     }
 
     /// The data type of events that are accepted by `TextSerializer`.
+    #[must_use]
     pub fn input_type(&self) -> DataType {
         DataType::Log | DataType::Metric
     }
 
     /// The schema required by the serializer.
+    #[must_use]
     pub fn schema_requirement(&self) -> schema::Requirement {
         get_serializer_schema_requirement()
     }
@@ -51,6 +56,7 @@ pub struct TextSerializer {
 
 impl TextSerializer {
     /// Creates a new `TextSerializer`.
+    #[must_use]
     pub const fn new(metric_tag_values: MetricTagValues) -> Self {
         Self { metric_tag_values }
     }
@@ -62,7 +68,7 @@ impl Encoder<Event> for TextSerializer {
     fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
         match event {
             Event::Log(log) => {
-                if let Some(bytes) = log.get_message().map(|value| value.coerce_to_bytes()) {
+                if let Some(bytes) = log.get_message().map(vrl::value::Value::coerce_to_bytes) {
                     buffer.put(bytes);
                 }
             }
@@ -74,7 +80,7 @@ impl Encoder<Event> for TextSerializer {
                 buffer.put(bytes.as_ref());
             }
             Event::Trace(_) => {}
-        };
+        }
 
         Ok(())
     }
@@ -83,8 +89,10 @@ impl Encoder<Event> for TextSerializer {
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};
-    use vector_core::event::{LogEvent, Metric, MetricKind, MetricValue};
-    use vector_core::metric_tags;
+    use vector_core::{
+        event::{LogEvent, Metric, MetricKind, MetricValue},
+        metric_tags,
+    };
 
     use super::*;
 
@@ -152,6 +160,11 @@ mod tests {
         )
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Keep the existing owned-argument API during the lint rollout."
+    )]
     fn serialize(config: TextSerializerConfig, input: Event) -> Bytes {
         let mut buffer = BytesMut::new();
         config.build().encode(input, &mut buffer).unwrap();

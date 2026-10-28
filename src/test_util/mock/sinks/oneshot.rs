@@ -1,17 +1,17 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::{StreamExt, stream::BoxStream};
 use tokio::sync::oneshot::Sender;
-use vector_lib::configurable::configurable_component;
 use vector_lib::{
     config::{AcknowledgementsConfig, Input},
+    configurable::configurable_component,
     event::EventArray,
     sink::{StreamSink, VectorSink},
 };
 
 use crate::{
-    config::{SinkConfig, SinkContext},
+    config::{SinkConfig, SinkContext, ValidatedSink},
     sinks::Healthcheck,
 };
 
@@ -26,6 +26,7 @@ pub struct OneshotSinkConfig {
 impl_generate_config_from_default!(OneshotSinkConfig);
 
 impl OneshotSinkConfig {
+    #[must_use]
     pub fn new(tx: Sender<EventArray>) -> Self {
         Self {
             tx: Arc::new(Mutex::new(Some(tx))),
@@ -43,17 +44,30 @@ impl SinkConfig for OneshotSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &AcknowledgementsConfig::DEFAULT
     }
+}
 
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+#[async_trait]
+impl ValidatedSink for OneshotSinkConfig {
+    type Validated = ();
+
+    fn validate(&self) -> crate::Result<Self::Validated> {
+        Ok(())
+    }
+
+    async fn build(
+        &self,
+        _validated: &Self::Validated,
+        _cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
         let tx = {
             let mut guard = self.tx.lock().expect("who cares if the lock is poisoned");
             guard.take()
         };
-        let sink = Box::new(OneshotSink { tx });
+        let sink = OneshotSink { tx };
 
         let healthcheck = Box::pin(async { Ok(()) });
 
-        Ok((VectorSink::Stream(sink), healthcheck))
+        Ok((VectorSink::from_streamsink(sink), healthcheck))
     }
 }
 

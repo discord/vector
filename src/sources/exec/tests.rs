@@ -1,13 +1,12 @@
-use crate::sources::exec::*;
-use crate::{event::LogEvent, test_util::trace_init};
+use std::{ffi::OsStr, io::Cursor};
+
 use bytes::Bytes;
-use std::ffi::OsStr;
-use std::io::Cursor;
+#[cfg(unix)]
+use futures::task::Poll;
 use vector_lib::event::EventMetadata;
 use vrl::value;
 
-#[cfg(unix)]
-use futures::task::Poll;
+use crate::{event::LogEvent, sources::exec::*, test_util::trace_init};
 
 #[test]
 fn test_generate_config() {
@@ -84,10 +83,11 @@ fn test_scheduled_handle_event_vector_namespace() {
         meta.get(path!("vector", "source_type")).unwrap(),
         &value!("exec")
     );
-    assert!(meta
-        .get(path!("vector", "ingest_timestamp"))
-        .unwrap()
-        .is_timestamp());
+    assert!(
+        meta.get(path!("vector", "ingest_timestamp"))
+            .unwrap()
+            .is_timestamp()
+    );
 }
 
 #[test]
@@ -160,10 +160,11 @@ fn test_streaming_create_event_vector_namespace() {
         meta.get(path!("vector", "source_type")).unwrap(),
         &value!("exec")
     );
-    assert!(meta
-        .get(path!("vector", "ingest_timestamp"))
-        .unwrap()
-        .is_timestamp());
+    assert!(
+        meta.get(path!("vector", "ingest_timestamp"))
+            .unwrap()
+            .is_timestamp()
+    );
 }
 
 #[test]
@@ -194,8 +195,8 @@ fn test_build_command() {
     expected_command.args(vec!["arg1".to_owned(), "arg2".to_owned()]);
 
     // Unfortunately the current_dir is not included in the formatted string
-    let expected_command_string = format!("{:?}", expected_command);
-    let command_string = format!("{:?}", command);
+    let expected_command_string = format!("{expected_command:?}");
+    let command_string = format!("{command:?}");
 
     assert_eq!(expected_command_string, command_string);
 }
@@ -264,7 +265,7 @@ async fn test_spawn_reader_thread() {
 
     let buf = Cursor::new("hello world\nhello rocket 🚀");
     let reader = BufReader::new(buf);
-    let decoder = crate::codecs::Decoder::default();
+    let decoder = vector_lib::codecs::Decoder::default();
     let (sender, mut receiver) = channel(1024);
 
     spawn_reader_thread(reader, decoder, STDOUT, sender);
@@ -301,7 +302,7 @@ async fn test_spawn_reader_thread() {
 async fn test_drop_receiver() {
     let config = standard_scheduled_test_config();
     let hostname = Some("Some.Machine".to_string());
-    let decoder = Default::default();
+    let decoder = Decoder::default();
     let shutdown = ShutdownSignal::noop();
     let (tx, rx) = SourceSender::new_test();
 
@@ -329,6 +330,7 @@ async fn test_drop_receiver() {
 
 #[tokio::test]
 #[cfg(unix)]
+#[cfg_attr(target_os = "macos", ignore = "Flaky when running cargo test on macOS")]
 async fn test_run_command_linux() {
     let config = standard_scheduled_test_config();
 
@@ -336,7 +338,7 @@ async fn test_run_command_linux() {
         &crate::test_util::components::SOURCE_TAGS,
         async {
             let hostname = Some("Some.Machine".to_string());
-            let decoder = Default::default();
+            let decoder = Decoder::default();
             let shutdown = ShutdownSignal::noop();
             let (tx, rx) = SourceSender::new_test();
 
@@ -370,7 +372,7 @@ async fn test_run_command_linux() {
         assert_eq!(*log.get_source_type().unwrap(), "exec".into());
         assert_eq!(*log.get_message().unwrap(), "Hello World!".into());
         assert_eq!(*log.get_host().unwrap(), "Some.Machine".into());
-        assert!(log.get(PID_KEY).is_some());
+        assert!(log.get(vrl::event_path!(PID_KEY)).is_some());
         assert!(log.get_timestamp().is_some());
 
         assert_eq!(8, log.all_event_fields().unwrap().count());
@@ -388,11 +390,11 @@ async fn test_graceful_shutdown() {
         String::from("bash"),
         String::from("-c"),
         String::from(
-            r#"trap 'echo signal received ; sleep 1; echo slept ; exit' SIGTERM; while true ; do sleep 10 ; done"#,
+            r"trap 'echo signal received ; sleep 1; echo slept ; exit' SIGTERM; while true ; do sleep 10 ; done",
         ),
     ];
     let hostname = Some("Some.Machine".to_string());
-    let decoder = Default::default();
+    let decoder = Decoder::default();
     let (trigger, shutdown, _) = ShutdownSignal::new_wired();
     let (tx, mut rx) = SourceSender::new_test();
 
@@ -436,7 +438,7 @@ async fn test_graceful_shutdown() {
 }
 
 fn standard_scheduled_test_config() -> ExecConfig {
-    Default::default()
+    ExecConfig::default()
 }
 
 fn standard_streaming_test_config() -> ExecConfig {

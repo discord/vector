@@ -1,21 +1,19 @@
 use std::marker::PhantomData;
-use vector_lib::lookup::lookup_v2::ConfigValuePath;
 
-use vector_lib::stream::BatcherSettings;
+use vector_lib::{lookup::lookup_v2::ConfigValuePath, stream::BatcherSettings};
 
+use super::{
+    KinesisResponse, KinesisService,
+    record::{Record, SendRecord},
+    request_builder::KinesisRequestBuilder,
+    sink::{BatchKinesisRequest, KinesisSink},
+};
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
     sinks::{
         prelude::*,
-        util::{retries::RetryLogic, TowerRequestConfig},
+        util::{TowerRequestConfig, retries::RetryLogic},
     },
-};
-
-use super::{
-    record::{Record, SendRecord},
-    request_builder::KinesisRequestBuilder,
-    sink::{BatchKinesisRequest, KinesisSink},
-    KinesisResponse, KinesisService,
 };
 
 /// Base configuration for the `aws_kinesis_` sinks.
@@ -32,33 +30,25 @@ pub struct KinesisSinkBaseConfig {
     pub stream_name: String,
 
     #[serde(flatten)]
-    #[configurable(derived)]
     pub region: RegionOrEndpoint,
 
-    #[configurable(derived)]
     pub encoding: EncodingConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub compression: Compression,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub request: TowerRequestConfig,
 
-    #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub auth: AwsAuthentication,
 
     /// Whether or not to retry successful requests containing partial failures.
     #[serde(default)]
-    #[configurable(metadata(docs::advanced))]
     pub request_retry_partial: bool,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -74,16 +64,21 @@ pub struct KinesisSinkBaseConfig {
 }
 
 impl KinesisSinkBaseConfig {
+    #[must_use]
     pub fn input(&self) -> Input {
         Input::new(self.encoding.config().input_type() & DataType::Log)
     }
 
+    #[must_use]
     pub const fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
 }
 
-/// Builds an aws_kinesis sink.
+/// Builds an AWS Kinesis sink.
+///
+/// # Errors
+/// Returns an error if the configured serializer cannot be built.
 pub fn build_sink<C, R, RR, E, RT>(
     config: &KinesisSinkBaseConfig,
     partition_key_field: Option<ConfigValuePath>,
@@ -99,7 +94,7 @@ where
     R: Send + 'static,
     RR: Record + Record<T = R> + Clone + Send + Sync + Unpin + 'static,
     E: Send + 'static,
-    RT: RetryLogic<Response = KinesisResponse> + Default,
+    RT: RetryLogic<Request = BatchKinesisRequest<RR>, Response = KinesisResponse> + Default,
 {
     let request_limits = config.request.into_settings();
 

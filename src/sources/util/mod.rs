@@ -1,6 +1,8 @@
 #![allow(missing_docs)]
 #[cfg(feature = "sources-http_server")]
 mod body_decoding;
+pub mod decompression;
+#[cfg(feature = "sources-file")]
 mod encoding_config;
 #[cfg(all(unix, feature = "sources-dnstap"))]
 pub mod framestream;
@@ -9,14 +11,22 @@ pub mod grpc;
 #[cfg(any(
     feature = "sources-utils-http-auth",
     feature = "sources-utils-http-encoding",
-    feature = "sources-utils-http-error",
+    feature = "sources-utils-http-headers",
     feature = "sources-utils-http-prelude",
     feature = "sources-utils-http-query"
 ))]
 pub mod http;
-#[cfg(any(feature = "sources-http_client", feature = "sources-prometheus-scrape",))]
+#[cfg(any(
+    feature = "sources-http_client",
+    feature = "sources-prometheus_scrape",
+    feature = "sources-okta"
+))]
 pub mod http_client;
-#[cfg(any(feature = "sources-aws_sqs", feature = "sources-gcp_pubsub"))]
+#[cfg(any(
+    feature = "sources-aws_sqs",
+    feature = "sources-gcp_pubsub",
+    feature = "sources-mqtt"
+))]
 mod message_decoding;
 pub mod multiline_config;
 #[cfg(any(feature = "sources-utils-net-tcp", feature = "sources-utils-net-udp"))]
@@ -32,6 +42,7 @@ mod unix_datagram;
 mod unix_stream;
 mod wrappers;
 
+pub use decompression::{max_decompressed_size_bytes, set_max_decompressed_size_bytes};
 #[cfg(feature = "sources-file")]
 pub use encoding_config::EncodingConfig;
 pub use multiline_config::MultilineConfig;
@@ -44,32 +55,34 @@ pub use unix::change_socket_permissions;
 pub use unix_datagram::build_unix_datagram_source;
 #[cfg(all(unix, feature = "sources-utils-net-unix",))]
 pub use unix_stream::build_unix_stream_source;
-pub use wrappers::{AfterRead, AfterReadExt};
+pub use wrappers::{AfterRead, AfterReadExt, LenientFramedRead};
 
 #[cfg(feature = "sources-http_server")]
 pub use self::body_decoding::Encoding;
+#[cfg(feature = "sources-utils-http-prelude")]
+pub use self::http::HttpSource;
+#[cfg(feature = "sources-utils-http-headers")]
+pub use self::http::add_headers;
 #[cfg(feature = "sources-utils-http-query")]
 pub use self::http::add_query_parameters;
 #[cfg(any(
-    feature = "sources-prometheus-scrape",
-    feature = "sources-prometheus-remote-write",
+    feature = "sources-prometheus_scrape",
+    feature = "sources-prometheus_remote_write",
     feature = "sources-utils-http-encoding"
 ))]
-pub use self::http::decode;
-#[cfg(feature = "sources-utils-http-error")]
-pub use self::http::ErrorMessage;
-#[cfg(feature = "sources-utils-http-prelude")]
-pub use self::http::HttpSource;
-#[cfg(feature = "sources-utils-http-auth")]
-pub use self::http::HttpSourceAuthConfig;
-#[cfg(any(feature = "sources-aws_sqs", feature = "sources-gcp_pubsub"))]
+pub use self::http::decompress_body;
+#[cfg(any(
+    feature = "sources-aws_sqs",
+    feature = "sources-gcp_pubsub",
+    feature = "sources-mqtt"
+))]
 pub use self::message_decoding::decode_message;
 
 /// Extract a tag and it's value from input string delimited by a colon character.
 ///
 /// Note: the behavior of StatsD if more than one colon is found (which would presumably
 /// be part of the tag value), is to remove any additional colons from the tag value.
-/// Thus Vector expects only one colon character to be present per chunk, so the find()
+/// Thus Vector expects only one colon character to be present per chunk, so the `find()`
 /// operation locating the first position is sufficient.
 #[cfg(any(feature = "sources-statsd", feature = "sources-datadog_agent"))]
 pub fn extract_tag_key_and_value<S: AsRef<str>>(

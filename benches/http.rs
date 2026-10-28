@@ -1,27 +1,35 @@
 use std::net::SocketAddr;
 
-use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group};
 use futures::TryFutureExt;
 use hyper::{
-    service::{make_service_fn, service_fn},
     Body, Response, Server,
+    service::{make_service_fn, service_fn},
 };
 use tokio::runtime::Runtime;
 use vector::{
-    config, sinks,
-    sinks::util::{BatchConfig, Compression},
+    Error, config,
+    sinks::{
+        self,
+        util::{BatchConfig, Compression},
+    },
     sources,
-    test_util::{next_addr, random_lines, runtime, send_lines, start_topology, wait_for_tcp},
-    Error,
+    template::UriTemplate,
+    test_util::{addr::next_addr, random_lines, runtime, send_lines, start_topology, wait_for_tcp},
 };
-use vector_lib::codecs::{encoding::FramingConfig, TextSerializerConfig};
+use vector_lib::codecs::{TextSerializerConfig, encoding::FramingConfig};
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::default_trait_access,
+    reason = "Keep inferred defaults where concrete type names need a separate import or API cleanup."
+)]
 fn benchmark_http(c: &mut Criterion) {
     let num_lines: usize = 1_000;
     let line_size: usize = 100;
 
-    let in_addr = next_addr();
-    let out_addr = next_addr();
+    let (_guard_0, in_addr) = next_addr();
+    let (_guard_1, out_addr) = next_addr();
 
     let _srv = serve(out_addr);
 
@@ -29,7 +37,7 @@ fn benchmark_http(c: &mut Criterion) {
     group.throughput(Throughput::Bytes((num_lines * line_size) as u64));
     group.sampling_mode(SamplingMode::Flat);
 
-    for compression in [Compression::None, Compression::gzip_default()].iter() {
+    for compression in &[Compression::None, Compression::gzip_default()] {
         group.bench_with_input(
             BenchmarkId::new("compression", compression),
             compression,
@@ -48,19 +56,20 @@ fn benchmark_http(c: &mut Criterion) {
                             "out",
                             &["in"],
                             sinks::http::config::HttpSinkConfig {
-                                uri: out_addr.to_string().parse::<http::Uri>().unwrap().into(),
+                                uri: UriTemplate::try_from(format!("http://{out_addr}")).unwrap(),
                                 compression: *compression,
                                 method: Default::default(),
-                                auth: Default::default(),
-                                headers: Default::default(),
-                                payload_prefix: Default::default(),
-                                payload_suffix: Default::default(),
+                                auth: Option::default(),
+                                payload_prefix: String::default(),
+                                payload_suffix: String::default(),
                                 batch,
                                 encoding: (None::<FramingConfig>, TextSerializerConfig::default())
                                     .into(),
                                 request: Default::default(),
-                                tls: Default::default(),
+                                tls: Option::default(),
                                 acknowledgements: Default::default(),
+                                retry_strategy: Default::default(),
+                                confinement: Default::default(),
                             },
                         );
 
@@ -78,10 +87,10 @@ fn benchmark_http(c: &mut Criterion) {
                             let lines = random_lines(line_size).take(num_lines);
                             send_lines(in_addr, lines).await.unwrap();
                             topology.stop().await;
-                        })
+                        });
                     },
                     BatchSize::PerIteration,
-                )
+                );
             },
         );
     }
@@ -100,7 +109,7 @@ fn serve(addr: SocketAddr) -> Runtime {
 
         Server::bind(&addr)
             .serve(make_service)
-            .map_err(|e| panic!("{}", e))
+            .map_err(|e| panic!("{e}"))
             .await
     });
     rt

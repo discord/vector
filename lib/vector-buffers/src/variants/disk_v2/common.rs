@@ -30,6 +30,9 @@ pub const MINIMUM_MAX_RECORD_SIZE: usize = align16(RECORD_HEADER_LEN + 1);
 // have it configured.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+// Reclaimation interval on deletion of data files that contain 100% completey acknowledged events.
+pub const DEFAULT_DATA_FILE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+
 // Using 256KB as it aligns nicely with the I/O size exposed by major cloud providers.  This may not
 // be the underlying block size used by the OS, but it still aligns well with what will happen on
 // the "backend" for cloud providers, which is simply a useful default for when we want to look at
@@ -43,6 +46,29 @@ pub const DEFAULT_WRITE_BUFFER_SIZE: usize = 256 * 1024;
 pub const MAX_FILE_ID: u16 = u16::MAX;
 #[cfg(test)]
 pub const MAX_FILE_ID: u16 = 6;
+
+pub(crate) fn data_file_id_in_range(file_id: u16, start: u16, end: u16) -> bool {
+    if start <= end {
+        (start..=end).contains(&file_id)
+    } else {
+        file_id >= start || file_id <= end
+    }
+}
+
+pub(crate) fn data_file_name(file_id: u16) -> String {
+    format!("buffer-data-{file_id}.dat")
+}
+
+pub(crate) fn parse_data_file_id(path: &Path) -> Option<u16> {
+    let file_name = path.file_name()?.to_str()?;
+    let id = file_name
+        .strip_prefix("buffer-data-")?
+        .strip_suffix(".dat")?
+        .parse()
+        .ok()?;
+
+    (id < MAX_FILE_ID).then_some(id)
+}
 
 // The alignment used by the record serializer.
 const SERIALIZER_ALIGNMENT: usize = 16;
@@ -64,7 +90,7 @@ pub(crate) const fn align16(amount: usize) -> usize {
         "`amount` must be less than `MAX_ALIGNABLE_AMOUNT`"
     );
 
-    ((amount + SERIALIZER_ALIGNMENT - 1) / SERIALIZER_ALIGNMENT) * SERIALIZER_ALIGNMENT
+    amount.div_ceil(SERIALIZER_ALIGNMENT) * SERIALIZER_ALIGNMENT
 }
 
 /// Gets the maximum possible data file size given the type-level numerical limits and buffer invariants.
@@ -208,7 +234,6 @@ where
     ///
     /// Defaults to `usize::MAX`, or effectively no limit.  Due to the internal design of the
     /// buffer, the effective maximum limit is around `max_data_file_size` * 2^16.
-    #[allow(dead_code)]
     pub fn max_buffer_size(mut self, amount: u64) -> Self {
         self.max_buffer_size = Some(amount);
         self
@@ -340,7 +365,7 @@ where
         if max_record_size <= MINIMUM_MAX_RECORD_SIZE {
             return Err(BuildError::InvalidParameter {
                 param_name: "max_record_size",
-                reason: format!("must be greater than or equal to {MINIMUM_MAX_RECORD_SIZE} bytes",),
+                reason: format!("must be greater than or equal to {MINIMUM_MAX_RECORD_SIZE} bytes"),
             });
         }
 
@@ -421,11 +446,10 @@ where
 mod tests {
     use proptest::{prop_assert, proptest, test_runner::Config};
 
-    use crate::variants::disk_v2::common::MAX_ALIGNABLE_AMOUNT;
-
     use super::{
-        align16, BuildError, DiskBufferConfigBuilder, MINIMUM_MAX_RECORD_SIZE, SERIALIZER_ALIGNMENT,
+        BuildError, DiskBufferConfigBuilder, MINIMUM_MAX_RECORD_SIZE, SERIALIZER_ALIGNMENT, align16,
     };
+    use crate::variants::disk_v2::common::MAX_ALIGNABLE_AMOUNT;
 
     #[test]
     #[should_panic(expected = "`amount` must be less than `MAX_ALIGNABLE_AMOUNT`")]
@@ -448,7 +472,7 @@ mod tests {
 
             // Make sure we're actually aligned.
             let aligned = align16(input);
-            prop_assert!(aligned % SERIALIZER_ALIGNMENT == 0);
+            prop_assert!(aligned.is_multiple_of(SERIALIZER_ALIGNMENT));
 
             // Make sure we're not overaligned, too.
             let delta = if aligned >= input {

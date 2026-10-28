@@ -1,17 +1,21 @@
 #![allow(missing_docs)]
 use indexmap::map::IndexMap;
 use serde::{Deserialize, Serialize};
-use vector_lib::codecs::{
-    decoding::{DeserializerConfig, FramingConfig},
-    BytesDecoderConfig, BytesDeserializerConfig,
-};
-use vector_lib::configurable::configurable_component;
 pub use vector_lib::serde::{bool_or_struct, is_default};
+use vector_lib::{
+    codecs::{
+        BytesDecoderConfig, BytesDeserializerConfig,
+        decoding::{DeserializerConfig, FramingConfig},
+    },
+    configurable::configurable_component,
+};
 
+#[must_use]
 pub const fn default_true() -> bool {
     true
 }
 
+#[must_use]
 pub const fn default_false() -> bool {
     false
 }
@@ -19,14 +23,17 @@ pub const fn default_false() -> bool {
 /// The default max length of the input buffer.
 ///
 /// Any input exceeding this limit will be discarded.
-pub fn default_max_length() -> usize {
-    bytesize::kib(100u64) as usize
+#[must_use]
+pub const fn default_max_length() -> usize {
+    100 * 1024
 }
 
+#[must_use]
 pub fn default_framing_message_based() -> FramingConfig {
     BytesDecoderConfig::new().into()
 }
 
+#[must_use]
 pub fn default_decoding() -> DeserializerConfig {
     BytesDeserializerConfig::new().into()
 }
@@ -90,7 +97,7 @@ impl<V: 'static> Fields<V> {
                     FieldsOrValue::Value(v) => Box::new(std::iter::once((k, v))),
                     FieldsOrValue::Fields(f) => Box::new(
                         f.all_fields()
-                            .map(move |(nested_k, v)| (format!("{}.{}", k, nested_k), v)),
+                            .map(move |(nested_k, v)| (format!("{k}.{nested_k}"), v)),
                     ),
                 }
             })

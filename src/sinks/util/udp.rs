@@ -1,33 +1,31 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    time::Duration,
 };
 
 use async_trait::async_trait;
-use bytes::BytesMut;
-use futures::{stream::BoxStream, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, stream::BoxStream};
 use snafu::{ResultExt, Snafu};
 use tokio::{net::UdpSocket, time::sleep};
 use tokio_util::codec::Encoder;
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{ByteSize, BytesSent, InternalEventHandle, Protocol, Registered};
-use vector_lib::EstimatedJsonEncodedSizeOf;
+use vector_lib::{
+    codecs::encoding::Chunker,
+    configurable::configurable_component,
+    internal_event::{BytesSent, Protocol, Registered},
+};
 
-use super::SinkBuildError;
+use super::{
+    SinkBuildError,
+    datagram::{DatagramSocket, send_datagrams},
+};
 use crate::{
     codecs::Transformer,
+    common::backoff::ExponentialBackoff,
     dns,
-    event::{Event, EventStatus, Finalizable},
-    internal_events::{
-        SocketEventsSent, SocketMode, SocketSendError, UdpSendIncompleteError,
-        UdpSocketConnectionEstablished, UdpSocketOutgoingConnectionError,
-    },
+    event::Event,
+    internal_events::{UdpSocketConnectionEstablished, UdpSocketOutgoingConnectionError},
     net,
-    sinks::{
-        util::{retries::ExponentialBackoff, StreamSink},
-        Healthcheck, VectorSink,
-    },
+    sinks::{Healthcheck, VectorSink, util::StreamSink},
 };
 
 #[derive(Debug, Snafu)]
@@ -64,6 +62,7 @@ pub struct UdpSinkConfig {
 }
 
 impl UdpSinkConfig {
+    #[must_use]
     pub const fn from_address(address: String) -> Self {
         Self {
             address,
@@ -71,24 +70,43 @@ impl UdpSinkConfig {
         }
     }
 
-    fn build_connector(&self) -> crate::Result<UdpConnector> {
+    /// Parses the configured address into its host and port components.
+    ///
+    /// The address must include a port; this is a pure check (no network I/O)
+    /// shared by validation and `build_connector`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address is invalid or lacks a host or valid port.
+    pub fn parse_address(&self) -> crate::Result<(String, u16)> {
         let uri = self.address.parse::<http::Uri>()?;
         let host = uri.host().ok_or(SinkBuildError::MissingHost)?.to_string();
         let port = uri.port_u16().ok_or(SinkBuildError::MissingPort)?;
+        Ok((host, port))
+    }
+
+    fn build_connector(&self) -> crate::Result<UdpConnector> {
+        let (host, port) = self.parse_address()?;
         Ok(UdpConnector::new(host, port, self.send_buffer_bytes))
     }
 
+    /// Builds the sink and its healthcheck.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address is invalid or lacks a host or valid port.
     pub fn build(
         &self,
         transformer: Transformer,
         encoder: impl Encoder<Event, Error = vector_lib::codecs::encoding::Error>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+        chunker: Option<Chunker>,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let connector = self.build_connector()?;
-        let sink = UdpSink::new(connector.clone(), transformer, encoder);
+        let sink = UdpSink::new(connector.clone(), transformer, encoder, chunker);
         Ok((
             VectorSink::from_event_streamsink(sink),
             async move { connector.healthcheck().await }.boxed(),
@@ -112,11 +130,9 @@ impl UdpConnector {
         }
     }
 
-    const fn fresh_backoff() -> ExponentialBackoff {
+    fn fresh_backoff() -> ExponentialBackoff {
         // TODO: make configurable
-        ExponentialBackoff::from_millis(2)
-            .factor(250)
-            .max_delay(Duration::from_secs(60))
+        ExponentialBackoff::default()
     }
 
     async fn connect(&self) -> Result<UdpSocket, UdpError> {
@@ -132,10 +148,10 @@ impl UdpConnector {
 
         let socket = UdpSocket::bind(bind_address).await.context(BindSnafu)?;
 
-        if let Some(send_buffer_bytes) = self.send_buffer_bytes {
-            if let Err(error) = net::set_send_buffer_size(&socket, send_buffer_bytes) {
-                warn!(message = "Failed configuring send buffer size on UDP socket.", %error);
-            }
+        if let Some(send_buffer_bytes) = self.send_buffer_bytes
+            && let Err(error) = net::set_send_buffer_size(&socket, send_buffer_bytes)
+        {
+            warn!(message = "Failed configuring send buffer size on UDP socket.", %error);
         }
 
         socket.connect(addr).await.context(ConnectSnafu)?;
@@ -171,6 +187,7 @@ where
     connector: UdpConnector,
     transformer: Transformer,
     encoder: E,
+    chunker: Option<Chunker>,
     bytes_sent: Registered<BytesSent>,
 }
 
@@ -178,11 +195,17 @@ impl<E> UdpSink<E>
 where
     E: Encoder<Event, Error = vector_lib::codecs::encoding::Error> + Clone + Send + Sync,
 {
-    fn new(connector: UdpConnector, transformer: Transformer, encoder: E) -> Self {
+    fn new(
+        connector: UdpConnector,
+        transformer: Transformer,
+        encoder: E,
+        chunker: Option<Chunker>,
+    ) -> Self {
         Self {
             connector,
             transformer,
             encoder,
+            chunker,
             bytes_sent: register!(BytesSent::from(Protocol::UDP)),
         }
     }
@@ -197,57 +220,22 @@ where
         let mut input = input.peekable();
 
         let mut encoder = self.encoder.clone();
+        let chunker = self.chunker.clone();
         while Pin::new(&mut input).peek().await.is_some() {
-            let mut socket = self.connector.connect_backoff().await;
-            while let Some(mut event) = input.next().await {
-                let byte_size = event.estimated_json_encoded_size_of();
-
-                self.transformer.transform(&mut event);
-
-                let finalizers = event.take_finalizers();
-                let mut bytes = BytesMut::new();
-
-                // Errors are handled by `Encoder`.
-                if encoder.encode(event, &mut bytes).is_err() {
-                    continue;
-                }
-
-                match udp_send(&mut socket, &bytes).await {
-                    Ok(()) => {
-                        emit!(SocketEventsSent {
-                            mode: SocketMode::Udp,
-                            count: 1,
-                            byte_size,
-                        });
-
-                        self.bytes_sent.emit(ByteSize(bytes.len()));
-                        finalizers.update_status(EventStatus::Delivered);
-                    }
-                    Err(error) => {
-                        emit!(SocketSendError {
-                            mode: SocketMode::Udp,
-                            error
-                        });
-                        finalizers.update_status(EventStatus::Errored);
-                        break;
-                    }
-                }
-            }
+            let socket = self.connector.connect_backoff().await;
+            send_datagrams(
+                &mut input,
+                DatagramSocket::Udp(socket),
+                &self.transformer,
+                &mut encoder,
+                &chunker,
+                &self.bytes_sent,
+            )
+            .await;
         }
 
         Ok(())
     }
-}
-
-async fn udp_send(socket: &mut UdpSocket, buf: &[u8]) -> tokio::io::Result<()> {
-    let sent = socket.send(buf).await?;
-    if sent != buf.len() {
-        emit!(UdpSendIncompleteError {
-            data_size: buf.len(),
-            sent,
-        });
-    }
-    Ok(())
 }
 
 pub(super) const fn find_bind_address(remote_addr: &SocketAddr) -> SocketAddr {

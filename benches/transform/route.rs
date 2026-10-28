@@ -3,13 +3,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{
-    black_box, criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId,
-    Criterion, SamplingMode, Throughput,
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group,
+    measurement::WallTime,
 };
-use vector::config::TransformContext;
-use vector::transforms::{
-    route::{Route, RouteConfig},
-    TransformOutputsBuf,
+use vector::{
+    config::TransformContext,
+    transforms::{
+        TransformOutputsBuf,
+        route::{Route, RouteConfig},
+    },
 };
 use vector_lib::{
     config::{DataType, TransformOutput},
@@ -32,6 +34,15 @@ impl fmt::Display for Param {
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::default_trait_access,
+    reason = "Keep inferred defaults where concrete type names need a separate import or API cleanup."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the existing control flow intact during the lint rollout."
+)]
 fn route(c: &mut Criterion) {
     let mut group: BenchmarkGroup<WallTime> = c.benchmark_group("vector::transforms::route::Route");
     group.sampling_mode(SamplingMode::Auto);
@@ -96,7 +107,7 @@ fn route(c: &mut Criterion) {
         // into named filters. A mixture of match and not match happens.
         Param {
             slug: "vrl_field_match_many",
-            input: event.clone(),
+            input: event,
             route_config: toml::from_str::<RouteConfig>(
                 r#"
             route.a.type = "vrl"
@@ -146,7 +157,7 @@ fn route(c: &mut Criterion) {
         "#,
             )
             .unwrap(),
-            output_buffer: output_buffer.clone(),
+            output_buffer,
         },
     ] {
         group.throughput(Throughput::Elements(param.input.len() as u64));
@@ -159,10 +170,11 @@ fn route(c: &mut Criterion) {
                     (route, param.input.clone(), param.output_buffer.clone())
                 },
                 |(mut route, input, mut output_buffer)| {
-                    black_box(route.transform(input, &mut output_buffer));
+                    route.transform(input, &mut output_buffer);
+                    std::hint::black_box(());
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
 }
@@ -171,7 +183,7 @@ criterion_group!(
     name = benches;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(120))
+        .measurement_time(Duration::from_mins(2))
         // degree of noise to ignore in measurements, here 1%
         .noise_threshold(0.01)
         // likelihood of noise registering as difference, here 5%

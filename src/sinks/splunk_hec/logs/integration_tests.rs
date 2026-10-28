@@ -3,15 +3,15 @@ use std::{convert::TryFrom, iter, num::NonZeroU8};
 use chrono::{TimeZone, Timelike, Utc};
 use futures::{future::ready, stream};
 use serde_json::Value as JsonValue;
-use tokio::time::{sleep, Duration};
-use vector_lib::codecs::{JsonSerializerConfig, TextSerializerConfig};
-use vector_lib::lookup::lookup_v2::{ConfigValuePath, OptionalTargetPath};
+use tokio::time::{Duration, sleep};
 use vector_lib::{
-    config::{init_telemetry, Tags, Telemetry},
+    codecs::{JsonSerializerConfig, TextSerializerConfig},
+    config::{Tags, Telemetry, init_telemetry},
     event::{BatchNotifier, BatchStatus, Event, LogEvent},
     lookup,
+    lookup::lookup_v2::{ConfigValuePath, OptionalTargetPath},
 };
-use vrl::path::OwnedTargetPath;
+use vrl::{event_path, path::OwnedTargetPath};
 
 use crate::{
     codecs::EncodingConfig,
@@ -20,19 +20,19 @@ use crate::{
     sinks::{
         splunk_hec::{
             common::{
+                EndpointTarget, SOURCE_FIELD,
                 acknowledgements::HecClientAcknowledgementsConfig,
                 integration_test_helpers::{get_token, splunk_api_address, splunk_hec_address},
-                EndpointTarget, SOURCE_FIELD,
             },
             logs::config::HecLogsSinkConfig,
         },
-        util::{BatchConfig, Compression, TowerRequestConfig},
+        util::{BatchConfig, Compression, HttpEndpoint, TowerRequestConfig},
     },
-    template::Template,
+    template::{ConfinementConfig, Template},
     test_util::{
         components::{
-            run_and_assert_data_volume_sink_compliance, run_and_assert_sink_compliance,
-            DATA_VOLUME_SINK_TAGS, HTTP_SINK_TAGS,
+            DATA_VOLUME_SINK_TAGS, HTTP_SINK_TAGS, run_and_assert_data_volume_sink_compliance,
+            run_and_assert_sink_compliance,
         },
         random_lines_with_stream, random_string,
     },
@@ -41,6 +41,9 @@ use crate::{
 const USERNAME: &str = "admin";
 const PASSWORD: &str = "password";
 const ACK_TOKEN: &str = "ack-token";
+// Matches `SPLUNK_HEC_TOKEN` in tests/integration/splunk/config/compose.yaml, which is not
+// configured for indexer acknowledgements (unlike `ACK_TOKEN`).
+const DEFAULT_TOKEN: &str = "abcd1234";
 
 async fn recent_entries(index: Option<&str>) -> Vec<JsonValue> {
     let client = reqwest::Client::builder()
@@ -50,7 +53,7 @@ async fn recent_entries(index: Option<&str>) -> Vec<JsonValue> {
 
     // https://docs.splunk.com/Documentation/Splunk/7.2.1/RESTREF/RESTsearch#search.2Fjobs
     let search_query = match index {
-        Some(index) => format!("search index={}", index),
+        Some(index) => format!("search index={index}"),
         None => "search index=*".into(),
     };
     let res = client
@@ -59,7 +62,7 @@ async fn recent_entries(index: Option<&str>) -> Vec<JsonValue> {
             splunk_api_address()
         ))
         .form(&vec![
-            ("search", &search_query[..]),
+            ("search", search_query.as_str()),
             ("exec_mode", "oneshot"),
             ("f", "*"),
         ])
@@ -117,7 +120,7 @@ async fn config(
 
     HecLogsSinkConfig {
         default_token: get_token().await.into(),
-        endpoint: splunk_hec_address(),
+        endpoint: HttpEndpoint::parse(&splunk_hec_address()).unwrap(),
         host_key: Some(OptionalTargetPath::event("host")),
         indexed_fields,
         index: None,
@@ -128,11 +131,12 @@ async fn config(
         batch,
         request: TowerRequestConfig::default(),
         tls: None,
-        acknowledgements: Default::default(),
+        acknowledgements: HecClientAcknowledgementsConfig::default(),
         timestamp_nanos_key: None,
         timestamp_key: None,
         auto_extract_timestamp: None,
         endpoint_target: EndpointTarget::Event,
+        confinement: ConfinementConfig::default(),
     }
 }
 
@@ -309,13 +313,13 @@ async fn splunk_index_is_interpolated() {
 
     let indexed_fields = vec!["asdf".into()];
     let mut config = config(JsonSerializerConfig::default().into(), indexed_fields).await;
-    config.index = Template::try_from("{{ index_name }}".to_string()).ok();
+    config.index = Template::try_from("custom_{{ index_name }}".to_string()).ok();
 
     let (sink, _) = config.build(cx).await.unwrap();
 
     let message = random_string(100);
     let mut event = LogEvent::from(message.clone());
-    event.insert("index_name", "custom_index");
+    event.insert(event_path!("index_name"), "index");
     run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
 
     let entry = find_entry(message.as_str()).await;
@@ -347,7 +351,7 @@ async fn splunk_custom_fields() {
 
     let message = random_string(100);
     let mut event = LogEvent::from(message.clone());
-    event.insert("asdf", "hello");
+    event.insert(event_path!("asdf"), "hello");
     run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
 
     let entry = find_entry(message.as_str()).await;
@@ -367,8 +371,8 @@ async fn splunk_hostname() {
 
     let message = random_string(100);
     let mut event = LogEvent::from(message.clone());
-    event.insert("asdf", "hello");
-    event.insert("host", "example.com:1234");
+    event.insert(event_path!("asdf"), "hello");
+    event.insert(event_path!("host"), "example.com:1234");
     run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
 
     let entry = find_entry(message.as_str()).await;
@@ -392,7 +396,7 @@ async fn splunk_sourcetype() {
 
     let message = random_string(100);
     let mut event = LogEvent::from(message.clone());
-    event.insert("asdf", "hello");
+    event.insert(event_path!("asdf"), "hello");
     run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
 
     let entry = find_entry(message.as_str()).await;
@@ -417,9 +421,9 @@ async fn splunk_configure_hostname() {
 
     let message = random_string(100);
     let mut event = LogEvent::from(message.clone());
-    event.insert("asdf", "hello");
-    event.insert("host", "example.com:1234");
-    event.insert("roast", "beef.example.com:1234");
+    event.insert(event_path!("asdf"), "hello");
+    event.insert(event_path!("host"), "example.com:1234");
+    event.insert(event_path!("roast"), "beef.example.com:1234");
     run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
 
     let entry = find_entry(message.as_str()).await;
@@ -461,7 +465,12 @@ async fn splunk_indexer_acknowledgements() {
 async fn splunk_indexer_acknowledgements_disabled_on_server() {
     let cx = SinkContext::default();
 
-    let config = config(JsonSerializerConfig::default().into(), vec!["asdf".into()]).await;
+    // `config()` fetches whatever token Splunk's inputs API happens to list first, which can
+    // be `ACK_TOKEN` and would defeat the point of this test. Force the non-ack token instead.
+    let config = HecLogsSinkConfig {
+        default_token: String::from(DEFAULT_TOKEN).into(),
+        ..config(JsonSerializerConfig::default().into(), vec!["asdf".into()]).await
+    };
     let (sink, _) = config.build(cx).await.unwrap();
 
     let (tx, mut rx) = BatchNotifier::new_with_receiver();
@@ -480,10 +489,7 @@ async fn splunk_auto_extracted_timestamp() {
     // The auto_extract_timestamp setting only works on version 8 and above of splunk.
     // If the splunk version is set to 7, we ignore this test.
     // This environment variable is set by the integration test docker-compose file.
-    if std::env::var("CONFIG_VERSION")
-        .map(|version| !version.starts_with("7."))
-        .unwrap_or(true)
-    {
+    if std::env::var("CONFIG_VERSION").map_or(true, |version| !version.starts_with("7.")) {
         let cx = SinkContext::default();
 
         let config = HecLogsSinkConfig {
@@ -507,7 +513,7 @@ async fn splunk_auto_extracted_timestamp() {
         let mut event = LogEvent::from(message.as_str());
 
         event.insert(
-            "timestamp",
+            vrl::event_path!("timestamp"),
             Value::from(
                 Utc.with_ymd_and_hms(2020, 3, 5, 0, 0, 0)
                     .single()
@@ -525,10 +531,7 @@ async fn splunk_auto_extracted_timestamp() {
         // Splunk will determine the timestamp from the *message* field in the event.
         // Thus, we expect the `timestamp` field to still be present.
         assert_eq!(
-            format!(
-                "{{\"message\":\"{}\",\"timestamp\":\"2020-03-05T00:00:00Z\"}}",
-                message
-            ),
+            format!("{{\"message\":\"{message}\",\"timestamp\":\"2020-03-05T00:00:00Z\"}}"),
             entry["_raw"].as_str().unwrap()
         );
         assert_eq!(
@@ -543,10 +546,7 @@ async fn splunk_non_auto_extracted_timestamp() {
     // The auto_extract_timestamp setting only works on version 8 and above of splunk.
     // If the splunk version is set to 7, we ignore this test.
     // This environment variable is set by the integration test docker-compose file.
-    if std::env::var("CONFIG_VERSION")
-        .map(|version| !version.starts_with("7."))
-        .unwrap_or(true)
-    {
+    if std::env::var("CONFIG_VERSION").map_or(true, |version| !version.starts_with("7.")) {
         let cx = SinkContext::default();
 
         let config = HecLogsSinkConfig {
@@ -566,7 +566,7 @@ async fn splunk_non_auto_extracted_timestamp() {
 
         // With auto_extract_timestamp switched off the timestamp comes from the event timestamp.
         event.insert(
-            "timestamp",
+            vrl::event_path!("timestamp"),
             Value::from(
                 Utc.with_ymd_and_hms(2020, 3, 5, 0, 0, 0)
                     .single()
@@ -579,7 +579,7 @@ async fn splunk_non_auto_extracted_timestamp() {
         let entry = find_entry(&message).await;
 
         assert_eq!(
-            format!("{{\"message\":\"{}\"}}", message),
+            format!("{{\"message\":\"{message}\"}}"),
             entry["_raw"].as_str().unwrap()
         );
         assert_eq!(

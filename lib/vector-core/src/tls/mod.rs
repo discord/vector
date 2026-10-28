@@ -1,13 +1,12 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::{fmt::Debug, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{fmt::Debug, net::SocketAddr, num::TryFromIntError, path::PathBuf, time::Duration};
 
 use openssl::{
     error::ErrorStack,
     ssl::{ConnectConfiguration, SslConnector, SslConnectorBuilder, SslMethod},
 };
 use snafu::{ResultExt, Snafu};
-use std::num::TryFromIntError;
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
@@ -16,14 +15,16 @@ use crate::tcp::{self, TcpKeepaliveConfig};
 mod incoming;
 mod maybe_tls;
 mod outgoing;
+mod reload;
 mod settings;
 
 pub use incoming::{CertificateMetadata, MaybeTlsIncomingStream, MaybeTlsListener};
 pub use maybe_tls::MaybeTls;
+pub use reload::{TlsAcceptorReloader, WeakTlsAcceptorReloader};
 pub use settings::{
-    MaybeTlsSettings, TlsConfig, TlsEnableableConfig, TlsSettings, TlsSourceConfig,
-    PEM_START_MARKER, TEST_PEM_CA_PATH, TEST_PEM_CLIENT_CRT_PATH, TEST_PEM_CLIENT_KEY_PATH,
-    TEST_PEM_CRT_PATH, TEST_PEM_INTERMEDIATE_CA_PATH, TEST_PEM_KEY_PATH,
+    MaybeTlsSettings, PEM_START_MARKER, TEST_PEM_CA_PATH, TEST_PEM_CLIENT_CRT_PATH,
+    TEST_PEM_CLIENT_KEY_PATH, TEST_PEM_CRT_PATH, TEST_PEM_INTERMEDIATE_CA_PATH, TEST_PEM_KEY_PATH,
+    TlsConfig, TlsEnableableConfig, TlsSettings, TlsSourceConfig,
 };
 
 pub type Result<T> = std::result::Result<T, TlsError>;
@@ -100,6 +101,8 @@ pub enum TlsError {
     AddCertToStore { source: ErrorStack },
     #[snafu(display("Error setting up the verification certificate: {}", source))]
     SetVerifyCert { source: ErrorStack },
+    #[snafu(display("Error setting SNI: {}", source))]
+    SetSni { source: ErrorStack },
     #[snafu(display("Error setting ALPN protocols: {}", source))]
     SetAlpnProtocols { source: ErrorStack },
     #[snafu(display(
@@ -183,13 +186,15 @@ pub fn tls_connector_builder(settings: &MaybeTlsSettings) -> Result<SslConnector
 }
 
 fn tls_connector(settings: &MaybeTlsSettings) -> Result<ConnectConfiguration> {
-    let verify_hostname = settings
-        .tls()
-        .map_or(true, |settings| settings.verify_hostname);
-    let configure = tls_connector_builder(settings)?
+    let mut configure = tls_connector_builder(settings)?
         .build()
         .configure()
-        .context(TlsBuildConnectorSnafu)?
-        .verify_hostname(verify_hostname);
+        .context(TlsBuildConnectorSnafu)?;
+    let tls_setting = settings.tls().cloned();
+    if let Some(tls_setting) = &tls_setting {
+        tls_setting
+            .apply_connect_configuration(&mut configure, false)
+            .context(SetSniSnafu)?;
+    }
     Ok(configure)
 }

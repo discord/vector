@@ -3,13 +3,11 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::{stream::BoxStream, task::noop_waker_ref, SinkExt, StreamExt};
-use futures_util::{future::ready, stream};
+use futures::{SinkExt, StreamExt, stream::BoxStream, task::noop_waker_ref};
 use snafu::{ResultExt, Snafu};
 use tokio::{
     io::{AsyncRead, ReadBuf},
@@ -17,25 +15,27 @@ use tokio::{
     time::sleep,
 };
 use tokio_util::codec::Encoder;
-use vector_lib::configurable::configurable_component;
-use vector_lib::json_size::JsonSize;
-use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    ByteSizeOf, EstimatedJsonEncodedSizeOf, configurable::configurable_component,
+    json_size::JsonSize,
+};
 
 use crate::{
     codecs::Transformer,
+    common::backoff::ExponentialBackoff,
     dns,
     event::Event,
     internal_events::{
         ConnectionOpen, OpenGauge, SocketMode, SocketSendError, TcpSocketConnectionEstablished,
         TcpSocketConnectionShutdown, TcpSocketOutgoingConnectionError,
     },
+    sink_ext::VecSinkExt,
     sinks::{
-        util::{
-            retries::ExponentialBackoff,
-            socket_bytes_sink::{BytesSink, ShutdownCheck},
-            EncodedEvent, SinkBuildError, StreamSink,
-        },
         Healthcheck, VectorSink,
+        util::{
+            EncodedEvent, SinkBuildError, StreamSink,
+            socket_bytes_sink::{BytesSink, ShutdownCheck},
+        },
     },
     tcp::TcpKeepaliveConfig,
     tls::{MaybeTlsSettings, MaybeTlsStream, TlsEnableableConfig, TlsError},
@@ -64,10 +64,8 @@ pub struct TcpSinkConfig {
     #[configurable(metadata(docs::examples = "https://somehost:5000"))]
     address: String,
 
-    #[configurable(derived)]
     keepalive: Option<TcpKeepaliveConfig>,
 
-    #[configurable(derived)]
     tls: Option<TlsEnableableConfig>,
 
     /// The size of the socket's send buffer.
@@ -79,6 +77,7 @@ pub struct TcpSinkConfig {
 }
 
 impl TcpSinkConfig {
+    #[must_use]
     pub const fn new(
         address: String,
         keepalive: Option<TcpKeepaliveConfig>,
@@ -93,6 +92,7 @@ impl TcpSinkConfig {
         }
     }
 
+    #[must_use]
     pub const fn from_address(address: String) -> Self {
         Self {
             address,
@@ -102,19 +102,61 @@ impl TcpSinkConfig {
         }
     }
 
+    /// Parse and validate the configured address, returning the host and port.
+    ///
+    /// This performs only pure parsing — no DNS resolution and no TLS setup —
+    /// so it can run during validation. TLS resolution remains in
+    /// [`Self::build`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address is invalid or lacks a host or valid port.
+    pub fn parse_address(&self) -> crate::Result<(String, u16)> {
+        let uri = self.address.parse::<http::Uri>()?;
+        let host = uri.host().ok_or(SinkBuildError::MissingHost)?.to_string();
+        let port = uri.port_u16().ok_or(SinkBuildError::MissingPort)?;
+        Ok((host, port))
+    }
+
+    /// Builds the sink and its healthcheck.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address is invalid or TLS configuration fails.
     pub fn build(
         &self,
         transformer: Transformer,
         encoder: impl Encoder<Event, Error = vector_lib::codecs::encoding::Error>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
-        let uri = self.address.parse::<http::Uri>()?;
-        let host = uri.host().ok_or(SinkBuildError::MissingHost)?.to_string();
-        let port = uri.port_u16().ok_or(SinkBuildError::MissingPort)?;
-        let tls = MaybeTlsSettings::from_config(&self.tls, false)?;
+        let (host, port) = self.parse_address()?;
+        self.build_with_address(host, port, transformer, encoder)
+    }
+
+    /// Build the sink from an already-parsed host and port.
+    ///
+    /// Used by sinks whose `validate` already parsed the address, so the
+    /// parsed value is plumbed through the validated state rather than
+    /// re-parsed here. TLS resolution still happens in this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS configuration fails.
+    pub fn build_with_address(
+        &self,
+        host: String,
+        port: u16,
+        transformer: Transformer,
+        encoder: impl Encoder<Event, Error = vector_lib::codecs::encoding::Error>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
         let connector = TcpConnector::new(host, port, self.keepalive, tls, self.send_buffer_bytes);
         let sink = TcpSink::new(connector.clone(), transformer, encoder);
 
@@ -156,11 +198,9 @@ impl TcpConnector {
         Self::new(host, port, None, None.into(), None)
     }
 
-    const fn fresh_backoff() -> ExponentialBackoff {
+    fn fresh_backoff() -> ExponentialBackoff {
         // TODO: make configurable
-        ExponentialBackoff::from_millis(2)
-            .factor(250)
-            .max_delay(Duration::from_secs(60))
+        ExponentialBackoff::default()
     }
 
     async fn connect(&self) -> Result<MaybeTlsStream<TcpStream>, TcpError> {
@@ -177,16 +217,16 @@ impl TcpConnector {
             .await
             .context(ConnectSnafu)
             .map(|mut maybe_tls| {
-                if let Some(keepalive) = self.keepalive {
-                    if let Err(error) = maybe_tls.set_keepalive(keepalive) {
-                        warn!(message = "Failed configuring TCP keepalive.", %error);
-                    }
+                if let Some(keepalive) = self.keepalive
+                    && let Err(error) = maybe_tls.set_keepalive(keepalive)
+                {
+                    warn!(message = "Failed configuring TCP keepalive.", %error);
                 }
 
-                if let Some(send_buffer_bytes) = self.send_buffer_bytes {
-                    if let Err(error) = maybe_tls.set_send_buffer_bytes(send_buffer_bytes) {
-                        warn!(message = "Failed configuring send buffer size on TCP socket.", %error);
-                    }
+                if let Some(send_buffer_bytes) = self.send_buffer_bytes
+                    && let Err(error) = maybe_tls.set_send_buffer_bytes(send_buffer_bytes)
+                {
+                    warn!(message = "Failed configuring send buffer size on TCP socket.", %error);
                 }
 
                 maybe_tls
@@ -281,34 +321,34 @@ where
         // We need [Peekable](https://docs.rs/futures/0.3.6/futures/stream/struct.Peekable.html) for initiating
         // connection only when we have something to send.
         let mut encoder = self.encoder.clone();
-        let mut input = input.map(|mut event| {
-            let byte_size = event.size_of();
-            let json_byte_size = event.estimated_json_encoded_size_of();
-            let finalizers = event.metadata_mut().take_finalizers();
-            self.transformer.transform(&mut event);
-            let mut bytes = BytesMut::new();
+        let mut input = input
+            .map(|mut event| {
+                let byte_size = event.size_of();
+                let json_byte_size = event.estimated_json_encoded_size_of();
+                let finalizers = event.metadata_mut().take_finalizers();
+                self.transformer.transform(&mut event);
+                let mut bytes = BytesMut::new();
 
-            // Errors are handled by `Encoder`.
-            if encoder.encode(event, &mut bytes).is_ok() {
-                let item = bytes.freeze();
-                EncodedEvent {
-                    item,
-                    finalizers,
-                    byte_size,
-                    json_byte_size,
+                // Errors are handled by `Encoder`.
+                if encoder.encode(event, &mut bytes).is_ok() {
+                    let item = bytes.freeze();
+                    EncodedEvent {
+                        item,
+                        finalizers,
+                        byte_size,
+                        json_byte_size,
+                    }
+                } else {
+                    EncodedEvent::new(Bytes::new(), 0, JsonSize::zero())
                 }
-            } else {
-                EncodedEvent::new(Bytes::new(), 0, JsonSize::zero())
-            }
-        });
+            })
+            .peekable();
 
-        while let Some(item) = input.next().await {
+        while Pin::new(&mut input).peek().await.is_some() {
             let mut sink = self.connect().await;
             let _open_token = OpenGauge::new().open(|count| emit!(ConnectionOpen { count }));
 
-            let mut mapped_input = stream::once(ready(item)).chain(&mut input).map(Ok);
-
-            let result = match sink.send_all(&mut mapped_input).await {
+            let result = match sink.send_all_peekable(&mut (&mut input).peekable()).await {
                 Ok(()) => sink.close().await,
                 Err(error) => Err(error),
             };
@@ -338,18 +378,18 @@ mod test {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::test_util::{next_addr, trace_init};
+    use crate::test_util::{addr::next_addr, trace_init};
 
     #[tokio::test]
     async fn healthcheck() {
         trace_init();
 
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let _listener = TcpListener::bind(&addr).await.unwrap();
         let good = TcpConnector::from_host_port(addr.ip().to_string(), addr.port());
         assert!(good.healthcheck().await.is_ok());
 
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let bad = TcpConnector::from_host_port(addr.ip().to_string(), addr.port());
         assert!(bad.healthcheck().await.is_err());
     }

@@ -4,14 +4,21 @@ use std::collections::HashSet;
 
 pub mod dedupe;
 pub mod reduce;
+#[cfg(feature = "transforms-impl-sample")]
 pub mod sample;
 
 #[cfg(feature = "transforms-aggregate")]
 pub mod aggregate;
 #[cfg(feature = "transforms-aws_ec2_metadata")]
 pub mod aws_ec2_metadata;
+#[cfg(feature = "transforms-delay")]
+pub mod delay;
+#[cfg(feature = "transforms-exclusive_route")]
+mod exclusive_route;
 #[cfg(feature = "transforms-filter")]
 pub mod filter;
+#[cfg(feature = "transforms-incremental_to_absolute")]
+pub mod incremental_to_absolute;
 #[cfg(feature = "transforms-log_to_metric")]
 pub mod log_to_metric;
 #[cfg(feature = "transforms-lua")]
@@ -26,6 +33,10 @@ pub mod route;
 pub mod tag_cardinality_limit;
 #[cfg(feature = "transforms-throttle")]
 pub mod throttle;
+#[cfg(feature = "transforms-trace_to_log")]
+pub mod trace_to_log;
+#[cfg(feature = "transforms-window")]
+pub mod window;
 
 pub use vector_lib::transform::{
     FunctionTransform, OutputBuffer, SyncTransform, TaskTransform, Transform, TransformOutputs,
@@ -42,8 +53,8 @@ mod test {
 
     use crate::{
         config::{
-            unit_test::{UnitTestStreamSinkConfig, UnitTestStreamSourceConfig},
             ConfigBuilder, TransformConfig,
+            unit_test::{UnitTestStreamSinkConfig, UnitTestStreamSourceConfig},
         },
         event::Event,
         test_util::start_topology,
@@ -85,7 +96,7 @@ mod test {
             "out",
             &["transform"],
             UnitTestStreamSinkConfig::new(
-                PollSender::new(tx).sink_map_err(|error| panic!("{}", error)),
+                PollSender::new(tx).sink_map_err(|error| panic!("{error}")),
             ),
         );
 

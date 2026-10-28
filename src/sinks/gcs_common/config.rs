@@ -1,5 +1,7 @@
+use std::marker::PhantomData;
+
 use futures::FutureExt;
-use http::{StatusCode, Uri};
+use http::StatusCode;
 use hyper::Body;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
@@ -8,13 +10,24 @@ use crate::{
     gcp::{GcpAuthenticator, GcpError},
     http::HttpClient,
     sinks::{
-        gcs_common::service::GcsResponse,
-        util::retries::{RetryAction, RetryLogic},
         Healthcheck, HealthcheckError,
+        gcs_common::service::GcsResponse,
+        util::{
+            HttpEndpoint,
+            retries::{RetryAction, RetryLogic},
+        },
     },
 };
 
-pub const BASE_URL: &str = "https://storage.googleapis.com/";
+/// Returns the default Google Cloud Storage endpoint.
+///
+/// # Panics
+/// Panics if the static endpoint is not a valid HTTP URL.
+#[must_use]
+pub fn default_endpoint() -> HttpEndpoint {
+    HttpEndpoint::parse("https://storage.googleapis.com")
+        .expect("static default endpoint should be a valid http(s) URL")
+}
 
 /// GCS Predefined ACLs.
 ///
@@ -22,8 +35,7 @@ pub const BASE_URL: &str = "https://storage.googleapis.com/";
 ///
 /// [predefined_acls]: https://cloud.google.com/storage/docs/access-control/lists#predefined-acl
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum GcsPredefinedAcl {
     /// Bucket/object can be read by authenticated users.
@@ -61,10 +73,10 @@ pub enum GcsPredefinedAcl {
     /// part of the project team is granted the `READER` permission.
     ///
     /// This is the default.
-    #[derivative(Default)]
+    #[default]
     ProjectPrivate,
 
-    /// Bucket/object can be read publically.
+    /// Bucket/object can be read publicly.
     ///
     /// The bucket/object owner is granted the `OWNER` permission, and all other users, whether
     /// authenticated or anonymous, are granted the `READER` permission.
@@ -77,14 +89,13 @@ pub enum GcsPredefinedAcl {
 ///
 /// [storage_classes]: https://cloud.google.com/storage/docs/storage-classes
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative, PartialEq, Eq)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GcsStorageClass {
     /// Standard storage.
     ///
     /// This is the default.
-    #[derivative(Default)]
+    #[default]
     Standard,
 
     /// Nearline storage.
@@ -103,14 +114,17 @@ pub enum GcsError {
     BucketNotFound { bucket: String },
 }
 
+/// Builds a bucket healthcheck.
+///
+/// The returned future reports request failures and non-successful health statuses.
 pub fn build_healthcheck(
     bucket: String,
     client: HttpClient,
-    base_url: String,
+    base_url: HttpEndpoint,
     auth: GcpAuthenticator,
-) -> crate::Result<Healthcheck> {
+) -> Healthcheck {
     let healthcheck = async move {
-        let uri = base_url.parse::<Uri>()?;
+        let uri = base_url.into_uri();
         let mut request = http::Request::head(uri).body(Body::empty())?;
 
         auth.apply(&mut request);
@@ -118,17 +132,33 @@ pub fn build_healthcheck(
         let not_found_error = GcsError::BucketNotFound { bucket }.into();
 
         let response = client.send(request).await?;
-        healthcheck_response(response, not_found_error)
+        healthcheck_response(&response, not_found_error)
     };
 
-    Ok(healthcheck.boxed())
+    healthcheck.boxed()
 }
 
+/// Classifies a GCP healthcheck response.
+///
+/// # Errors
+/// Returns an error for forbidden, missing, or unexpected response statuses.
 pub fn healthcheck_response(
-    response: http::Response<hyper::Body>,
+    response: &http::Response<hyper::Body>,
     not_found_error: crate::Error,
 ) -> crate::Result<()> {
-    match response.status() {
+    healthcheck_status(response.status(), not_found_error)
+}
+
+/// Classifies a GCP healthcheck response by status alone, shared by the legacy and native
+/// HTTP clients.
+///
+/// # Errors
+/// Returns an error for forbidden, missing, or unexpected response statuses.
+pub fn healthcheck_status(
+    status: http::StatusCode,
+    not_found_error: crate::Error,
+) -> crate::Result<()> {
+    match status {
         StatusCode::OK => Ok(()),
         StatusCode::FORBIDDEN => Err(GcpError::HealthcheckForbidden.into()),
         StatusCode::NOT_FOUND => Err(not_found_error),
@@ -136,30 +166,49 @@ pub fn healthcheck_response(
     }
 }
 
-#[derive(Clone)]
-pub struct GcsRetryLogic;
+pub struct GcsRetryLogic<Request> {
+    request: PhantomData<Request>,
+}
+
+impl<Request> Default for GcsRetryLogic<Request> {
+    fn default() -> Self {
+        Self {
+            request: PhantomData,
+        }
+    }
+}
+
+impl<Request> Clone for GcsRetryLogic<Request> {
+    fn clone(&self) -> Self {
+        Self {
+            request: PhantomData,
+        }
+    }
+}
 
 // This is a clone of HttpRetryLogic for the Body type, should get merged
-impl RetryLogic for GcsRetryLogic {
+impl<Request: Clone + Send + Sync + 'static> RetryLogic for GcsRetryLogic<Request> {
     type Error = hyper::Error;
+    type Request = Request;
     type Response = GcsResponse;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
         true
     }
 
-    fn should_retry_response(&self, response: &Self::Response) -> RetryAction {
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
         let status = response.inner.status();
 
         match status {
             StatusCode::UNAUTHORIZED => RetryAction::Retry("unauthorized".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
             }
             _ if status.is_server_error() => RetryAction::Retry(status.to_string().into()),
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
+            _ => RetryAction::DontRetry(format!("response status: {status}").into()),
         }
     }
 }

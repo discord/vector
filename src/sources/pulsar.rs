@@ -2,20 +2,21 @@
 //! Accepts log events streamed from [`Apache Pulsar`][pulsar].
 //!
 //! [pulsar]: https://pulsar.apache.org/
+use std::path::Path;
+
 use chrono::TimeZone;
 use futures_util::StreamExt;
 use pulsar::{
+    Authentication, Consumer, Pulsar, SubType, TokioExecutor,
     authentication::oauth2::{OAuth2Authentication, OAuth2Params},
     consumer::Message,
     message::proto::MessageIdData,
-    Authentication, Consumer, Pulsar, SubType, TokioExecutor,
 };
-use tokio_util::codec::FramedRead;
-
 use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
     codecs::{
+        Decoder, DecoderFramedRead, DecodingConfig, StreamDecodingError,
         decoding::{DeserializerConfig, FramingConfig},
-        StreamDecodingError,
     },
     config::{LegacyKey, LogNamespace, SourceAcknowledgementsConfig, SourceOutput},
     configurable::configurable_component,
@@ -28,19 +29,17 @@ use vector_lib::{
     },
     sensitive_string::SensitiveString,
     shutdown::ShutdownSignal,
-    EstimatedJsonEncodedSizeOf,
 };
 use vrl::{owned_value_path, path, value::Kind};
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
+    SourceSender,
     config::{SourceConfig, SourceContext},
     event::BatchNotifier,
     internal_events::{
         PulsarErrorEvent, PulsarErrorEventData, PulsarErrorEventType, StreamClosedError,
     },
-    serde::{bool_or_struct, default_decoding, default_framing_message_based},
-    SourceSender,
+    serde::{default_decoding, default_framing_message_based},
 };
 
 /// Configuration for the `pulsar` source.
@@ -76,30 +75,28 @@ pub struct PulsarSourceConfig {
     /// Max count of messages in a batch.
     batch_size: Option<u32>,
 
-    #[configurable(derived)]
     auth: Option<AuthConfig>,
 
-    #[configurable(derived)]
     dead_letter_queue_policy: Option<DeadLetterQueuePolicy>,
 
-    #[configurable(derived)]
     #[serde(default = "default_framing_message_based")]
     #[derivative(Default(value = "default_framing_message_based()"))]
     framing: FramingConfig,
 
-    #[configurable(derived)]
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     decoding: DeserializerConfig,
 
-    #[configurable(derived)]
-    #[serde(default, deserialize_with = "bool_or_struct")]
+    #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     acknowledgements: SourceAcknowledgementsConfig,
 
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     log_namespace: Option<bool>,
+
+    #[serde(default)]
+    tls: Option<TlsOptions>,
 }
 
 /// Authentication configuration.
@@ -127,10 +124,7 @@ enum AuthConfig {
     },
 
     /// OAuth authentication.
-    OAuth {
-        #[configurable(derived)]
-        oauth2: OAuth2Config,
-    },
+    OAuth { oauth2: OAuth2Config },
 }
 
 /// OAuth2-specific authentication configuration.
@@ -150,12 +144,12 @@ pub struct OAuth2Config {
     #[configurable(metadata(docs::examples = "data:application/json;base64,cHVsc2FyCg=="))]
     credentials_url: String,
 
-    /// The OAuth2 audience.
+    /// The `OAuth2` audience.
     #[configurable(metadata(docs::examples = "${OAUTH2_AUDIENCE}"))]
     #[configurable(metadata(docs::examples = "pulsar"))]
     audience: Option<String>,
 
-    /// The OAuth2 scope.
+    /// The `OAuth2` scope.
     #[configurable(metadata(docs::examples = "${OAUTH2_SCOPE}"))]
     #[configurable(metadata(docs::examples = "admin"))]
     scope: Option<String>,
@@ -170,6 +164,25 @@ struct DeadLetterQueuePolicy {
 
     /// Name of the dead letter topic where the failing messages will be sent.
     pub dead_letter_topic: String,
+}
+
+#[configurable_component]
+#[configurable(description = "TLS options configuration for the Pulsar client.")]
+#[derive(Clone, Debug)]
+pub struct TlsOptions {
+    /// File path containing a list of PEM encoded certificates
+    #[configurable(metadata(docs::examples = "/etc/certs/chain.pem"))]
+    pub ca_file: String,
+
+    /// Enables certificate verification.
+    ///
+    /// Do NOT set this to `false` unless you understand the risks of not verifying the validity of certificates.
+    pub verify_certificate: Option<bool>,
+
+    /// Whether hostname verification is enabled when `verify_certificate` is false
+    ///
+    /// Set to true if not specified.
+    pub verify_hostname: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -192,7 +205,7 @@ impl SourceConfig for PulsarSourceConfig {
                 .build()?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
 
-        Ok(Box::pin(pulsar_source(
+        Ok(crate::sources::opaque_source(pulsar_source(
             consumer,
             decoder,
             cx.shutdown,
@@ -263,10 +276,17 @@ impl PulsarSourceConfig {
                 ),
             };
         }
+        if let Some(options) = &self.tls {
+            builder = builder.with_certificate_chain_file(Path::new(&options.ca_file))?;
+            builder =
+                builder.with_allow_insecure_connection(!options.verify_certificate.unwrap_or(true));
+            builder = builder
+                .with_tls_hostname_verification_enabled(options.verify_hostname.unwrap_or(true));
+        }
 
         let pulsar = builder.build().await?;
 
-        let mut consumer_builder = pulsar
+        let mut consumer_builder: pulsar::ConsumerBuilder<TokioExecutor> = pulsar
             .consumer()
             .with_topics(&self.topics)
             .with_subscription_type(SubType::Shared)
@@ -342,6 +362,10 @@ async fn pulsar_source(
     Ok(())
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "Keep batch notifier and optional metadata signatures consistent with the existing finalization callbacks. https://github.com/vectordotdev/vector/issues/23659"
+)]
 #[allow(clippy::too_many_arguments)]
 async fn parse_message(
     msg: Message<String>,
@@ -359,7 +383,7 @@ async fn parse_message(
     let topic = msg.topic.clone();
     let producer_name = msg.payload.metadata.producer_name.clone();
 
-    let mut stream = FramedRead::new(msg.payload.data.as_ref(), decoder.clone());
+    let mut stream = DecoderFramedRead::new(msg.payload.data.as_ref(), decoder.clone());
     let stream = async_stream::stream! {
         while let Some(next) = stream.next().await {
             match next {
@@ -411,7 +435,7 @@ async fn parse_message(
                     }
                 }
                 Err(error) => {
-                    // Error is logged by `crate::codecs`, no further
+                    // Error is logged by `vector_lib::codecs`, no further
                     // handling is needed here.
                     if !error.can_continue() {
                         break;
@@ -434,6 +458,10 @@ async fn parse_message(
     .await;
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "Keep batch notifier and optional metadata signatures consistent with the existing finalization callbacks. https://github.com/vectordotdev/vector/issues/23659"
+)]
 /// Send the event stream created by the framed read to the `out` stream.
 async fn finalize_event_stream(
     consumer: &mut Consumer<String, TokioExecutor>,
@@ -453,7 +481,7 @@ async fn finalize_event_stream(
                 Err(_error) => {
                     emit!(StreamClosedError { count: 1 });
                 }
-                Ok(_) => {
+                Ok(()) => {
                     finalizer.add(FinalizerEntry { topic, message_id }, receiver);
                 }
             }
@@ -462,7 +490,7 @@ async fn finalize_event_stream(
             Err(_error) => {
                 emit!(StreamClosedError { count: 1 });
             }
-            Ok(_) => {
+            Ok(()) => {
                 if let Err(error) = consumer.ack_with_id(topic.as_str(), message_id).await {
                     pulsar_error_events.emit(PulsarErrorEventData {
                         msg: error.to_string(),
@@ -520,40 +548,93 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::config::log_schema;
-    use crate::test_util::components::{assert_source_compliance, SOURCE_TAGS};
-    use crate::test_util::{collect_n, random_string, trace_init};
+    use crate::{
+        config::log_schema,
+        test_util::{
+            collect_n,
+            components::{SOURCE_TAGS, assert_source_compliance},
+            random_string, trace_init,
+        },
+        tls::TEST_PEM_INTERMEDIATE_CA_PATH,
+    };
 
-    fn pulsar_address() -> String {
-        std::env::var("PULSAR_ADDRESS").unwrap_or_else(|_| "pulsar://127.0.0.1:6650".into())
+    fn pulsar_host() -> String {
+        std::env::var("PULSAR_HOST").unwrap_or_else(|_| "127.0.0.1".into())
     }
 
+    fn pulsar_address(scheme: &str, port: u16) -> String {
+        format!("{scheme}://{}:{port}", pulsar_host())
+    }
     #[tokio::test]
     async fn consumes_event_with_acknowledgements() {
-        pulsar_send_receive(true, LogNamespace::Legacy).await;
+        Box::pin(pulsar_send_receive(
+            &pulsar_address("pulsar", 6650),
+            true,
+            LogNamespace::Legacy,
+            None,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn consumes_event_with_acknowledgements_vector_namespace() {
-        pulsar_send_receive(true, LogNamespace::Vector).await;
+        Box::pin(pulsar_send_receive(
+            &pulsar_address("pulsar", 6650),
+            true,
+            LogNamespace::Vector,
+            None,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn consumes_event_without_acknowledgements() {
-        pulsar_send_receive(false, LogNamespace::Legacy).await;
+        Box::pin(pulsar_send_receive(
+            &pulsar_address("pulsar", 6650),
+            false,
+            LogNamespace::Legacy,
+            None,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn consumes_event_without_acknowledgements_vector_namespace() {
-        pulsar_send_receive(false, LogNamespace::Vector).await;
+        Box::pin(pulsar_send_receive(
+            &pulsar_address("pulsar", 6650),
+            false,
+            LogNamespace::Vector,
+            None,
+        ))
+        .await;
     }
 
-    async fn pulsar_send_receive(acknowledgements: bool, log_namespace: LogNamespace) {
+    #[tokio::test]
+    async fn consumes_event_with_tls() {
+        Box::pin(pulsar_send_receive(
+            &pulsar_address("pulsar+ssl", 6651),
+            false,
+            LogNamespace::Vector,
+            Some(TlsOptions {
+                ca_file: TEST_PEM_INTERMEDIATE_CA_PATH.into(),
+                verify_certificate: None,
+                verify_hostname: None,
+            }),
+        ))
+        .await;
+    }
+
+    async fn pulsar_send_receive(
+        endpoint: &str,
+        acknowledgements: bool,
+        log_namespace: LogNamespace,
+        tls: Option<TlsOptions>,
+    ) {
         trace_init();
 
         let topic = format!("test-{}", random_string(10));
         let cnf = PulsarSourceConfig {
-            endpoint: pulsar_address(),
+            endpoint: endpoint.into(),
             topics: vec![topic.clone()],
             consumer_name: None,
             subscription_name: None,
@@ -565,12 +646,20 @@ mod integration_tests {
             decoding: DeserializerConfig::Bytes,
             acknowledgements: acknowledgements.into(),
             log_namespace: None,
+            tls: tls.clone(),
         };
+        let mut builder = Pulsar::<TokioExecutor>::builder(&cnf.endpoint, TokioExecutor);
+        if let Some(options) = &tls {
+            builder = builder
+                .with_certificate_chain_file(Path::new(&options.ca_file))
+                .unwrap();
+            builder =
+                builder.with_allow_insecure_connection(!options.verify_certificate.unwrap_or(true));
+            builder = builder
+                .with_tls_hostname_verification_enabled(options.verify_hostname.unwrap_or(true));
+        }
 
-        let pulsar = Pulsar::<TokioExecutor>::builder(&cnf.endpoint, TokioExecutor)
-            .build()
-            .await
-            .unwrap();
+        let pulsar = builder.build().await.unwrap();
 
         let consumer = cnf.create_consumer().await.unwrap();
         let decoder = DecodingConfig::new(
@@ -581,11 +670,13 @@ mod integration_tests {
         .build()
         .unwrap();
 
-        let mut producer = pulsar.producer().with_topic(topic).build().await.unwrap();
+        let mut producer = Box::pin(pulsar.producer().with_topic(topic).build())
+            .await
+            .unwrap();
 
         let msg = "test message";
 
-        let events = assert_source_compliance(&SOURCE_TAGS, async move {
+        let events = Box::pin(assert_source_compliance(&SOURCE_TAGS, async move {
             let (tx, rx) = SourceSender::new_test();
             tokio::spawn(pulsar_source(
                 consumer,
@@ -595,10 +686,10 @@ mod integration_tests {
                 acknowledgements,
                 log_namespace,
             ));
-            producer.send_non_blocking(msg).await.unwrap();
+            Box::pin(producer.send_non_blocking(msg)).await.unwrap();
 
             collect_n(rx, 1).await
-        })
+        }))
         .await;
 
         assert_eq!(

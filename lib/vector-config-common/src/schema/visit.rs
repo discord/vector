@@ -1,6 +1,6 @@
 use tracing::debug;
 
-use super::{get_cleaned_schema_reference, Map, RootSchema, Schema, SchemaObject, SingleOrVec};
+use super::{Map, RootSchema, Schema, SchemaObject, SingleOrVec, get_cleaned_schema_reference};
 
 /// Trait used to recursively modify a constructed schema and its subschemas.
 pub trait Visitor: std::fmt::Debug {
@@ -61,7 +61,7 @@ pub fn visit_schema_object<V: Visitor + ?Sized>(
 
                 v.visit_schema(defs, referenced_schema);
             },
-        )
+        );
     }
 
     if let Some(sub) = &mut schema.subschemas {
@@ -136,6 +136,10 @@ fn visit_single_or_vec<V: Visitor + ?Sized>(
     }
 }
 
+/// # Panics
+///
+/// Panics if the schema reference does not start with `#/definitions/` or its
+/// referenced definition is missing.
 pub fn with_resolved_schema_reference<F>(
     definitions: &mut Map<String, Schema>,
     schema: &mut SchemaObject,

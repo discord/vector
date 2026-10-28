@@ -4,10 +4,10 @@ mod test_util;
 
 use vector_lib::config::LogNamespace;
 
-use crate::sources::kubernetes_logs::transform_utils::get_message_path;
 use crate::{
     event::{Event, Value},
     internal_events::KubernetesLogsFormatPickerEdgeCase,
+    sources::kubernetes_logs::transform_utils::get_message_path,
     transforms::{FunctionTransform, OutputBuffer},
 };
 
@@ -43,18 +43,16 @@ impl FunctionTransform for Parser {
         match &mut self.state {
             ParserState::Uninitialized => {
                 let message_field = get_message_path(self.log_namespace);
-                let message = match event.as_log().get(&message_field) {
-                    Some(message) => message,
-                    None => {
-                        emit!(KubernetesLogsFormatPickerEdgeCase {
-                            what: "got an event without a message"
-                        });
-                        return;
-                    }
+                let Some(message) = event.as_log().get(&message_field) else {
+                    emit!(KubernetesLogsFormatPickerEdgeCase {
+                        what: "got an event without a message"
+                    });
+                    return;
                 };
 
                 let bytes = match message {
                     Value::Bytes(bytes) => bytes,
+                    Value::String(string) => string.as_bytes(),
                     _ => {
                         emit!(KubernetesLogsFormatPickerEdgeCase {
                             what: "got an event with non-bytes message"
@@ -68,7 +66,7 @@ impl FunctionTransform for Parser {
                 } else {
                     ParserState::Cri(cri::Cri::new(self.log_namespace))
                 };
-                self.transform(output, event)
+                self.transform(output, event);
             }
             ParserState::Docker(t) => t.transform(output, event),
             ParserState::Cri(t) => t.transform(output, event),
@@ -83,7 +81,10 @@ mod tests {
     use vrl::value;
 
     use super::*;
-    use crate::{event::Event, event::LogEvent, test_util::trace_init};
+    use crate::{
+        event::{Event, LogEvent},
+        test_util::trace_init,
+    };
 
     /// Picker has to work for all test cases for underlying parsers.
     fn valid_cases(log_namespace: LogNamespace) -> Vec<(Bytes, Vec<Event>)> {
@@ -131,7 +132,7 @@ mod tests {
             let mut output = OutputBuffer::default();
             parser.transform(&mut output, input.into());
 
-            assert!(output.is_empty(), "Expected no events: {:?}", output);
+            assert!(output.is_empty(), "Expected no events: {output:?}");
         }
     }
 
@@ -159,7 +160,7 @@ mod tests {
             let mut output = OutputBuffer::default();
             parser.transform(&mut output, input.into());
 
-            assert!(output.is_empty(), "Expected no events: {:?}", output);
+            assert!(output.is_empty(), "Expected no events: {output:?}");
         }
     }
 }

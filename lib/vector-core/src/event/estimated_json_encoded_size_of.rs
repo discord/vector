@@ -74,6 +74,7 @@ impl EstimatedJsonEncodedSizeOf for Value {
             Value::Object(v) => v.estimated_json_encoded_size_of(),
             Value::Array(v) => v.estimated_json_encoded_size_of(),
             Value::Bytes(v) => v.estimated_json_encoded_size_of(),
+            Value::String(v) => v.estimated_json_encoded_size_of(),
             Value::Regex(v) => v.as_str().estimated_json_encoded_size_of(),
             Value::Integer(v) => v.estimated_json_encoded_size_of(),
             Value::Float(v) => v.estimated_json_encoded_size_of(),
@@ -114,23 +115,19 @@ impl EstimatedJsonEncodedSizeOf for Bytes {
 
 impl EstimatedJsonEncodedSizeOf for bool {
     fn estimated_json_encoded_size_of(&self) -> JsonSize {
-        if *self {
-            TRUE_SIZE
-        } else {
-            FALSE_SIZE
-        }
+        if *self { TRUE_SIZE } else { FALSE_SIZE }
     }
 }
 
 impl EstimatedJsonEncodedSizeOf for f64 {
     fn estimated_json_encoded_size_of(&self) -> JsonSize {
-        ryu::Buffer::new().format_finite(*self).len().into()
+        zmij::Buffer::new().format_finite(*self).len().into()
     }
 }
 
 impl EstimatedJsonEncodedSizeOf for f32 {
     fn estimated_json_encoded_size_of(&self) -> JsonSize {
-        ryu::Buffer::new().format_finite(*self).len().into()
+        zmij::Buffer::new().format_finite(*self).len().into()
     }
 }
 
@@ -216,9 +213,9 @@ impl EstimatedJsonEncodedSizeOf for DateTime<Utc> {
         let ns = self.nanosecond() % 1_000_000_000;
         let epoch = if ns == 0 {
             EPOCH_RFC3339_0
-        } else if ns % 1_000_000 == 0 {
+        } else if ns.is_multiple_of(1_000_000) {
             EPOCH_RFC3339_3
-        } else if ns % 1_000 == 0 {
+        } else if ns.is_multiple_of(1_000) {
             EPOCH_RFC3339_6
         } else {
             EPOCH_RFC3339_9
@@ -446,10 +443,11 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
     use serde::Serialize;
+
+    use super::*;
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
     struct ValidString(String);
@@ -640,6 +638,7 @@ mod tests {
     fn is_inaccurately_counted_value(v: &Value) -> bool {
         match v {
             Value::Bytes(v) => is_inaccurately_counted_bytes(v),
+            Value::String(v) => is_inaccurately_counted_bytes(v.as_bytes()),
             Value::Object(v) => v.iter().any(|(k, v)| {
                 is_inaccurately_counted_bytes(k.as_bytes()) || is_inaccurately_counted_value(v)
             }),

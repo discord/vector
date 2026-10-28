@@ -5,32 +5,29 @@ use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use warp::{filters::BoxedFilter, path, path::FullPath, reply::Response, Filter};
-
-use vector_lib::internal_event::{CountByteSize, InternalEventHandle as _, Registered};
 use vector_lib::{
-    event::{DatadogMetricOriginMetadata, EventMetadata},
-    metrics::AgentDDSketch,
     EstimatedJsonEncodedSizeOf,
+    event::{DatadogMetricOriginMetadata, EventMetadata},
+    internal_event::{CountByteSize, InternalEventHandle as _, Registered},
+    metrics::AgentDDSketch,
 };
+use warp::{Filter, filters::BoxedFilter, path, path::FullPath, reply::Response};
 
+use super::ddmetric_proto::{Metadata, MetricPayload, SketchPayload, metric_payload};
+use super::{ApiKeyQueryParams, DatadogAgentSource, RequestHandler};
 use crate::{
-    common::datadog::{DatadogMetricType, DatadogSeriesMetric},
+    common::{
+        datadog::{DATADOG_METRIC_RESOURCE_TAG_PREFIX, DatadogMetricType, DatadogSeriesMetric},
+        http::ErrorMessage,
+    },
     config::log_schema,
     event::{
-        metric::{Metric, MetricValue},
         Event, MetricKind, MetricTags,
+        metric::{Metric, MetricValue},
     },
     internal_events::EventsReceived,
     schema,
-    sources::{
-        datadog_agent::{
-            ddmetric_proto::{metric_payload, Metadata, MetricPayload, SketchPayload},
-            handle_request, ApiKeyQueryParams, DatadogAgentSource,
-        },
-        util::{extract_tag_key_and_value, ErrorMessage},
-    },
-    SourceSender,
+    sources::util::{extract_tag_key_and_value, http::capped_body},
 };
 
 #[derive(Deserialize, Serialize)]
@@ -38,17 +35,13 @@ pub(crate) struct DatadogSeriesRequest {
     pub(crate) series: Vec<DatadogSeriesMetric>,
 }
 
-pub(crate) fn build_warp_filter(
-    acknowledgements: bool,
-    multiple_outputs: bool,
-    out: SourceSender,
+pub(super) fn build_warp_filter(
+    handler: RequestHandler,
     source: DatadogAgentSource,
 ) -> BoxedFilter<(Response,)> {
-    let output = multiple_outputs.then_some(super::METRICS);
-    let sketches_service = sketches_service(acknowledgements, output, out.clone(), source.clone());
-    let series_v1_service =
-        series_v1_service(acknowledgements, output, out.clone(), source.clone());
-    let series_v2_service = series_v2_service(acknowledgements, output, out, source);
+    let sketches_service = sketches_service(handler.clone(), source.clone());
+    let series_v1_service = series_v1_service(handler.clone(), source.clone());
+    let series_v2_service = series_v2_service(handler, source);
     sketches_service
         .or(series_v1_service)
         .unify()
@@ -58,9 +51,7 @@ pub(crate) fn build_warp_filter(
 }
 
 fn sketches_service(
-    acknowledgements: bool,
-    output: Option<&'static str>,
-    out: SourceSender,
+    handler: RequestHandler,
     source: DatadogAgentSource,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
@@ -69,8 +60,8 @@ fn sketches_service(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
-        .and_then(
+        .and(capped_body())
+        .and_then({
             move |path: FullPath,
                   encoding_header: Option<String>,
                   api_token: Option<String>,
@@ -86,19 +77,18 @@ fn sketches_service(
                                 api_token,
                                 query_params.dd_api_key,
                             ),
+                            source.split_metric_namespace,
                             &source.events_received,
                         )
                     });
-                handle_request(events, acknowledgements, out.clone(), output)
-            },
-        )
+                handler.clone().handle_request(events, super::METRICS)
+            }
+        })
         .boxed()
 }
 
 fn series_v1_service(
-    acknowledgements: bool,
-    output: Option<&'static str>,
-    out: SourceSender,
+    handler: RequestHandler,
     source: DatadogAgentSource,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
@@ -107,8 +97,8 @@ fn series_v1_service(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
-        .and_then(
+        .and(capped_body())
+        .and_then({
             move |path: FullPath,
                   encoding_header: Option<String>,
                   api_token: Option<String>,
@@ -127,19 +117,18 @@ fn series_v1_service(
                             // Currently metrics do not have schemas defined, so for now we just pass a
                             // default one.
                             &Arc::new(schema::Definition::default_legacy_namespace()),
+                            source.split_metric_namespace,
                             &source.events_received,
                         )
                     });
-                handle_request(events, acknowledgements, out.clone(), output)
-            },
-        )
+                handler.clone().handle_request(events, super::METRICS)
+            }
+        })
         .boxed()
 }
 
 fn series_v2_service(
-    acknowledgements: bool,
-    output: Option<&'static str>,
-    out: SourceSender,
+    handler: RequestHandler,
     source: DatadogAgentSource,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
@@ -148,8 +137,8 @@ fn series_v2_service(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
-        .and_then(
+        .and(capped_body())
+        .and_then({
             move |path: FullPath,
                   encoding_header: Option<String>,
                   api_token: Option<String>,
@@ -165,33 +154,36 @@ fn series_v2_service(
                                 api_token,
                                 query_params.dd_api_key,
                             ),
+                            source.split_metric_namespace,
                             &source.events_received,
                         )
                     });
-                handle_request(events, acknowledgements, out.clone(), output)
-            },
-        )
+                handler.clone().handle_request(events, super::METRICS)
+            }
+        })
         .boxed()
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Request handlers own payload and token values at this boundary."
+)]
 fn decode_datadog_sketches(
     body: Bytes,
     api_key: Option<Arc<str>>,
+    split_metric_namespace: bool,
     events_received: &Registered<EventsReceived>,
 ) -> Result<Vec<Event>, ErrorMessage> {
     if body.is_empty() {
         // The datadog agent may send an empty payload as a keep alive
-        debug!(
-            message = "Empty payload ignored.",
-            internal_log_rate_limit = true
-        );
+        debug!(message = "Empty payload ignored.");
         return Ok(Vec::new());
     }
 
-    let metrics = decode_ddsketch(body, &api_key).map_err(|error| {
+    let metrics = decode_ddsketch(body, &api_key, split_metric_namespace).map_err(|error| {
         ErrorMessage::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("Error decoding Datadog sketch: {:?}", error),
+            format!("Error decoding Datadog sketch: {error:?}"),
         )
     })?;
 
@@ -203,24 +195,26 @@ fn decode_datadog_sketches(
     Ok(metrics)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Request handlers own payload and token values at this boundary."
+)]
 fn decode_datadog_series_v2(
     body: Bytes,
     api_key: Option<Arc<str>>,
+    split_metric_namespace: bool,
     events_received: &Registered<EventsReceived>,
 ) -> Result<Vec<Event>, ErrorMessage> {
     if body.is_empty() {
         // The datadog agent may send an empty payload as a keep alive
-        debug!(
-            message = "Empty payload ignored.",
-            internal_log_rate_limit = true
-        );
+        debug!(message = "Empty payload ignored.");
         return Ok(Vec::new());
     }
 
-    let metrics = decode_ddseries_v2(body, &api_key).map_err(|error| {
+    let metrics = decode_ddseries_v2(body, &api_key, split_metric_namespace).map_err(|error| {
         ErrorMessage::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("Error decoding Datadog sketch: {:?}", error),
+            format!("Error decoding Datadog sketch: {error:?}"),
         )
     })?;
 
@@ -240,9 +234,7 @@ fn get_event_metadata(metadata: Option<&Metadata>) -> EventMetadata {
         .map_or_else(EventMetadata::default, |origin| {
             trace!(
                 "Deserialized origin_product: `{}` origin_category: `{}` origin_service: `{}`.",
-                origin.origin_product,
-                origin.origin_category,
-                origin.origin_service,
+                origin.origin_product, origin.origin_category, origin.origin_service,
             );
             EventMetadata::default().with_origin_metadata(DatadogMetricOriginMetadata::new(
                 Some(origin.origin_product),
@@ -252,16 +244,34 @@ fn get_event_metadata(metadata: Option<&Metadata>) -> EventMetadata {
         })
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "Changing this shared optional metadata signature is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+)]
 pub(crate) fn decode_ddseries_v2(
     frame: Bytes,
     api_key: &Option<Arc<str>>,
+    split_metric_namespace: bool,
 ) -> crate::Result<Vec<Event>> {
     let payload = MetricPayload::decode(frame)?;
     let decoded_metrics: Vec<Event> = payload
         .series
         .into_iter()
         .flat_map(|serie| {
-            let (namespace, name) = namespace_name_from_dd_metric(&serie.metric);
+            let (namespace, name) = if split_metric_namespace {
+                namespace_name_from_dd_metric(&serie.metric)
+            } else {
+                (None, serie.metric.as_str())
+            };
             let mut tags = into_metric_tags(serie.tags);
 
             let event_metadata = get_event_metadata(serie.metadata.as_ref());
@@ -294,15 +304,22 @@ pub(crate) fn decode_ddseries_v2(
             };
 
             serie.resources.into_iter().for_each(|r| {
-                // As per https://github.com/DataDog/datadog-agent/blob/a62ac9fb13e1e5060b89e731b8355b2b20a07c5b/pkg/serializer/internal/metrics/iterable_series.go#L180-L189
-                // the hostname can be found in MetricSeries::resources and that is the only value stored there.
+                // As per https://github.com/DataDog/datadog-agent/blob/965622d50073913d95176606ebcbd0f7553627b6/pkg/serializer/internal/metrics/iterable_series.go#L201-L264
+                // MetricSeries::resources can contain host, device, and other series resources.
                 if r.r#type.eq("host") {
                     log_schema()
                         .host_key()
                         .and_then(|key| tags.replace(key.to_string(), r.name));
+                } else if r.r#type.eq("device") {
+                    // The `device` resource type is used by Agent checks (disk, SNMP/NDM, etc.)
+                    // and must be preserved as a plain `device` tag to match the v1 series behavior.
+                    tags.replace("device".into(), r.name);
                 } else {
-                    // But to avoid losing information if this situation changes, any other resource type/name will be saved in the tags map
-                    tags.replace(format!("resource.{}", r.r#type), r.name);
+                    // Preserve other resources in the generic metric tags.
+                    tags.insert(
+                        format!("{DATADOG_METRIC_RESOURCE_TAG_PREFIX}{}", r.r#type),
+                        r.name,
+                    );
                 }
             });
             (!serie.source_type_name.is_empty())
@@ -359,13 +376,12 @@ pub(crate) fn decode_ddseries_v2(
                     .map(|dd_point| {
                         let i = Some(serie.interval)
                             .filter(|v| *v != 0)
-                            .map(|v| v as u32)
-                            .unwrap_or(1);
+                            .map_or(1, |v| v as u32);
                         Metric::new_with_metadata(
                             name.to_string(),
                             MetricKind::Incremental,
                             MetricValue::Counter {
-                                value: dd_point.value * (i as f64),
+                                value: dd_point.value * f64::from(i),
                             },
                             event_metadata.clone(),
                         )
@@ -397,32 +413,41 @@ pub(crate) fn decode_ddseries_v2(
     Ok(decoded_metrics)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Request handlers own payload and token values at this boundary."
+)]
 fn decode_datadog_series_v1(
     body: Bytes,
     api_key: Option<Arc<str>>,
     schema_definition: &Arc<schema::Definition>,
+    split_metric_namespace: bool,
     events_received: &Registered<EventsReceived>,
 ) -> Result<Vec<Event>, ErrorMessage> {
     if body.is_empty() {
         // The datadog agent may send an empty payload as a keep alive
-        debug!(
-            message = "Empty payload ignored.",
-            internal_log_rate_limit = true
-        );
+        debug!(message = "Empty payload ignored.");
         return Ok(Vec::new());
     }
 
     let metrics: DatadogSeriesRequest = serde_json::from_slice(&body).map_err(|error| {
         ErrorMessage::new(
             StatusCode::BAD_REQUEST,
-            format!("Error parsing JSON: {:?}", error),
+            format!("Error parsing JSON: {error:?}"),
         )
     })?;
 
     let decoded_metrics: Vec<Event> = metrics
         .series
         .into_iter()
-        .flat_map(|m| into_vector_metric(m, api_key.clone(), schema_definition))
+        .flat_map(|m| {
+            into_vector_metric(
+                m,
+                api_key.clone(),
+                schema_definition,
+                split_metric_namespace,
+            )
+        })
         .collect();
 
     events_received.emit(CountByteSize(
@@ -434,13 +459,20 @@ fn decode_datadog_series_v1(
 }
 
 fn into_metric_tags(tags: Vec<String>) -> MetricTags {
-    tags.iter().map(extract_tag_key_and_value).collect()
+    tags.into_iter()
+        .map(|tag| extract_tag_key_and_value(&tag))
+        .collect()
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Request handlers own payload and token values at this boundary."
+)]
 fn into_vector_metric(
     dd_metric: DatadogSeriesMetric,
     api_key: Option<Arc<str>>,
     schema_definition: &Arc<schema::Definition>,
+    split_metric_namespace: bool,
 ) -> Vec<Event> {
     let mut tags = into_metric_tags(dd_metric.tags.unwrap_or_default());
 
@@ -457,7 +489,11 @@ fn into_vector_metric(
         .device
         .and_then(|dev| tags.replace("device".into(), dev));
 
-    let (namespace, name) = namespace_name_from_dd_metric(&dd_metric.metric);
+    let (namespace, name) = if split_metric_namespace {
+        namespace_name_from_dd_metric(&dd_metric.metric)
+    } else {
+        (None, dd_metric.metric.as_str())
+    };
 
     match dd_metric.r#type {
         DatadogMetricType::Count => dd_metric
@@ -507,7 +543,7 @@ fn into_vector_metric(
                     name.to_string(),
                     MetricKind::Incremental,
                     MetricValue::Counter {
-                        value: dd_point.1 * (i as f64),
+                        value: dd_point.1 * f64::from(i),
                     },
                 )
                 .with_timestamp(Some(
@@ -547,9 +583,19 @@ fn namespace_name_from_dd_metric(dd_metric_name: &str) -> (Option<&str>, &str) {
     }
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "Changing this shared optional metadata signature is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+)]
 pub(crate) fn decode_ddsketch(
     frame: Bytes,
     api_key: &Option<Arc<str>>,
+    split_metric_namespace: bool,
 ) -> crate::Result<Vec<Event>> {
     let payload = SketchPayload::decode(frame)?;
     // payload.metadata is always empty for payload coming from dd agents
@@ -580,7 +626,11 @@ pub(crate) fn decode_ddsketch(
                     )
                     .unwrap_or_else(AgentDDSketch::with_agent_defaults),
                 );
-                let (namespace, name) = namespace_name_from_dd_metric(&sketch_series.metric);
+                let (namespace, name) = if split_metric_namespace {
+                    namespace_name_from_dd_metric(&sketch_series.metric)
+                } else {
+                    (None, sketch_series.metric.as_str())
+                };
                 let mut metric = Metric::new_with_metadata(
                     name.to_string(),
                     MetricKind::Incremental,

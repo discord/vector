@@ -6,26 +6,26 @@ use std::{
 };
 
 use criterion::{
-    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId,
-    Criterion, SamplingMode, Throughput,
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group,
+    criterion_main, measurement::WallTime,
 };
 use tokio::runtime::{Handle, Runtime};
-use vector_buffers::{BufferType, WhenFull};
+use vector_buffers::{BufferType, MemoryBufferSize, WhenFull};
 
 use crate::common::{init_instrumentation, war_measurement, wtr_measurement};
 
 mod common;
 
-/// A struct to manage the data_dir of an on-disk benchmark
+/// A struct to manage the `data_dir` of an on-disk benchmark
 ///
-/// The way our benchmarks function we have the choice of sharing a data_dir
-/// between benchmarks or give each benchmark its own data_dir. The first option
+/// The way our benchmarks function we have the choice of sharing a `data_dir`
+/// between benchmarks or give each benchmark its own `data_dir`. The first option
 /// will cause cross-pollution of benchmarks so that's a no-go. The second
 /// option will fill up the benchmarker's disk. Filling up disk is a no-go but
 /// is something we can manage.
 ///
 /// This struct keeps track of the current iteration of the tests and manages
-/// new sub-data_dir paths. These paths, wrapped in a [`PathGuard`]
+/// new sub-`data_dir` paths. These paths, wrapped in a [`PathGuard`]
 /// self-destruct when the benchmark drops them while this struct self-destructs
 /// when it is dropped. This keeps disk consumption to a minimum.
 struct DataDir {
@@ -35,6 +35,12 @@ struct DataDir {
 
 struct PathGuard {
     inner: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum BoundBy {
+    Bytes,
+    NumberEvents,
 }
 
 impl DataDir {
@@ -52,7 +58,7 @@ impl DataDir {
 
     fn next(&mut self) -> PathGuard {
         let mut nxt = self.base.clone();
-        nxt.push(&self.index.to_string());
+        nxt.push(self.index.to_string());
         self.index += 1;
         std::fs::create_dir_all(&nxt).expect("could not make next dir");
 
@@ -79,9 +85,19 @@ fn create_disk_v2_variant(_max_events: usize, max_size: u64) -> BufferType {
     }
 }
 
-fn create_in_memory_variant(max_events: usize, _max_size: u64) -> BufferType {
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Preserve the benchmark buffer-size conversion on all target widths. https://github.com/vectordotdev/vector/issues/23659"
+)]
+fn create_in_memory_variant(bound_by: BoundBy, max_events: usize, max_size: u64) -> BufferType {
+    let size = match bound_by {
+        BoundBy::Bytes => MemoryBufferSize::MaxSize(NonZeroUsize::new(max_size as usize).unwrap()),
+        BoundBy::NumberEvents => {
+            MemoryBufferSize::MaxEvents(NonZeroUsize::new(max_events).unwrap())
+        }
+    };
     BufferType::Memory {
-        max_events: NonZeroUsize::new(max_events).unwrap(),
+        size,
         when_full: WhenFull::DropNewest,
     }
 }
@@ -146,13 +162,24 @@ fn write_then_read(c: &mut Criterion) {
         create_disk_v2_variant
     );
 
+    let f = |a, b| create_in_memory_variant(BoundBy::NumberEvents, a, b);
     experiment!(
         c,
         [32, 64, 128, 256, 512, 1024],
         "buffer-in-memory-v2",
         "write-then-read",
         wtr_measurement,
-        create_in_memory_variant
+        f
+    );
+
+    let f = |a, b| create_in_memory_variant(BoundBy::Bytes, a, b);
+    experiment!(
+        c,
+        [32, 64, 128, 256, 512, 1024],
+        "buffer-in-memory-bytes-v2",
+        "write-then-read",
+        wtr_measurement,
+        f
     );
 }
 
@@ -167,20 +194,31 @@ fn write_and_read(c: &mut Criterion) {
         create_disk_v2_variant
     );
 
+    let f = |a, b| create_in_memory_variant(BoundBy::NumberEvents, a, b);
     experiment!(
         c,
         [32, 64, 128, 256, 512, 1024],
         "buffer-in-memory-v2",
         "write-and-read",
         war_measurement,
-        create_in_memory_variant
+        f
+    );
+
+    let f = |a, b| create_in_memory_variant(BoundBy::Bytes, a, b);
+    experiment!(
+        c,
+        [32, 64, 128, 256, 512, 1024],
+        "buffer-in-memory-bytes-v2",
+        "write-and-read",
+        war_measurement,
+        f
     );
 }
 
 criterion_group!(
     name = sized_records;
     config = Criterion::default()
-        .measurement_time(Duration::from_secs(60))
+        .measurement_time(Duration::from_mins(1))
         .confidence_level(0.99)
         .nresamples(500_000)
         .sample_size(100);

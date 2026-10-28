@@ -1,55 +1,71 @@
 use std::{fs::remove_file, path::PathBuf, time::Duration};
 
-use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
+use smallvec::SmallVec;
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
     time::sleep,
 };
 use tokio_stream::wrappers::UnixListenerStream;
-use tokio_util::codec::FramedRead;
-use tracing::{field, Instrument};
-use vector_lib::codecs::StreamDecodingError;
-use vector_lib::internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol};
-use vector_lib::EstimatedJsonEncodedSizeOf;
+use tracing::{Instrument, field};
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    codecs::{DecoderFramedRead, StreamDecodingError},
+    internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
+};
 
 use super::AfterReadExt;
 use crate::{
+    SourceSender,
     async_read::VecAsyncReadExt,
-    codecs::Decoder,
     event::Event,
     internal_events::{
         ConnectionOpen, OpenGauge, SocketEventsReceived, SocketMode, StreamClosedError,
         UnixSocketError, UnixSocketFileDeleteError,
     },
     shutdown::ShutdownSignal,
-    sources::util::change_socket_permissions,
-    sources::util::unix::{remove_stale_socket, UNNAMED_SOCKET_HOST},
-    sources::Source,
-    SourceSender,
+    sources::{
+        Source,
+        util::{
+            change_socket_permissions,
+            unix::{UNNAMED_SOCKET_HOST, remove_stale_socket},
+        },
+    },
 };
 
+///
+/// # Errors
+///
+/// The returned source reports an error if processing the socket stream fails.
+///
+/// # Panics
+///
+/// The returned source panics if binding the listener or setting its permissions fails.
 /// Returns a `Source` object corresponding to a Unix domain stream socket.
 /// Passing in different functions for `decoder` and `handle_events` can allow
 /// for different source-specific logic (such as decoding syslog messages in the
 /// syslog source).
-pub fn build_unix_stream_source(
+pub fn build_unix_stream_source<D, F, E>(
     listen_path: PathBuf,
     socket_file_mode: Option<u32>,
-    decoder: Decoder,
-    handle_events: impl Fn(&mut [Event], Option<Bytes>) + Clone + Send + Sync + 'static,
+    decoder: D,
+    handle_events: impl Fn(&mut [Event], Option<String>) + Clone + Send + Sync + 'static,
     shutdown: ShutdownSignal,
     out: SourceSender,
-) -> crate::Result<Source> {
+) -> crate::Result<Source>
+where
+    D: tokio_util::codec::Decoder<Item = (F, usize), Error = E> + Clone + Send + 'static,
+    E: StreamDecodingError + std::fmt::Display + Send + From<std::io::Error>,
+    F: Into<SmallVec<[Event; 1]>> + Send,
+{
     Ok(Box::pin(async move {
         remove_stale_socket(&listen_path);
 
         let listener = UnixListener::bind(&listen_path).unwrap_or_else(|e| {
             panic!(
-                "Failed to bind to listener socket at path: {}. Err: {}",
-                listen_path.to_string_lossy(),
-                e
+                "Failed to bind to listener socket at path: {}. Err: {e}",
+                listen_path.to_string_lossy()
             )
         });
         info!(message = "Listening.", path = ?listen_path, r#type = "unix");
@@ -75,14 +91,14 @@ pub fn build_unix_stream_source(
 
             let span = info_span!("connection");
 
-            let received_from: Bytes = socket
+            let received_from = socket
                 .peer_addr()
                 .ok()
                 .and_then(|addr| {
-                    addr.as_pathname().map(|e| e.to_owned()).map({
+                    addr.as_pathname().map(ToOwned::to_owned).map({
                         |path| {
-                            span.record("peer_path", &field::debug(&path));
-                            path.to_string_lossy().into_owned().into()
+                            span.record("peer_path", field::debug(&path));
+                            path.to_string_lossy().into_owned()
                         }
                     })
                 })
@@ -90,7 +106,7 @@ pub fn build_unix_stream_source(
                 // an unnamed socket (a socket not bound to a
                 // file). Instead of a filename, we'll surface a specific
                 // host value.
-                .unwrap_or_else(|| UNNAMED_SOCKET_HOST.into());
+                .unwrap_or_else(|| UNNAMED_SOCKET_HOST.to_owned());
 
             let handle_events = handle_events.clone();
 
@@ -100,7 +116,7 @@ pub fn build_unix_stream_source(
                     bytes_received.emit(ByteSize(byte_size));
                 })
                 .allow_read_until(shutdown.clone().map(|_| ()));
-            let mut stream = FramedRead::new(stream, decoder.clone());
+            let mut stream = DecoderFramedRead::new(stream, decoder.clone());
 
             let connection_open = connection_open.clone();
             let mut out = out.clone();
@@ -110,7 +126,9 @@ pub fn build_unix_stream_source(
 
                     while let Some(result) = stream.next().await {
                         match result {
-                            Ok((mut events, _byte_size)) => {
+                            Ok((frame, _byte_size)) => {
+                                let mut events = frame.into();
+
                                 emit!(SocketEventsReceived {
                                     mode: SocketMode::Unix,
                                     byte_size: events.estimated_json_encoded_size_of(),

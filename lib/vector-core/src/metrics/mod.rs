@@ -1,5 +1,6 @@
 mod ddsketch;
 mod label_filter;
+mod metric_matcher;
 mod recency;
 mod recorder;
 mod storage;
@@ -7,18 +8,26 @@ mod storage;
 use std::{sync::OnceLock, time::Duration};
 
 use chrono::Utc;
+use metric_matcher::MetricKeyMatcher;
 use metrics::Key;
 use metrics_tracing_context::TracingContextLayer;
 use metrics_util::layers::Layer;
 use snafu::Snafu;
 
 pub use self::ddsketch::{AgentDDSketch, BinMap, Config};
-use self::{label_filter::VectorLabelFilter, recorder::Registry, recorder::VectorRecorder};
-use crate::event::{Metric, MetricValue};
+pub use self::label_filter::{LABELS, MetricLabel};
+use self::{
+    label_filter::VectorLabelFilter,
+    recorder::{Registry, VectorRecorder},
+};
+use crate::{
+    config::metrics_expiration::PerMetricSetExpiration,
+    event::{Metric, MetricValue},
+};
 
 type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Snafu)]
+#[derive(Clone, Debug, PartialEq, Snafu)]
 pub enum Error {
     #[snafu(display("Recorder already initialized."))]
     AlreadyInitialized,
@@ -26,6 +35,8 @@ pub enum Error {
     NotInitialized,
     #[snafu(display("Timeout value of {} must be positive.", timeout))]
     TimeoutMustBePositive { timeout: f64 },
+    #[snafu(display("Invalid regex pattern: {}.", pattern))]
+    InvalidRegexPattern { pattern: String },
 }
 
 static CONTROLLER: OnceLock<Controller> = OnceLock::new();
@@ -142,14 +153,27 @@ impl Controller {
     /// # Errors
     ///
     /// The contained timeout value must be positive.
-    pub fn set_expiry(&self, timeout: Option<f64>) -> Result<()> {
-        if let Some(timeout) = timeout {
-            if timeout <= 0.0 {
-                return Err(Error::TimeoutMustBePositive { timeout });
-            }
+    pub fn set_expiry(
+        &self,
+        global_timeout: Option<f64>,
+        expire_metrics_per_metric_set: Vec<PerMetricSetExpiration>,
+    ) -> Result<()> {
+        if let Some(timeout) = global_timeout
+            && timeout <= 0.0
+        {
+            return Err(Error::TimeoutMustBePositive { timeout });
         }
-        self.recorder
-            .with_registry(|registry| registry.set_expiry(timeout.map(Duration::from_secs_f64)));
+        let per_metric_expiration = expire_metrics_per_metric_set
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<(MetricKeyMatcher, Duration)>>>()?;
+
+        self.recorder.with_registry(|registry| {
+            registry.set_expiry(
+                global_timeout.map(Duration::from_secs_f64),
+                per_metric_expiration,
+            );
+        });
         Ok(())
     }
 
@@ -177,55 +201,21 @@ impl Controller {
     }
 }
 
-#[macro_export]
-/// This macro is used to emit metrics as a `counter` while simultaneously
-/// converting from absolute values to incremental values.
-///
-/// Values that do not arrive in strictly monotonically increasing order are
-/// ignored and will not be emitted.
-macro_rules! update_counter {
-    ($label:literal, $value:expr) => {{
-        use ::std::sync::atomic::{AtomicU64, Ordering};
-
-        static PREVIOUS_VALUE: AtomicU64 = AtomicU64::new(0);
-
-        let new_value = $value;
-        let mut previous_value = PREVIOUS_VALUE.load(Ordering::Relaxed);
-
-        loop {
-            // Either a new greater value has been emitted before this thread updated the counter
-            // or values were provided that are not in strictly monotonically increasing order.
-            // Ignore.
-            if new_value <= previous_value {
-                break;
-            }
-
-            match PREVIOUS_VALUE.compare_exchange_weak(
-                previous_value,
-                new_value,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                // Another thread has written a new value before us. Re-enter loop.
-                Err(value) => previous_value = value,
-                // Calculate delta to last emitted value and emit it.
-                Ok(_) => {
-                    let delta = new_value - previous_value;
-                    // Albeit very unlikely, note that this sequence of deltas might be emitted in
-                    // a different order than they were calculated.
-                    counter!($label).increment(delta);
-                    break;
-                }
-            }
-        }
-    }};
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use strum::IntoEnumIterator;
+    use vector_common::{
+        counter, gauge,
+        internal_event::{CounterName, GaugeName},
+    };
 
-    use crate::event::MetricKind;
+    use super::*;
+    use crate::{
+        config::metrics_expiration::{
+            MetricLabelMatcher, MetricLabelMatcherConfig, MetricNameMatcherConfig,
+        },
+        event::MetricKind,
+    };
 
     const IDLE_TIMEOUT: f64 = 0.5;
 
@@ -241,8 +231,9 @@ mod tests {
             let controller = Controller::get().unwrap();
             controller.reset();
 
+            let name = CounterName::iter().next().unwrap();
             for idx in 0..cardinality {
-                metrics::counter!("test", "idx" => idx.to_string()).increment(1);
+                counter!(name, "idx" => idx.to_string()).increment(1);
             }
 
             let metrics = controller.capture_metrics();
@@ -270,11 +261,11 @@ mod tests {
     fn handles_registered_metrics() {
         let controller = init_metrics();
 
-        let counter = metrics::counter!("test7");
+        let counter = counter!(CounterName::iter().next().unwrap());
         assert_eq!(controller.capture_metrics().len(), 3);
         counter.increment(1);
         assert_eq!(controller.capture_metrics().len(), 3);
-        let gauge = metrics::gauge!("test8");
+        let gauge = gauge!(GaugeName::iter().next().unwrap());
         assert_eq!(controller.capture_metrics().len(), 4);
         gauge.set(1.0);
         assert_eq!(controller.capture_metrics().len(), 4);
@@ -283,38 +274,53 @@ mod tests {
     #[test]
     fn expires_metrics() {
         let controller = init_metrics();
-        controller.set_expiry(Some(IDLE_TIMEOUT)).unwrap();
+        controller
+            .set_expiry(Some(IDLE_TIMEOUT), Vec::new())
+            .unwrap();
 
-        metrics::counter!("test2").increment(1);
-        metrics::counter!("test3").increment(2);
+        let mut names = CounterName::iter();
+        let name_a = names.next().unwrap();
+        let name_b = names.next().unwrap();
+
+        counter!(name_a).increment(1);
+        counter!(name_b).increment(2);
         assert_eq!(controller.capture_metrics().len(), 4);
 
         std::thread::sleep(Duration::from_secs_f64(IDLE_TIMEOUT * 2.0));
-        metrics::counter!("test2").increment(3);
+        counter!(name_a).increment(3);
         assert_eq!(controller.capture_metrics().len(), 3);
     }
 
     #[test]
     fn expires_metrics_tags() {
         let controller = init_metrics();
-        controller.set_expiry(Some(IDLE_TIMEOUT)).unwrap();
+        controller
+            .set_expiry(Some(IDLE_TIMEOUT), Vec::new())
+            .unwrap();
 
-        metrics::counter!("test4", "tag" => "value1").increment(1);
-        metrics::counter!("test4", "tag" => "value2").increment(2);
+        let name = CounterName::iter().next().unwrap();
+        counter!(name, "tag" => "value1").increment(1);
+        counter!(name, "tag" => "value2").increment(2);
         assert_eq!(controller.capture_metrics().len(), 4);
 
         std::thread::sleep(Duration::from_secs_f64(IDLE_TIMEOUT * 2.0));
-        metrics::counter!("test4", "tag" => "value1").increment(3);
+        counter!(name, "tag" => "value1").increment(3);
         assert_eq!(controller.capture_metrics().len(), 3);
     }
 
     #[test]
     fn skips_expiring_registered() {
         let controller = init_metrics();
-        controller.set_expiry(Some(IDLE_TIMEOUT)).unwrap();
+        controller
+            .set_expiry(Some(IDLE_TIMEOUT), Vec::new())
+            .unwrap();
 
-        let a = metrics::counter!("test5");
-        metrics::counter!("test6").increment(5);
+        let mut names = CounterName::iter();
+        let name_a = names.next().unwrap();
+        let name_b = names.next().unwrap();
+
+        let a = counter!(name_a);
+        counter!(name_b).increment(5);
         assert_eq!(controller.capture_metrics().len(), 4);
         a.increment(1);
         assert_eq!(controller.capture_metrics().len(), 4);
@@ -327,11 +333,95 @@ mod tests {
         assert_eq!(metrics.len(), 3);
         let metric = metrics
             .into_iter()
-            .find(|metric| metric.name() == "test5")
+            .find(|metric| metric.name() == name_a.as_str())
             .expect("Test metric is not present");
         match metric.value() {
             MetricValue::Counter { value } => assert_eq!(*value, 2.0),
             value => panic!("Invalid metric value {value:?}"),
         }
+    }
+
+    #[test]
+    fn expires_metrics_per_set() {
+        let controller = init_metrics();
+
+        let mut names = CounterName::iter();
+        let name_a = names.next().unwrap();
+        let name_b = names.next().unwrap();
+
+        controller
+            .set_expiry(
+                None,
+                vec![PerMetricSetExpiration {
+                    name: Some(MetricNameMatcherConfig::Exact {
+                        value: name_b.as_str().to_string(),
+                    }),
+                    labels: None,
+                    expire_secs: IDLE_TIMEOUT,
+                }],
+            )
+            .unwrap();
+
+        counter!(name_a).increment(1);
+        counter!(name_b).increment(2);
+        assert_eq!(controller.capture_metrics().len(), 4);
+
+        std::thread::sleep(Duration::from_secs_f64(IDLE_TIMEOUT * 2.0));
+        counter!(name_a).increment(3);
+        assert_eq!(controller.capture_metrics().len(), 3);
+    }
+
+    #[test]
+    fn expires_metrics_multiple_different_sets() {
+        let controller = init_metrics();
+
+        let mut names = CounterName::iter();
+        let name_a = names.next().unwrap();
+        let name_b = names.next().unwrap();
+        let name_c = names.next().unwrap();
+        let name_d = names.next().unwrap();
+
+        controller
+            .set_expiry(
+                Some(IDLE_TIMEOUT * 3.0),
+                vec![
+                    PerMetricSetExpiration {
+                        name: Some(MetricNameMatcherConfig::Exact {
+                            value: name_c.as_str().to_string(),
+                        }),
+                        labels: None,
+                        expire_secs: IDLE_TIMEOUT,
+                    },
+                    PerMetricSetExpiration {
+                        name: None,
+                        labels: Some(MetricLabelMatcherConfig::All {
+                            matchers: vec![MetricLabelMatcher::Exact {
+                                key: "tag".to_string(),
+                                value: "value1".to_string(),
+                            }],
+                        }),
+                        expire_secs: IDLE_TIMEOUT * 2.0,
+                    },
+                ],
+            )
+            .unwrap();
+
+        counter!(name_a).increment(1);
+        counter!(name_b).increment(1);
+        counter!(name_c).increment(2);
+        counter!(name_d, "tag" => "value1").increment(3);
+        assert_eq!(controller.capture_metrics().len(), 6);
+
+        std::thread::sleep(Duration::from_secs_f64(IDLE_TIMEOUT * 1.5));
+        counter!(name_b).increment(3);
+        assert_eq!(controller.capture_metrics().len(), 5);
+
+        std::thread::sleep(Duration::from_secs_f64(IDLE_TIMEOUT));
+        counter!(name_b).increment(3);
+        assert_eq!(controller.capture_metrics().len(), 4);
+
+        std::thread::sleep(Duration::from_secs_f64(IDLE_TIMEOUT));
+        counter!(name_b).increment(3);
+        assert_eq!(controller.capture_metrics().len(), 3);
     }
 }

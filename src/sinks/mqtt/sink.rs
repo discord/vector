@@ -1,56 +1,19 @@
 use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt};
-use rumqttc::{AsyncClient, EventLoop, MqttOptions};
-use snafu::{ResultExt, Snafu};
-use vector_lib::tls::TlsError;
-
-use crate::internal_events::MqttConnectionError;
-use crate::sinks::prelude::*;
+use futures::{StreamExt, stream::BoxStream};
 
 use super::{
-    config::{ConfigurationError, MqttQoS},
+    MqttSinkConfig,
+    config::MqttQoS,
     request_builder::{MqttEncoder, MqttRequestBuilder},
     service::MqttService,
-    MqttSinkConfig,
 };
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum MqttError {
-    #[snafu(display("invalid topic template: {}", source))]
-    TopicTemplate { source: TemplateParseError },
-    #[snafu(display("TLS error: {}", source))]
-    Tls { source: TlsError },
-    #[snafu(display("MQTT configuration error: {}", source))]
-    Configuration { source: ConfigurationError },
-}
-
-#[derive(Clone)]
-pub struct MqttConnector {
-    options: MqttOptions,
-    topic: Template,
-}
-
-impl MqttConnector {
-    pub fn new(options: MqttOptions, topic: String) -> Result<Self, MqttError> {
-        let topic = Template::try_from(topic).context(TopicTemplateSnafu)?;
-        Ok(Self { options, topic })
-    }
-
-    fn connect(&self) -> (AsyncClient, EventLoop) {
-        AsyncClient::new(self.options.clone(), 1024)
-    }
-
-    pub async fn healthcheck(&self) -> crate::Result<()> {
-        // TODO: Right now there is no way to implement the healthcheck properly: https://github.com/bytebeamio/rumqtt/issues/562
-        Ok(())
-    }
-}
+use crate::{common::mqtt::MqttConnector, internal_events::MqttConnectionError, sinks::prelude::*};
 
 pub struct MqttSink {
     transformer: Transformer,
     encoder: Encoder<()>,
     connector: MqttConnector,
+    topic: ConfinedTemplate,
     quality_of_service: MqttQoS,
     retain: bool,
 }
@@ -61,7 +24,11 @@ pub(super) struct MqttEvent {
 }
 
 impl MqttSink {
-    pub fn new(config: &MqttSinkConfig, connector: MqttConnector) -> crate::Result<Self> {
+    pub fn new(
+        config: &MqttSinkConfig,
+        topic: ConfinedTemplate,
+        connector: MqttConnector,
+    ) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
@@ -70,6 +37,7 @@ impl MqttSink {
             transformer,
             encoder,
             connector,
+            topic,
             quality_of_service: config.quality_of_service,
             retain: config.retain,
         })
@@ -77,7 +45,6 @@ impl MqttSink {
 
     fn make_mqtt_event(&self, event: Event) -> Option<MqttEvent> {
         let topic = self
-            .connector
             .topic
             .render_string(&event)
             .map_err(|missing_keys| {
@@ -85,7 +52,7 @@ impl MqttSink {
                     error: missing_keys,
                     field: Some("topic"),
                     drop_event: true,
-                })
+                });
             })
             .ok()?;
 
@@ -96,7 +63,7 @@ impl MqttSink {
         let (client, mut connection) = self.connector.connect();
 
         // This is necessary to keep the mqtt event loop moving forward.
-        tokio::spawn(async move {
+        crate::spawn_in_current_span(async move {
             loop {
                 // If an error is returned here there is currently no way to tie this back
                 // to the event that was posted which means we can't accurately provide
@@ -133,7 +100,7 @@ impl MqttSink {
             .filter_map(|request| async move {
                 match request {
                     Err(e) => {
-                        error!("Failed to build MQTT request: {:?}.", e);
+                        error!("Failed to build MQTT request: {e:?}.");
                         None
                     }
                     Ok(req) => Some(req),

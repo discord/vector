@@ -107,7 +107,7 @@ if [[ -z "${CONTAINER_IMAGE:-}" ]]; then
 
     # Build docker image with Vector - the same way it's done for releases. Don't
     # do the push - we'll handle it later.
-    REPO="$CONTAINER_IMAGE_REPO" \
+    REPOS="$CONTAINER_IMAGE_REPO" \
       CHANNEL="test" \
       BASE="$BASE_TAG" \
       TAG="$VERSION_TAG" \
@@ -122,7 +122,13 @@ fi
 if [[ -z "${SKIP_CONTAINER_IMAGE_PUBLISHING:-}" ]]; then
   # Make the container image accessible to the k8s cluster.
   if is_minikube_cache_enabled; then
-    minikube image load "$CONTAINER_IMAGE"
+    # Docker 25+ (including 29.1.5 on GitHub Actions) removed the VirtualSize field
+    # from the image API, breaking minikube image load with "unable to calculate manifest".
+    # Even minikube v1.34.0 doesn't fix Docker 29 compatibility.
+    # Workaround: Use Docker API v1.43 which still has VirtualSize.
+    # See: https://github.com/kubernetes/minikube/issues/18021
+    echo "Loading image into minikube: $CONTAINER_IMAGE"
+    DOCKER_API_VERSION=1.43 minikube image load "$CONTAINER_IMAGE"
     trap 'minikube image rm "$CONTAINER_IMAGE"' EXIT
   else
     docker push "$CONTAINER_IMAGE"

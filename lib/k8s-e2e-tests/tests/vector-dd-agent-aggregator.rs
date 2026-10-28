@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use indoc::indoc;
 use k8s_e2e_tests::*;
 use k8s_test_framework::{lock, namespace, test_pod, vector::Config as VectorConfig};
@@ -6,11 +8,16 @@ use serde_json::Value;
 /// This test validates that vector-aggregator can deploy with the default
 /// settings and a dummy topology.
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the scenario setup and assertions together; splitting is deferred"
+)]
 async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
     let namespace = get_namespace();
     let override_name = get_override_name(&namespace, "vector-aggregator");
-    let vector_endpoint = &format!("{}.{}.svc.cluster.local", override_name, namespace);
+    let vector_endpoint = &format!("{override_name}.{namespace}.svc.cluster.local");
     let datadog_namespace = get_namespace_appended(&namespace, "datadog-agent");
     let datadog_override_name = get_override_name(&namespace, "datadog-agent");
     let pod_namespace = get_namespace_appended(&namespace, "test-pod");
@@ -56,7 +63,7 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             "vector",
             "vector",
-            "https://helm.vector.dev",
+            &helm_chart_repo(),
             VectorConfig {
                 custom_helm_values: vec![&config_override_name(&override_name, false)],
                 ..Default::default()
@@ -66,7 +73,7 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &namespace,
-            &format!("statefulset/{}", override_name),
+            &format!("statefulset/{override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
@@ -90,7 +97,7 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
     framework
         .wait_for_rollout(
             &datadog_namespace,
-            &format!("daemonset/{}", datadog_override_name),
+            &format!("daemonset/{datadog_override_name}"),
             vec!["--timeout=60s"],
         )
         .await?;
@@ -114,7 +121,7 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
         ))?)
         .await?;
 
-    let mut log_reader = framework.logs(&namespace, &format!("statefulset/{}", override_name))?;
+    let mut log_reader = framework.logs(&namespace, &format!("statefulset/{override_name}"))?;
     smoke_check_first_line(&mut log_reader).await;
 
     // Read the rest of the log lines.
@@ -130,11 +137,8 @@ async fn datadog_to_vector() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(val["message"], "MARKER");
         assert_eq!(val["source_type"], "datadog_agent");
 
-        if got_marker {
-            // We've already seen one marker! This is not good, we only emitted
-            // one.
-            panic!("Marker seen more than once");
-        }
+        // Only one marker was emitted, so a second occurrence is a duplicate.
+        assert!(!got_marker, "Marker seen more than once");
 
         // If we did, remember it.
         got_marker = true;

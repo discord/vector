@@ -2,24 +2,30 @@ use std::{error, fmt, path::PathBuf};
 
 use bytes::{Buf, BufMut};
 use metrics_tracing_context::{MetricsLayer, TracingContextLayer};
-use metrics_util::debugging::DebuggingRecorder;
-use metrics_util::layers::Layer;
+use metrics_util::{debugging::DebuggingRecorder, layers::Layer};
 use tracing::Span;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use vector_buffers::{
+    BufferType, Bufferable, EventCount,
     encoding::FixedEncodable,
     topology::{
         builder::TopologyBuilder,
         channel::{BufferReceiver, BufferSender},
     },
-    BufferType, EventCount,
 };
-use vector_common::byte_size_of::ByteSizeOf;
-use vector_common::finalization::{AddBatchNotifier, BatchNotifier, EventFinalizers, Finalizable};
+use vector_common::{
+    byte_size_of::ByteSizeOf,
+    finalization::{
+        AddBatchNotifier, BatchNotifier, EventFinalizers, Finalizable, MergeFinalizable,
+    },
+};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Message<const N: usize> {
     id: u64,
+    // Purpose of `_heap_allocated` is to simulate memory pressure in the buffer benchmarks when the
+    // max_size option is selected.
+    _heap_allocated: Box<[u64; N]>,
     _padding: [u64; N],
 }
 
@@ -27,6 +33,7 @@ impl<const N: usize> Message<N> {
     fn new(id: u64) -> Self {
         Message {
             id,
+            _heap_allocated: Box::new([0; N]),
             _padding: [0; N],
         }
     }
@@ -40,7 +47,7 @@ impl<const N: usize> AddBatchNotifier for Message<N> {
 
 impl<const N: usize> ByteSizeOf for Message<N> {
     fn allocated_bytes(&self) -> usize {
-        0
+        N * std::mem::size_of::<u64>()
     }
 }
 
@@ -50,9 +57,17 @@ impl<const N: usize> EventCount for Message<N> {
     }
 }
 
+impl<const N: usize> Bufferable for Message<N> {}
+
 impl<const N: usize> Finalizable for Message<N> {
     fn take_finalizers(&mut self) -> EventFinalizers {
-        Default::default() // This benchmark doesn't need finalization
+        EventFinalizers::default() // This benchmark doesn't need finalization
+    }
+}
+
+impl<const N: usize> MergeFinalizable for Message<N> {
+    fn merge_finalizers(&mut self, _finalizers: EventFinalizers) {
+        // This benchmark doesn't need finalization.
     }
 }
 
@@ -61,7 +76,7 @@ pub struct EncodeError;
 
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -72,7 +87,7 @@ pub struct DecodeError;
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -88,8 +103,8 @@ impl<const N: usize> FixedEncodable for Message<N> {
         Self: Sized,
     {
         buffer.put_u64(self.id);
-        for _ in 0..N {
-            // this covers self._padding
+        for _ in 0..(N * 2) {
+            // this covers self._padding and self.heap_allocated
             buffer.put_u64(0);
         }
         Ok(())
@@ -101,8 +116,8 @@ impl<const N: usize> FixedEncodable for Message<N> {
         Self: Sized,
     {
         let id = buffer.get_u64();
-        for _ in 0..N {
-            // this covers self._padding
+        for _ in 0..(N * 2) {
+            // this covers self._padding and self.heap_allocated
             _ = buffer.get_u64();
         }
         Ok(Message::new(id))
@@ -111,6 +126,9 @@ impl<const N: usize> FixedEncodable for Message<N> {
 
 #[allow(dead_code)]
 #[allow(clippy::type_complexity)]
+/// # Panics
+///
+/// Panics if the benchmark buffer cannot be configured or built.
 pub async fn setup<const N: usize>(
     variant: BufferType,
     total_events: usize,
@@ -138,6 +156,9 @@ pub async fn setup<const N: usize>(
     (tx, rx, messages)
 }
 
+/// # Panics
+///
+/// Panics if the global metrics recorder cannot be installed.
 pub fn init_instrumentation() {
     let subscriber = tracing_subscriber::Registry::default().with(MetricsLayer::new());
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
@@ -156,12 +177,15 @@ pub fn init_instrumentation() {
 // reads it from the buffer.
 //
 
+/// # Panics
+///
+/// Panics if a benchmark message cannot be sent.
 pub async fn wtr_measurement<const N: usize>(
     mut sender: BufferSender<Message<N>>,
     mut receiver: BufferReceiver<Message<N>>,
     messages: Vec<Message<N>>,
 ) {
-    for msg in messages.into_iter() {
+    for msg in messages {
         sender.send(msg, None).await.unwrap();
     }
     drop(sender);
@@ -169,12 +193,15 @@ pub async fn wtr_measurement<const N: usize>(
     while receiver.next().await.is_some() {}
 }
 
+/// # Panics
+///
+/// Panics if a benchmark message cannot be sent or received.
 pub async fn war_measurement<const N: usize>(
     mut sender: BufferSender<Message<N>>,
     mut receiver: BufferReceiver<Message<N>>,
     messages: Vec<Message<N>>,
 ) {
-    for msg in messages.into_iter() {
+    for msg in messages {
         sender.send(msg, None).await.unwrap();
         _ = receiver.next().await.unwrap();
     }

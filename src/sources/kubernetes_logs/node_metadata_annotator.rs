@@ -2,15 +2,20 @@
 
 #![deny(missing_docs)]
 
-use crate::event::{Event, LogEvent};
 use k8s_openapi::{api::core::v1::Node, apimachinery::pkg::apis::meta::v1::ObjectMeta};
-use kube::runtime::reflector::{store::Store, ObjectRef};
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::lookup_v2::OptionalTargetPath;
-use vector_lib::lookup::{lookup_v2::ValuePath, owned_value_path, path, OwnedTargetPath};
+use kube::runtime::reflector::{ObjectRef, store::Store};
+use vector_lib::{
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    lookup::{
+        OwnedTargetPath,
+        lookup_v2::{OptionalTargetPath, ValuePath},
+        owned_value_path, path,
+    },
+};
 
 use super::Config;
+use crate::event::{Event, LogEvent};
 
 /// Configuration for how the events are enriched with Node metadata.
 #[configurable_component]
@@ -77,18 +82,21 @@ fn annotate_from_metadata(
     log_namespace: LogNamespace,
 ) {
     if let Some(labels) = &metadata.labels {
-        if let Some(prefix_path) = &fields_spec.node_labels.path {
-            for (key, value) in labels.iter() {
-                let key_path = path!(key);
+        let legacy_key_prefix = fields_spec.node_labels.path.as_ref().map(|k| &k.path);
 
-                log_namespace.insert_source_metadata(
-                    Config::NAME,
-                    log,
-                    Some(LegacyKey::Overwrite((&prefix_path.path).concat(key_path))),
-                    path!("node_labels", key),
-                    value.to_owned(),
-                )
-            }
+        for (key, value) in labels {
+            let key_path = path!(key);
+            let legacy_key = legacy_key_prefix
+                .map(|k| k.concat(key_path))
+                .map(LegacyKey::Overwrite);
+
+            log_namespace.insert_source_metadata(
+                Config::NAME,
+                log,
+                legacy_key,
+                path!("node_labels", key),
+                value.to_owned(),
+            );
         }
     }
 }
@@ -100,6 +108,10 @@ mod tests {
 
     use super::*;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this fixture is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn test_annotate_from_metadata() {
         let cases = vec![
@@ -192,9 +204,53 @@ mod tests {
                 },
                 LogNamespace::Legacy,
             ),
+            // Suppressing the legacy key must not suppress the Vector namespace
+            // metadata, which is always stored under `%kubernetes_logs`.
+            (
+                FieldsSpec {
+                    node_labels: OptionalTargetPath::none(),
+                },
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![("sandbox0-label0".to_owned(), "val0".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "node_labels", "sandbox0-label0"),
+                        "val0",
+                    );
+                    log
+                },
+                LogNamespace::Vector,
+            ),
+            // With the legacy namespace, an empty path does suppress the key.
+            (
+                FieldsSpec {
+                    node_labels: OptionalTargetPath::none(),
+                },
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![("sandbox0-label0".to_owned(), "val0".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                LogEvent::default(),
+                LogNamespace::Legacy,
+            ),
         ];
 
-        for (fields_spec, metadata, expected, log_namespace) in cases.into_iter() {
+        for (fields_spec, metadata, expected, log_namespace) in cases {
             let mut log = LogEvent::default();
             annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
             assert_eq!(log, expected);

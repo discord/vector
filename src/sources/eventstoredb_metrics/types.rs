@@ -1,8 +1,9 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde::{
-    de::{self, Error, MapAccess, Unexpected, Visitor},
     Deserialize, Deserializer,
+    de::{self, Error, MapAccess, Unexpected, Visitor},
 };
 
 use crate::event::{Metric, MetricKind, MetricTags, MetricValue};
@@ -15,6 +16,15 @@ pub struct Stats {
 }
 
 impl Stats {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Preserve the existing conversion of source counters to floating-point metrics. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    #[must_use]
     pub fn metrics(&self, namespace: Option<String>) -> Vec<Metric> {
         let mut result = Vec::new();
         let mut tags = MetricTags::default();
@@ -244,9 +254,9 @@ where
     D: Deserializer<'de>,
 {
     struct PercentOrInteger;
-    static PERCENT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+)%").unwrap());
+    static PERCENT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)%").unwrap());
 
-    impl<'de> Visitor<'de> for PercentOrInteger {
+    impl Visitor<'_> for PercentOrInteger {
         type Value = usize;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -259,7 +269,7 @@ where
         {
             if let Some(caps) = PERCENT_REGEX.captures(value) {
                 caps[1].parse::<usize>().map_err(|err| {
-                    Error::custom(format!("could not parse percent value into usize: {}", err))
+                    Error::custom(format!("could not parse percent value into usize: {err}"))
                 })
             } else {
                 Err(de::Error::invalid_value(

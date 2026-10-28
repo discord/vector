@@ -1,17 +1,20 @@
-use crate::encoding::BuildError;
 use bytes::BytesMut;
 use chrono::SecondsFormat;
 use csv_core::{WriteResult, Writer, WriterBuilder};
 use lookup::lookup_v2::ConfigTargetPath;
 use tokio_util::codec::Encoder;
+use vector_config_macros::configurable_component;
 use vector_core::{
     config::DataType,
     event::{Event, Value},
     schema,
+    serde::AsciiChar,
 };
 
+use crate::encoding::BuildError;
+
 /// The user configuration to choose the metric tag strategy.
-#[crate::configurable_component]
+#[configurable_component]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStyle {
@@ -26,8 +29,8 @@ pub enum QuoteStyle {
     Necessary,
 
     /// Puts quotes around all fields that are non-numeric.
-    /// Namely, when writing a field that does not parse as a valid float or integer,
-    /// then quotes are used even if they aren't strictly necessary.
+    /// This means that when writing a field that does not parse as a valid float or integer,
+    /// quotes are used even if they aren't strictly necessary.
     NonNumeric,
 
     /// Never writes quotes, even if it produces invalid CSV data.
@@ -35,7 +38,7 @@ pub enum QuoteStyle {
 }
 
 /// Config used to build a `CsvSerializer`.
-#[crate::configurable_component]
+#[configurable_component]
 #[derive(Debug, Clone)]
 pub struct CsvSerializerConfig {
     /// The CSV Serializer Options.
@@ -44,11 +47,17 @@ pub struct CsvSerializerConfig {
 
 impl CsvSerializerConfig {
     /// Creates a new `CsvSerializerConfig`.
+    #[must_use]
     pub const fn new(csv: CsvSerializerOptions) -> Self {
         Self { csv }
     }
 
     /// Build the `CsvSerializer` from this configuration.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "The codec API error documentation needs a separate audit."
+    )]
     pub fn build(&self) -> Result<CsvSerializer, BuildError> {
         if self.csv.fields.is_empty() {
             Err("At least one CSV field must be specified".into())
@@ -58,11 +67,13 @@ impl CsvSerializerConfig {
     }
 
     /// The data type of events that are accepted by `CsvSerializer`.
+    #[must_use]
     pub fn input_type(&self) -> DataType {
         DataType::Log
     }
 
     /// The schema required by the serializer.
+    #[must_use]
     pub fn schema_requirement(&self) -> schema::Requirement {
         // While technically we support `Value` variants that can't be losslessly serialized to
         // CSV, we don't want to enforce that limitation to users yet.
@@ -71,21 +82,19 @@ impl CsvSerializerConfig {
 }
 
 /// Config used to build a `CsvSerializer`.
-#[crate::configurable_component]
+#[configurable_component]
 #[derive(Debug, Clone)]
 pub struct CsvSerializerOptions {
     /// The field delimiter to use when writing CSV.
-    #[configurable(metadata(docs::type_override = "ascii_char"))]
     #[serde(
         default = "default_delimiter",
-        with = "vector_core::serde::ascii_char",
         skip_serializing_if = "vector_core::serde::is_default"
     )]
-    pub delimiter: u8,
+    pub delimiter: AsciiChar,
 
-    /// Enable double quote escapes.
+    /// Enables double quote escapes.
     ///
-    /// This is enabled by default, but it may be disabled. When disabled, quotes in
+    /// This is enabled by default, but you can disable it. When disabled, quotes in
     /// field data are escaped instead of doubled.
     #[serde(
         default = "default_double_quote",
@@ -98,49 +107,45 @@ pub struct CsvSerializerOptions {
     /// In some variants of CSV, quotes are escaped using a special escape character
     /// like \ (instead of escaping quotes by doubling them).
     ///
-    /// To use this, `double_quotes` needs to be disabled as well otherwise it is ignored.
-    #[configurable(metadata(docs::type_override = "ascii_char"))]
+    /// To use this, `double_quotes` needs to be disabled as well; otherwise, this setting is ignored.
     #[serde(
         default = "default_escape",
-        with = "vector_core::serde::ascii_char",
         skip_serializing_if = "vector_core::serde::is_default"
     )]
-    pub escape: u8,
+    pub escape: AsciiChar,
 
     /// The quote character to use when writing CSV.
-    #[configurable(metadata(docs::type_override = "ascii_char"))]
     #[serde(
         default = "default_escape",
-        with = "vector_core::serde::ascii_char",
         skip_serializing_if = "vector_core::serde::is_default"
     )]
-    quote: u8,
+    quote: AsciiChar,
 
     /// The quoting style to use when writing CSV data.
     #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub quote_style: QuoteStyle,
 
-    /// Set the capacity (in bytes) of the internal buffer used in the CSV writer.
-    /// This defaults to a reasonable setting.
+    /// Sets the capacity (in bytes) of the internal buffer used in the CSV writer.
+    /// This defaults to 8192 bytes (8KB).
     #[serde(default = "default_capacity")]
     pub capacity: usize,
 
-    /// Configures the fields that will be encoded, as well as the order in which they
+    /// Configures the fields that are encoded, as well as the order in which they
     /// appear in the output.
     ///
-    /// If a field is not present in the event, the output will be an empty string.
+    /// If a field is not present in the event, the output for that field is an empty string.
     ///
-    /// Values of type `Array`, `Object`, and `Regex` are not supported and the
-    /// output will be an empty string.
+    /// Values of type `Array`, `Object`, and `Regex` are not supported, and the
+    /// output for any of these types is an empty string.
     pub fields: Vec<ConfigTargetPath>,
 }
 
-const fn default_delimiter() -> u8 {
-    b','
+const fn default_delimiter() -> AsciiChar {
+    AsciiChar::new(',')
 }
 
-const fn default_escape() -> u8 {
-    b'"'
+const fn default_escape() -> AsciiChar {
+    AsciiChar::new('"')
 }
 
 const fn default_double_quote() -> bool {
@@ -188,15 +193,16 @@ pub struct CsvSerializer {
 
 impl CsvSerializer {
     /// Creates a new `CsvSerializer`.
+    #[must_use]
     pub fn new(config: CsvSerializerConfig) -> Self {
         // 'flexible' is not needed since every event is a single context free csv line
         let writer = Box::new(
             WriterBuilder::new()
-                .delimiter(config.csv.delimiter)
+                .delimiter(config.csv.delimiter.as_byte())
                 .double_quote(config.csv.double_quote)
-                .escape(config.csv.escape)
+                .escape(config.csv.escape.as_byte())
                 .quote_style(config.csv.csv_quote_style())
-                .quote(config.csv.quote)
+                .quote(config.csv.quote.as_byte())
                 .build(),
         );
 
@@ -246,16 +252,15 @@ impl Encoder<Event> for CsvSerializer {
             // get string value of current field
             let field_value = match field_value {
                 Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+                Some(Value::String(string)) => string.to_string(),
                 Some(Value::Integer(int)) => int.to_string(),
                 Some(Value::Float(float)) => float.to_string(),
                 Some(Value::Boolean(bool)) => bool.to_string(),
                 Some(Value::Timestamp(timestamp)) => {
                     timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true)
                 }
-                Some(Value::Null) => String::new(),
-                // Other value types: Array, Regex, Object are not supported by the CSV format.
-                Some(_) => String::new(),
-                None => String::new(),
+                // Null, missing, and unsupported values (Array, Regex, Object) render as empty.
+                _ => String::new(),
             };
 
             // mutable byte_slice so it can be written in chunks if internal_buffer fills up
@@ -317,7 +322,7 @@ mod tests {
         let mut fields: Vec<ConfigTargetPath> = std::vec::Vec::new();
         let mut tree = ObjectMap::new();
 
-        for (field_name, field_value) in field_data.into_iter() {
+        for (field_name, field_value) in field_data {
             let field = field_name.into();
             fields.push(field);
 
@@ -343,7 +348,7 @@ mod tests {
             "foo" => Value::from("bar"),
             "int" => Value::from(123),
             "comma" => Value::from("abc,bcd"),
-            "float" => Value::Float(NotNan::new(3.1415925).unwrap()),
+            "float" => Value::Float(NotNan::new(std::f64::consts::PI).unwrap()),
             "space" => Value::from("sp ace"),
             "time" => Value::Timestamp(DateTime::parse_from_rfc3339("2023-02-27T15:04:49.363+08:00").unwrap().into()),
             "quote" => Value::from("the \"quote\" should be escaped"),
@@ -374,7 +379,7 @@ mod tests {
 
         assert_eq!(
             bytes.freeze(),
-            b"bar,123,\"abc,bcd\",3.1415925,,sp ace,2023-02-27T07:04:49.363Z,\"the \"\"quote\"\" should be escaped\",true".as_slice()
+            b"bar,123,\"abc,bcd\",3.141592653589793,,sp ace,2023-02-27T07:04:49.363Z,\"the \"\"quote\"\" should be escaped\",true".as_slice()
         );
     }
 
@@ -460,13 +465,13 @@ mod tests {
         .unwrap();
 
         CsvSerializerConfig::new(CsvSerializerOptions {
-            fields: fields.clone(),
+            fields,
             quote_style: QuoteStyle::NonNumeric,
             ..Default::default()
         })
         .build()
         .unwrap()
-        .encode(event.clone(), &mut non_numeric_bytes)
+        .encode(event, &mut non_numeric_bytes)
         .unwrap();
 
         assert_eq!(
@@ -493,7 +498,7 @@ mod tests {
             make_event_with_fields(vec![("field1", "value1"), ("field2", "value2")]);
         let opts = CsvSerializerOptions {
             fields,
-            delimiter: b'\t',
+            delimiter: AsciiChar::new('\t'),
             ..Default::default()
         };
         let config = CsvSerializerConfig::new(opts);
@@ -511,7 +516,7 @@ mod tests {
         let opts = CsvSerializerOptions {
             fields,
             double_quote: false,
-            escape: b'\\',
+            escape: AsciiChar::new('\\'),
             ..Default::default()
         };
         let config = CsvSerializerConfig::new(opts);
@@ -528,7 +533,7 @@ mod tests {
         let (fields, event) = make_event_with_fields(vec![("field1", "foo \" $ bar")]);
         let opts = CsvSerializerOptions {
             fields,
-            quote: b'$',
+            quote: AsciiChar::new('$'),
             ..Default::default()
         };
         let config = CsvSerializerConfig::new(opts);

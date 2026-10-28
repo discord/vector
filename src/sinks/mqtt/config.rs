@@ -1,53 +1,32 @@
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use rumqttc::{MqttOptions, QoS, TlsConfiguration, Transport};
-use snafu::{ResultExt, Snafu};
+use snafu::ResultExt;
 use vector_lib::codecs::JsonSerializerConfig;
 
-use crate::template::Template;
 use crate::{
     codecs::EncodingConfig,
-    config::{AcknowledgementsConfig, Input, SinkConfig, SinkContext},
-    sinks::{
-        mqtt::sink::{ConfigurationSnafu, MqttConnector, MqttError, MqttSink, TlsSnafu},
-        prelude::*,
-        Healthcheck, VectorSink,
+    common::mqtt::{
+        ConfigurationError, ConfigurationSnafu, MqttCommonConfig, MqttConnector, MqttError,
+        TlsSnafu,
     },
-    tls::{MaybeTlsSettings, TlsEnableableConfig},
+    config::{AcknowledgementsConfig, Input, SinkConfig, SinkContext, ValidatedSink},
+    sinks::{Healthcheck, VectorSink, mqtt::sink::MqttSink, prelude::*},
+    template::{ConfinementConfig, Template},
+    tls::MaybeTlsSettings,
 };
 
 /// Configuration for the `mqtt` sink
 #[configurable_component(sink("mqtt"))]
 #[derive(Clone, Debug)]
 pub struct MqttSinkConfig {
-    /// MQTT server address (The broker’s domain name or IP address).
-    #[configurable(metadata(docs::examples = "mqtt.example.com", docs::examples = "127.0.0.1"))]
-    pub host: String,
-
-    /// TCP port of the MQTT server to connect to.
-    #[serde(default = "default_port")]
-    pub port: u16,
-
-    /// MQTT username.
-    pub user: Option<String>,
-
-    /// MQTT password.
-    pub password: Option<String>,
-
-    /// MQTT client ID.
-    pub client_id: Option<String>,
-
-    /// Connection keep-alive interval.
-    #[serde(default = "default_keep_alive")]
-    pub keep_alive: u16,
+    #[serde(flatten)]
+    pub common: MqttCommonConfig,
 
     /// If set to true, the MQTT session is cleaned on login.
     #[serde(default = "default_clean_session")]
     pub clean_session: bool,
-
-    #[configurable(derived)]
-    pub tls: Option<TlsEnableableConfig>,
 
     /// MQTT publish topic (templates allowed)
     pub topic: Template,
@@ -56,10 +35,8 @@ pub struct MqttSinkConfig {
     #[serde(default = "default_retain")]
     pub retain: bool,
 
-    #[configurable(derived)]
     pub encoding: EncodingConfig,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -67,26 +44,27 @@ pub struct MqttSinkConfig {
     )]
     pub acknowledgements: AcknowledgementsConfig,
 
-    #[configurable(derived)]
     #[serde(default = "default_qos")]
     pub quality_of_service: MqttQoS,
+
+    #[serde(flatten)]
+    pub confinement: ConfinementConfig,
 }
 
 /// Supported Quality of Service types for MQTT.
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 #[allow(clippy::enum_variant_names)]
 pub enum MqttQoS {
-    /// AtLeastOnce.
-    #[derivative(Default)]
+    /// `AtLeastOnce`.
+    #[default]
     AtLeastOnce,
 
-    /// AtMostOnce.
+    /// `AtMostOnce`.
     AtMostOnce,
 
-    /// ExactlyOnce.
+    /// `ExactlyOnce`.
     ExactlyOnce,
 }
 
@@ -98,14 +76,6 @@ impl From<MqttQoS> for QoS {
             MqttQoS::ExactlyOnce => QoS::ExactlyOnce,
         }
     }
-}
-
-const fn default_port() -> u16 {
-    1883
-}
-
-const fn default_keep_alive() -> u16 {
-    60
 }
 
 const fn default_clean_session() -> bool {
@@ -123,19 +93,15 @@ const fn default_retain() -> bool {
 impl Default for MqttSinkConfig {
     fn default() -> Self {
         Self {
-            host: "localhost".into(),
-            port: default_port(),
-            user: None,
-            password: None,
-            client_id: None,
-            keep_alive: default_keep_alive(),
+            common: MqttCommonConfig::default(),
             clean_session: default_clean_session(),
-            tls: None,
+
             topic: Template::try_from("vector").expect("Cannot parse as a template"),
             retain: default_retain(),
             encoding: JsonSerializerConfig::default().into(),
             acknowledgements: AcknowledgementsConfig::default(),
             quality_of_service: MqttQoS::default(),
+            confinement: ConfinementConfig::default(),
         }
     }
 }
@@ -145,14 +111,8 @@ impl_generate_config_from_default!(MqttSinkConfig);
 #[async_trait::async_trait]
 #[typetag::serde(name = "mqtt")]
 impl SinkConfig for MqttSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let connector = self.build_connector()?;
-        let sink = MqttSink::new(self, connector.clone())?;
-
-        Ok((
-            VectorSink::from_event_streamsink(sink),
-            Box::pin(async move { connector.healthcheck().await }),
-        ))
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
     }
 
     fn input(&self) -> Input {
@@ -164,18 +124,59 @@ impl SinkConfig for MqttSinkConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Snafu)]
-pub enum ConfigurationError {
-    #[snafu(display("Client ID is not allowed to be empty."))]
-    EmptyClientId,
-    #[snafu(display("Username and password must be either both provided or both missing."))]
-    InvalidCredentials,
+#[derive(Clone, Debug)]
+pub struct ValidatedMqttSink {
+    topic: ConfinedTemplate,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for MqttSinkConfig {
+    type Validated = ValidatedMqttSink;
+
+    fn validate(&self) -> crate::Result<ValidatedMqttSink> {
+        // Reject an empty client ID, matching `build_connector` which rejects it
+        // before the runtime connector is created.
+        if self.common.client_id.as_deref() == Some("") {
+            return Err(Box::new(MqttError::Configuration {
+                source: ConfigurationError::EmptyClientId,
+            }));
+        }
+        // Username and password must be either both provided or both missing.
+        match (&self.common.user, &self.common.password) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                return Err(Box::new(MqttError::Configuration {
+                    source: ConfigurationError::InvalidCredentials,
+                }));
+            }
+        }
+        self.encoding.validate()?;
+        let topic = self
+            .topic
+            .clone()
+            .confine(&self.confinement, Self::NAME, "topic")?;
+        Ok(ValidatedMqttSink { topic })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedMqttSink,
+        _cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedMqttSink { topic } = validated.clone();
+        let connector = self.build_connector()?;
+        let sink = MqttSink::new(self, topic, connector.clone())?;
+        Ok((
+            VectorSink::from_event_streamsink(sink),
+            Box::pin(async move { connector.healthcheck() }),
+        ))
+    }
 }
 
 impl MqttSinkConfig {
     fn build_connector(&self) -> Result<MqttConnector, MqttError> {
-        let client_id = self.client_id.clone().unwrap_or_else(|| {
-            let hash = rand::thread_rng()
+        let client_id = self.common.client_id.clone().unwrap_or_else(|| {
+            let hash = rand::rng()
                 .sample_iter(&rand_distr::Alphanumeric)
                 .take(6)
                 .map(char::from)
@@ -186,11 +187,13 @@ impl MqttSinkConfig {
         if client_id.is_empty() {
             return Err(ConfigurationError::EmptyClientId).context(ConfigurationSnafu);
         }
-        let tls = MaybeTlsSettings::from_config(&self.tls, false).context(TlsSnafu)?;
-        let mut options = MqttOptions::new(&client_id, &self.host, self.port);
-        options.set_keep_alive(Duration::from_secs(self.keep_alive.into()));
+        let tls =
+            MaybeTlsSettings::from_config(self.common.tls.as_ref(), false).context(TlsSnafu)?;
+        let mut options = MqttOptions::new(&client_id, &self.common.host, self.common.port);
+        options.set_keep_alive(Duration::from_secs(self.common.keep_alive.into()));
+        options.set_max_packet_size(self.common.max_packet_size, self.common.max_packet_size);
         options.set_clean_session(self.clean_session);
-        match (&self.user, &self.password) {
+        match (&self.common.user, &self.common.password) {
             (Some(user), Some(password)) => {
                 options.set_credentials(user, password);
             }
@@ -203,24 +206,103 @@ impl MqttSinkConfig {
         }
         if let Some(tls) = tls.tls() {
             let ca = tls.authorities_pem().flatten().collect();
-            let client_auth = None;
-            let alpn = Some(vec!["mqtt".into()]);
+            let client_auth = tls.identity_pem();
+            // Honor the user-configured `tls.alpn_protocols` (e.g. `x-amzn-mqtt-ca`, required to
+            // reach AWS IoT Core over port 443), falling back to `mqtt` when it is not set.
+            let alpn = self
+                .common
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.options.alpn_protocols.as_ref())
+                .filter(|protocols| !protocols.is_empty())
+                .map_or_else(
+                    || vec![b"mqtt".to_vec()],
+                    |protocols| protocols.iter().map(|p| p.clone().into_bytes()).collect(),
+                );
             options.set_transport(Transport::Tls(TlsConfiguration::Simple {
                 ca,
                 client_auth,
-                alpn,
+                alpn: Some(alpn),
             }));
         }
-        MqttConnector::new(options, self.topic.to_string())
+        Ok(MqttConnector::new(options))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::config::ValidatedSink;
+    use crate::template::{ConfinementConfig, Template};
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<MqttSinkConfig>();
+    }
+
+    #[test]
+    fn validate_rejects_empty_client_id() {
+        let config = MqttSinkConfig {
+            common: MqttCommonConfig {
+                client_id: Some(String::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "an empty client_id should fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_partial_credentials() {
+        let config = MqttSinkConfig {
+            common: MqttCommonConfig {
+                user: Some("user".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "credentials with only a username should fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_returns_confined_topic() {
+        let config = MqttSinkConfig {
+            topic: Template::try_from("test-topic").unwrap(),
+            ..Default::default()
+        };
+        let validated = config.validate().expect("validation should succeed");
+        assert_eq!(validated.topic.to_string(), "test-topic");
+    }
+
+    #[test]
+    fn confinement_rejects_unconfined_topic() {
+        let template = Template::try_from("{{ topic }}").unwrap();
+        let config = ConfinementConfig::default();
+        let result = template.confine(&config, "mqtt", "topic");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confinement_opt_out_allows_unconfined_topic() {
+        let template = Template::try_from("{{ topic }}").unwrap();
+        let config = ConfinementConfig {
+            dangerously_allow_unconfined_template_resolution: true,
+        };
+        let result = template.confine(&config, "mqtt", "topic");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn confinement_allows_prefixed_topic() {
+        let template = Template::try_from("events-{{ env }}").unwrap();
+        let config = ConfinementConfig::default();
+        let result = template.confine(&config, "mqtt", "topic");
+        assert!(result.is_ok());
     }
 }

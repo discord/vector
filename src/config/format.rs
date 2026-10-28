@@ -2,17 +2,30 @@
 
 #![deny(missing_docs, missing_debug_implementations)]
 
-use std::fmt;
-use std::path::Path;
-use std::str::FromStr;
+use std::{fmt, path::Path, str::FromStr};
 
-use serde::de;
+use serde::{Deserialize, Serialize, de};
+use vector_config_macros::Configurable;
 
 /// A type alias to better capture the semantics.
 pub type FormatHint = Option<Format>;
 
 /// The format used to represent the configuration data.
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Debug,
+    Default,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Serialize,
+    Deserialize,
+    Configurable,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Format {
     /// TOML format is used.
     #[default]
@@ -31,7 +44,7 @@ impl FromStr for Format {
             "toml" => Ok(Format::Toml),
             "yaml" => Ok(Format::Yaml),
             "json" => Ok(Format::Json),
-            _ => Err(format!("Invalid format: {}", s)),
+            _ => Err(format!("Invalid format: {s}")),
         }
     }
 }
@@ -43,16 +56,18 @@ impl fmt::Display for Format {
             Format::Json => "json",
             Format::Yaml => "yaml",
         };
-        write!(f, "{}", format)
+        write!(f, "{format}")
     }
 }
 
 impl Format {
     /// Obtain the format from the file path using extension as a hint.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn from_path<T: AsRef<Path>>(path: T) -> Result<Self, T> {
         match path.as_ref().extension().and_then(|ext| ext.to_str()) {
             Some("toml") => Ok(Format::Toml),
-            Some("yaml") | Some("yml") => Ok(Format::Yaml),
+            Some("yaml" | "yml") => Ok(Format::Yaml),
             Some("json") => Ok(Format::Json),
             _ => Err(path),
         }
@@ -60,18 +75,27 @@ impl Format {
 }
 
 /// Parse the string represented in the specified format.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub fn deserialize<T>(content: &str, format: Format) -> Result<T, Vec<String>>
 where
     T: de::DeserializeOwned,
 {
     match format {
         Format::Toml => toml::from_str(content).map_err(|e| vec![e.to_string()]),
-        Format::Yaml => serde_yaml::from_str(content).map_err(|e| vec![e.to_string()]),
+        Format::Yaml => serde_yaml::from_str::<serde_yaml::Value>(content)
+            .and_then(|mut v| {
+                v.apply_merge()?;
+                serde_yaml::from_value(v)
+            })
+            .map_err(|e| vec![e.to_string()]),
         Format::Json => serde_json::from_str(content).map_err(|e| vec![e.to_string()]),
     }
 }
 
 /// Serialize the specified `value` into a string.
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
 pub fn serialize<T>(value: &T, format: Format) -> Result<String, String>
 where
     T: serde::ser::Serialize,
@@ -143,7 +167,7 @@ mod tests {
 
         for (input, expected) in cases {
             let output = Format::from_path(std::path::PathBuf::from(input));
-            assert_eq!(expected, output.ok(), "{}", input)
+            assert_eq!(expected, output.ok(), "{input}");
         }
     }
 
@@ -155,11 +179,13 @@ mod tests {
         feature = "sinks-socket"
     ))]
     #[test]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::too_many_lines, reason = "Preserve existing control flow")]
     fn test_deserialize_matches_toml() {
         use crate::config::ConfigBuilder;
 
         macro_rules! concat_with_newlines {
-            ($($e:expr,)*) => { concat!( $($e, "\n"),+ ) };
+            ($($e:expr_2021,)*) => { concat!( $($e, "\n"),+ ) };
         }
 
         const SAMPLE_TOML: &str = r#"
@@ -171,6 +197,10 @@ mod tests {
             type = "socket"
             mode = "tcp"
             address = "127.0.0.1:1235"
+            [sources.in2]
+            type = "socket"
+            mode = "tcp"
+            address = "127.0.0.1:1234"
             [transforms.sample]
             type = "sample"
             inputs = ["in"]
@@ -208,10 +238,13 @@ mod tests {
                     r#"      encoding:"#,
                     r#"        type: "csv""#,
                     r#"sources:"#,
-                    r#"  in:"#,
+                    r#"  in: &a"#,
                     r#"    type: "socket""#,
-                    r#"    mode: "tcp""#,
+                    r#"    mode: &b "tcp""#,
                     r#"    address: "127.0.0.1:1235""#,
+                    r#"  in2:"#,
+                    r#"    <<: *a"#,
+                    r#"    address: "127.0.0.1:1234""#,
                     r#"transforms:"#,
                     r#"  sample:"#,
                     r#"    type: "sample""#,
@@ -220,7 +253,7 @@ mod tests {
                     r#"sinks:"#,
                     r#"  out:"#,
                     r#"    type: "socket""#,
-                    r#"    mode: "tcp""#,
+                    r#"    mode: *b"#,
                     r#"    inputs: ["sample"]"#,
                     r#"    encoding:"#,
                     r#"      codec: "text""#,
@@ -248,6 +281,11 @@ mod tests {
                             "type": "socket",
                             "mode": "tcp",
                             "address": "127.0.0.1:1235"
+                        },
+                        "in2": {
+                            "type": "socket",
+                            "mode": "tcp",
+                            "address": "127.0.0.1:1234"
                         }
                     },
                     "transforms": {
@@ -282,25 +320,21 @@ mod tests {
             let output = deserialize(input, format);
             match expected {
                 Ok(expected) => {
-                    #[allow(clippy::expect_fun_call)] // false positive
-                    let output: ConfigBuilder = output.expect(&format!(
-                        "expected Ok, got Err with format {:?} and input {:?}",
-                        format, input
-                    ));
+                    let output: ConfigBuilder = output.unwrap_or_else(|_| {
+                        panic!("expected Ok, got Err with format {format:?} and input {input:?}")
+                    });
                     let output_json = serde_json::to_value(output).unwrap();
                     let expected_output: ConfigBuilder = deserialize(expected, Format::Toml)
                         .expect("Invalid TOML passed as an expectation");
                     let expected_json = serde_json::to_value(expected_output).unwrap();
-                    assert_eq!(expected_json, output_json, "{}", input)
+                    assert_eq!(expected_json, output_json, "{input}");
                 }
                 Err(expected) => assert_eq!(
                     expected,
                     output.expect_err(&format!(
-                        "expected Err, got Ok with format {:?} and input {:?}",
-                        format, input
+                        "expected Err, got Ok with format {format:?} and input {input:?}"
                     )),
-                    "{}",
-                    input
+                    "{input}"
                 ),
             }
         }

@@ -5,15 +5,15 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{future::join_all, StreamExt, TryFutureExt};
+use futures::{StreamExt, TryFutureExt, future::join_all};
 use http::{Request, StatusCode};
-use hyper::{body::to_bytes as body_to_bytes, Body, Uri};
+use http_body::Collected;
+use hyper::{Body, Uri};
 use serde_with::serde_as;
 use snafu::{ResultExt, Snafu};
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
-use vector_lib::configurable::configurable_component;
-use vector_lib::{metric_tags, EstimatedJsonEncodedSizeOf};
+use vector_lib::{EstimatedJsonEncodedSizeOf, configurable::configurable_component, metric_tags};
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -31,17 +31,29 @@ use parser::NginxStubStatus;
 use vector_lib::config::LogNamespace;
 
 macro_rules! counter {
-    ($value:expr) => {
-        MetricValue::Counter {
-            value: $value as f64,
+    ($value:expr_2021) => {
+        {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_lossless,
+                reason = "The metric macro accepts integer and floating-point counters; preserve their existing conversion. https://github.com/vectordotdev/vector/issues/23659"
+            )]
+            let value = $value as f64;
+            MetricValue::Counter { value }
         }
     };
 }
 
 macro_rules! gauge {
-    ($value:expr) => {
-        MetricValue::Gauge {
-            value: $value as f64,
+    ($value:expr_2021) => {
+        {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_lossless,
+                reason = "The metric macro accepts integer and floating-point counters; preserve their existing conversion. https://github.com/vectordotdev/vector/issues/23659"
+            )]
+            let value = $value as f64;
+            MetricValue::Gauge { value }
         }
     };
 }
@@ -85,10 +97,8 @@ pub struct NginxMetricsConfig {
     #[serde(default = "default_namespace")]
     namespace: String,
 
-    #[configurable(derived)]
     tls: Option<TlsConfig>,
 
-    #[configurable(derived)]
     auth: Option<Auth>,
 }
 
@@ -96,6 +106,7 @@ pub(super) const fn default_scrape_interval_secs() -> Duration {
     Duration::from_secs(15)
 }
 
+#[must_use]
 pub fn default_namespace() -> String {
     "nginx".to_string()
 }
@@ -106,12 +117,12 @@ impl_generate_config_from_default!(NginxMetricsConfig);
 #[typetag::serde(name = "nginx_metrics")]
 impl SourceConfig for NginxMetricsConfig {
     async fn build(&self, mut cx: SourceContext) -> crate::Result<super::Source> {
-        let tls = TlsSettings::from_options(&self.tls)?;
+        let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let http_client = HttpClient::new(tls, &cx.proxy)?;
 
         let namespace = Some(self.namespace.clone()).filter(|namespace| !namespace.is_empty());
         let mut sources = Vec::with_capacity(self.endpoints.len());
-        for endpoint in self.endpoints.iter() {
+        for endpoint in &self.endpoints {
             sources.push(NginxMetrics::new(
                 http_client.clone(),
                 endpoint.clone(),
@@ -122,11 +133,11 @@ impl SourceConfig for NginxMetricsConfig {
 
         let duration = self.scrape_interval_secs;
         let shutdown = cx.shutdown;
-        Ok(Box::pin(async move {
+        Ok(crate::sources::source_with_error(async move {
             let mut interval = IntervalStream::new(time::interval(duration)).take_until(shutdown);
             while interval.next().await.is_some() {
                 let start = Instant::now();
-                let metrics = join_all(sources.iter().map(|nginx| nginx.collect())).await;
+                let metrics = join_all(sources.iter().map(NginxMetrics::collect)).await;
                 emit!(CollectionCompleted {
                     start,
                     end: Instant::now()
@@ -135,9 +146,9 @@ impl SourceConfig for NginxMetricsConfig {
                 let metrics: Vec<Metric> = metrics.into_iter().flatten().collect();
                 let count = metrics.len();
 
-                if (cx.out.send_batch(metrics).await).is_err() {
+                if let Err(error) = cx.out.send_batch(metrics).await {
                     emit!(StreamClosedError { count });
-                    return Err(());
+                    return Err(error);
                 }
             }
 
@@ -188,7 +199,7 @@ impl NginxMetrics {
         let uri: Uri = endpoint.parse().context(HostInvalidUriSnafu)?;
         Ok(match (uri.host().unwrap_or(""), uri.port()) {
             (host, None) => host.to_owned(),
-            (host, Some(port)) => format!("{}:{}", host, port),
+            (host, Some(port)) => format!("{host}:{port}"),
         })
     }
 
@@ -216,7 +227,7 @@ impl NginxMetrics {
             emit!(NginxMetricsRequestError {
                 error,
                 endpoint: &self.endpoint,
-            })
+            });
         })?;
         emit!(EndpointBytesReceived {
             byte_size: response.len(),
@@ -229,7 +240,7 @@ impl NginxMetrics {
                 emit!(NginxMetricsStubStatusParseError {
                     error,
                     endpoint: &self.endpoint,
-                })
+                });
             })?;
 
         Ok(vec![
@@ -252,7 +263,10 @@ impl NginxMetrics {
         let response = self.http_client.send(request).await?;
         let (parts, body) = response.into_parts();
         match parts.status {
-            StatusCode::OK => body_to_bytes(body).err_into().await,
+            StatusCode::OK => http_body::Body::collect(body)
+                .err_into()
+                .await
+                .map(Collected::to_bytes),
             status => Err(Box::new(NginxError::InvalidResponseStatus { status })),
         }
     }
@@ -277,12 +291,13 @@ mod tests {
 
 #[cfg(all(test, feature = "nginx-integration-tests"))]
 mod integration_tests {
+    use tokio::time::Duration;
+
     use super::*;
     use crate::{
         config::ProxyConfig,
-        test_util::components::{run_and_assert_source_compliance_advanced, HTTP_PULL_SOURCE_TAGS},
+        test_util::components::{HTTP_PULL_SOURCE_TAGS, run_and_assert_source_compliance_advanced},
     };
-    use tokio::time::Duration;
 
     fn nginx_proxy_address() -> String {
         std::env::var("NGINX_PROXY_ADDRESS").unwrap_or_else(|_| "http://nginx-proxy:8000".into())
@@ -321,7 +336,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_stub_status() {
         let url = format!("{}/basic_status", nginx_address());
-        test_nginx(url, None, ProxyConfig::default()).await
+        test_nginx(url, None, ProxyConfig::default()).await;
     }
 
     #[tokio::test]
@@ -335,7 +350,7 @@ mod integration_tests {
             }),
             ProxyConfig::default(),
         )
-        .await
+        .await;
     }
 
     // This integration test verifies that proxy support is wired up correctly in Vector
@@ -351,6 +366,6 @@ mod integration_tests {
                 ..Default::default()
             },
         )
-        .await
+        .await;
     }
 }

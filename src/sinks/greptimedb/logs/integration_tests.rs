@@ -1,17 +1,16 @@
 use chrono::{DateTime, Utc};
 use futures::stream;
 use vector_lib::event::{Event, LogEvent};
+use vrl::event_path;
 
 use crate::{
     config::{SinkConfig, SinkContext},
-    sinks::util::test::load_sink,
+    sinks::{greptimedb::logs::config::GreptimeDBLogsConfig, util::test::load_sink},
     test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        components::{SINK_TAGS, run_and_assert_sink_compliance},
         trace_init,
     },
 };
-
-use crate::sinks::greptimedb::logs::config::GreptimeDBLogsConfig;
 
 #[tokio::test]
 async fn test_greptimedb_logs_sink() {
@@ -56,7 +55,46 @@ pipeline_name = "test"
             .expect("Error getting greptimedb response array")
             .len(),
         10
-    )
+    );
+}
+
+#[tokio::test]
+async fn test_greptimedb_logs_sink_default_pipeline() {
+    trace_init();
+    let greptimedb_http_endpoint =
+        std::env::var("GREPTIMEDB_HTTP").unwrap_or_else(|_| "http://localhost:4000".to_owned());
+    let cfg = format!(
+        r#"endpoint= "{}"
+table = "logs2"
+dbname = "public"
+"#,
+        &greptimedb_http_endpoint
+    );
+
+    let (config, _) = load_sink::<GreptimeDBLogsConfig>(&cfg).unwrap();
+    let (sink, _hc) = config.build(SinkContext::default()).await.unwrap();
+
+    let client = GreptimeClient::new(greptimedb_http_endpoint.clone());
+
+    // Drop the table and data inside
+    client.query("DROP TABLE logs2").await;
+
+    let base_time = Utc::now();
+    let events: Vec<_> = (0..10).map(|idx| create_event(idx, base_time)).collect();
+
+    run_and_assert_sink_compliance(sink, stream::iter(events), &SINK_TAGS).await;
+
+    let query_response = client.query("SELECT * FROM logs2").await;
+    let result: serde_json::Value =
+        serde_json::from_str(&query_response).expect("Invalid json returned from greptimedb query");
+    assert_eq!(
+        result
+            .pointer("/output/0/records/rows")
+            .and_then(|v| v.as_array())
+            .expect("Error getting greptimedb response array")
+            .len(),
+        10
+    );
 }
 
 struct GreptimeClient {
@@ -74,9 +112,9 @@ impl GreptimeClient {
 
     async fn create_pipeline(&self, pipeline_name: &str, pipeline_content: &str) {
         self.client
-            .post(&format!(
-                "{}/v1/events/pipelines/{}",
-                self.endpoint, pipeline_name
+            .post(format!(
+                "{}/v1/events/pipelines/{pipeline_name}",
+                self.endpoint
             ))
             .header("Content-Type", "application/x-yaml")
             .body(String::from(pipeline_content))
@@ -87,7 +125,7 @@ impl GreptimeClient {
 
     async fn query(&self, sql: &str) -> String {
         self.client
-            .get(&format!("{}/v1/sql", self.endpoint))
+            .get(format!("{}/v1/sql", self.endpoint))
             .query(&[("sql", sql)])
             .send()
             .await
@@ -100,10 +138,10 @@ impl GreptimeClient {
 
 fn create_event(i: i32, base_time: DateTime<Utc>) -> Event {
     let mut event = LogEvent::default();
-    event.insert("message", format!("test message {}", i));
-    event.insert("timestamp", base_time);
-    event.insert("name", "test");
-    event.insert("namespace", "default");
-    event.insert("kind", "test");
+    event.insert(event_path!("message"), format!("test message {i}"));
+    event.insert(event_path!("timestamp"), base_time);
+    event.insert(event_path!("name"), "test");
+    event.insert(event_path!("namespace"), "default");
+    event.insert(event_path!("kind"), "test");
     Event::Log(event)
 }
