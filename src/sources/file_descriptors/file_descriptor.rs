@@ -1,12 +1,17 @@
-use std::{fs::File, io, os::unix::io::FromRawFd};
+use std::{
+    fs::File,
+    io,
+    os::fd::{FromRawFd as _, IntoRawFd, RawFd},
+};
 
-use super::{outputs, FileDescriptorConfig};
-use indoc::indoc;
-use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::lookup_v2::OptionalValuePath;
+use vector_lib::{
+    codecs::decoding::{DeserializerConfig, FramingConfig},
+    config::LogNamespace,
+    configurable::configurable_component,
+    lookup::lookup_v2::OptionalValuePath,
+};
 
+use super::{FileDescriptorConfig, outputs};
 use crate::{
     config::{GenerateConfig, Resource, SourceConfig, SourceContext, SourceOutput},
     serde::default_decoding,
@@ -29,10 +34,8 @@ pub struct FileDescriptorSourceConfig {
     /// By default, the [global `host_key` option](https://vector.dev/docs/reference/configuration//global-options#log_schema.host_key) is used.
     pub host_key: Option<OptionalValuePath>,
 
-    #[configurable(derived)]
     pub framing: Option<FramingConfig>,
 
-    #[configurable(derived)]
     #[serde(default = "default_decoding")]
     pub decoding: DeserializerConfig,
 
@@ -66,18 +69,36 @@ impl FileDescriptorConfig for FileDescriptorSourceConfig {
 }
 
 impl GenerateConfig for FileDescriptorSourceConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(indoc! {r#"
-            fd = 10
-        "#})
+    fn generate_config() -> serde_json::Value {
+        let fd = null_fd().unwrap();
+        toml::from_str(&format!(
+            r"
+            fd = {fd}
+            "
+        ))
         .unwrap()
     }
+}
+
+pub(crate) fn null_fd() -> crate::Result<RawFd> {
+    #[cfg(unix)]
+    const FILENAME: &str = "/dev/null";
+    #[cfg(windows)]
+    const FILENAME: &str = "C:\\NUL";
+    File::open(FILENAME)
+        .map_err(|error| format!("Could not open dummy file at {FILENAME:?}: {error}").into())
+        .map(IntoRawFd::into_raw_fd)
 }
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "file_descriptor")]
 impl SourceConfig for FileDescriptorSourceConfig {
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     async fn build(&self, cx: SourceContext) -> crate::Result<crate::sources::Source> {
+        // SAFETY: The configured descriptor is open and its ownership is transferred here.
         let pipe = io::BufReader::new(unsafe { File::from_raw_fd(self.fd as i32) });
         let log_namespace = cx.log_namespace(self.log_namespace);
 
@@ -87,7 +108,12 @@ impl SourceConfig for FileDescriptorSourceConfig {
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
 
-        outputs(log_namespace, &self.host_key, &self.decoding, Self::NAME)
+        outputs(
+            log_namespace,
+            self.host_key.as_ref(),
+            &self.decoding,
+            Self::NAME,
+        )
     }
 
     fn resources(&self) -> Vec<Resource> {
@@ -101,25 +127,30 @@ impl SourceConfig for FileDescriptorSourceConfig {
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
     use nix::unistd::{close, pipe, write};
+    use std::os::fd::AsRawFd;
     use vector_lib::lookup::path;
+    use vrl::value;
 
     use super::*;
     use crate::{
+        SourceSender,
         config::log_schema,
         test_util::components::{
-            assert_source_compliance, assert_source_error, COMPONENT_ERROR_TAGS, SOURCE_TAGS,
+            COMPONENT_ERROR_TAGS, SOURCE_TAGS, assert_source_compliance, assert_source_error,
         },
-        SourceSender,
     };
-    use futures::StreamExt;
-    use vrl::value;
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<FileDescriptorSourceConfig>();
     }
 
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[tokio::test]
     async fn file_descriptor_decodes_line() {
         assert_source_compliance(&SOURCE_TAGS, async {
@@ -127,16 +158,16 @@ mod tests {
             let (read_fd, write_fd) = pipe().unwrap();
             let config = FileDescriptorSourceConfig {
                 max_length: crate::serde::default_max_length(),
-                host_key: Default::default(),
+                host_key: Option::default(),
                 framing: None,
                 decoding: default_decoding(),
-                fd: read_fd as u32,
+                fd: read_fd.into_raw_fd() as u32,
                 log_namespace: None,
             };
 
             let mut stream = rx;
 
-            write(write_fd, b"hello world\nhello world again\n").unwrap();
+            write(&write_fd, b"hello world\nhello world again\n").unwrap();
             close(write_fd).unwrap();
 
             let context = SourceContext::new_test(tx, None);
@@ -161,6 +192,10 @@ mod tests {
         .await;
     }
 
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[tokio::test]
     async fn file_descriptor_decodes_line_vector_namespace() {
         assert_source_compliance(&SOURCE_TAGS, async {
@@ -168,16 +203,16 @@ mod tests {
             let (read_fd, write_fd) = pipe().unwrap();
             let config = FileDescriptorSourceConfig {
                 max_length: crate::serde::default_max_length(),
-                host_key: Default::default(),
+                host_key: Option::default(),
                 framing: None,
                 decoding: default_decoding(),
-                fd: read_fd as u32,
+                fd: read_fd.into_raw_fd() as u32,
                 log_namespace: Some(true),
             };
 
             let mut stream = rx;
 
-            write(write_fd, b"hello world\nhello world again\n").unwrap();
+            write(&write_fd, b"hello world\nhello world again\n").unwrap();
             close(write_fd).unwrap();
 
             let context = SourceContext::new_test(tx, None);
@@ -193,10 +228,11 @@ mod tests {
                 meta.get(path!("vector", "source_type")).unwrap(),
                 &value!("file_descriptor")
             );
-            assert!(meta
-                .get(path!("vector", "ingest_timestamp"))
-                .unwrap()
-                .is_timestamp());
+            assert!(
+                meta.get(path!("vector", "ingest_timestamp"))
+                    .unwrap()
+                    .is_timestamp()
+            );
 
             let event = stream.next().await;
             let event = event.unwrap();
@@ -210,6 +246,10 @@ mod tests {
         .await;
     }
 
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing numeric representation of these protocol fixtures. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[tokio::test]
     async fn file_descriptor_handles_invalid_fd() {
         assert_source_error(&COMPONENT_ERROR_TAGS, async {
@@ -217,17 +257,19 @@ mod tests {
             let (_read_fd, write_fd) = pipe().unwrap();
             let config = FileDescriptorSourceConfig {
                 max_length: crate::serde::default_max_length(),
-                host_key: Default::default(),
+                host_key: Option::default(),
                 framing: None,
                 decoding: default_decoding(),
-                fd: write_fd as u32, // intentionally giving the source a write-only fd
+                fd: write_fd.as_raw_fd() as u32, // intentionally giving the source a write-only fd
                 log_namespace: None,
             };
 
             let mut stream = rx;
 
-            write(write_fd, b"hello world\nhello world again\n").unwrap();
-            close(write_fd).unwrap();
+            write(&write_fd, b"hello world\nhello world again\n").unwrap();
+            // Consume the OwnedFd without closing it to avoid double-close
+            // with the File created in build().
+            _ = write_fd.into_raw_fd();
 
             let context = SourceContext::new_test(tx, None);
             config.build(context).await.unwrap().await.unwrap();

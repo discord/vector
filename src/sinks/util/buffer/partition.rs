@@ -1,8 +1,8 @@
 use vector_lib::ByteSizeOf;
 
 use super::super::{
-    batch::{Batch, BatchConfig, BatchError, PushResult},
     ElementCount,
+    batch::{Batch, BatchConfig, BatchError, PushResult},
 };
 use crate::sinks::util::{Merged, SinkBatchSettings};
 
@@ -76,7 +76,6 @@ impl<T, K> PartitionInnerBuffer<T, K> {
         Self { inner, key }
     }
 
-    #[allow(clippy::missing_const_for_fn)] // const cannot run destructor
     pub fn into_parts(self) -> (T, K) {
         (self.inner, self.key)
     }

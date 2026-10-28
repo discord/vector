@@ -10,21 +10,25 @@ use glob::{Pattern, PatternError};
 use heim::units::ratio::ratio;
 use heim::units::time::second;
 use serde_with::serde_as;
+use sysinfo::{Components, System};
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    config::LogNamespace,
+    configurable::{configurable_component, schema::is_generating_root_schema},
+    internal_event::{
+        ByteSize, BytesReceived, CountByteSize, CounterName, GaugeName, InternalEventHandle as _,
+        Protocol, Registered,
+    },
 };
-use vector_lib::EstimatedJsonEncodedSizeOf;
 
 use crate::{
+    SourceSender,
     config::{SourceConfig, SourceContext, SourceOutput},
     event::metric::{Metric, MetricKind, MetricTags, MetricValue},
     internal_events::{EventsReceived, HostMetricsScrapeDetailError, StreamClosedError},
     shutdown::ShutdownSignal,
-    SourceSender,
 };
 
 #[cfg(target_os = "linux")]
@@ -34,6 +38,10 @@ mod disk;
 mod filesystem;
 mod memory;
 mod network;
+mod process;
+#[cfg(target_os = "linux")]
+mod tcp;
+mod temperature;
 
 /// Collector types.
 #[serde_as]
@@ -48,6 +56,9 @@ pub enum Collector {
 
     /// Metrics related to CPU utilization.
     Cpu,
+
+    /// Metrics related to Process utilization.
+    Process,
 
     /// Metrics related to disk I/O utilization.
     Disk,
@@ -66,6 +77,12 @@ pub enum Collector {
 
     /// Metrics related to network utilization.
     Network,
+
+    /// Metrics related to TCP connections.
+    TCP,
+
+    /// Metrics related to component temperatures.
+    Temperature,
 }
 
 /// Filtering configuration.
@@ -109,22 +126,21 @@ pub struct HostMetricsConfig {
     #[serde(default = "default_namespace")]
     pub namespace: Option<String>,
 
-    #[configurable(derived)]
     #[derivative(Default(value = "default_cgroups_config()"))]
     #[serde(default = "default_cgroups_config")]
     pub cgroups: Option<CGroupsConfig>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub disk: disk::DiskConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub filesystem: filesystem::FilesystemConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub network: network::NetworkConfig,
+
+    #[serde(default)]
+    pub process: process::ProcessConfig,
 }
 
 /// Options for the cgroups (controller groups) metrics collector.
@@ -166,11 +182,12 @@ const fn default_scrape_interval() -> Duration {
     Duration::from_secs(15)
 }
 
+#[must_use]
 pub fn default_namespace() -> Option<String> {
     Some(String::from("host"))
 }
 
-const fn example_collectors() -> [&'static str; 8] {
+const fn example_collectors() -> [&'static str; 10] {
     [
         "cgroups",
         "cpu",
@@ -180,9 +197,15 @@ const fn example_collectors() -> [&'static str; 8] {
         "host",
         "memory",
         "network",
+        "tcp",
+        "temperature",
     ]
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Serde requires the optional field type in this default function."
+)]
 fn default_collectors() -> Option<Vec<Collector>> {
     let mut collectors = vec![
         Collector::Cpu,
@@ -192,15 +215,18 @@ fn default_collectors() -> Option<Vec<Collector>> {
         Collector::Host,
         Collector::Memory,
         Collector::Network,
+        Collector::Process,
     ];
 
     #[cfg(target_os = "linux")]
     {
         collectors.push(Collector::CGroups);
+        collectors.push(Collector::TCP);
     }
     #[cfg(not(target_os = "linux"))]
-    if std::env::var("VECTOR_GENERATE_SCHEMA").is_ok() {
+    if is_generating_root_schema() {
         collectors.push(Collector::CGroups);
+        collectors.push(Collector::TCP);
     }
 
     Some(collectors)
@@ -220,6 +246,20 @@ fn default_all_devices() -> FilterList {
     }
 }
 
+fn example_processes() -> FilterList {
+    FilterList {
+        includes: Some(vec!["docker".try_into().unwrap()]),
+        excludes: None,
+    }
+}
+
+fn default_all_processes() -> FilterList {
+    FilterList {
+        includes: Some(vec!["*".try_into().unwrap()]),
+        excludes: None,
+    }
+}
+
 const fn default_levels() -> usize {
     100
 }
@@ -231,9 +271,13 @@ fn example_cgroups() -> FilterList {
     }
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Non-Linux platforms omit cgroups outside schema generation. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn default_cgroups_config() -> Option<CGroupsConfig> {
-    // Check env variable to allow generating docs on non-linux systems.
-    if std::env::var("VECTOR_GENERATE_SCHEMA").is_ok() {
+    // Include the Linux-only default when generating docs on other platforms.
+    if is_generating_root_schema() {
         return Some(CGroupsConfig::default());
     }
 
@@ -261,12 +305,17 @@ impl SourceConfig for HostMetricsConfig {
             if self.cgroups.is_some() || self.has_collector(Collector::CGroups) {
                 return Err("CGroups collector is only available on Linux systems".into());
             }
+            if self.has_collector(Collector::TCP) {
+                return Err("TCP collector is only available on Linux systems".into());
+            }
         }
 
         let mut config = self.clone();
         config.namespace = config.namespace.filter(|namespace| !namespace.is_empty());
 
-        Ok(Box::pin(config.run(cx.out, cx.shutdown)))
+        Ok(crate::sources::source_with_error(
+            config.run(cx.out, cx.shutdown),
+        ))
     }
 
     fn outputs(&self, _global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -284,11 +333,15 @@ impl HostMetricsConfig {
         self.scrape_interval_secs = Duration::from_secs_f64(value);
     }
 
-    async fn run(self, mut out: SourceSender, shutdown: ShutdownSignal) -> Result<(), ()> {
+    async fn run(
+        self,
+        mut out: SourceSender,
+        shutdown: ShutdownSignal,
+    ) -> vector_lib::source_sender::SendResult {
         let duration = self.scrape_interval_secs;
         let mut interval = IntervalStream::new(time::interval(duration)).take_until(shutdown);
 
-        let generator = HostMetrics::new(self);
+        let mut generator = HostMetrics::new(self);
 
         let bytes_received = register!(BytesReceived::from(Protocol::NONE));
 
@@ -296,9 +349,9 @@ impl HostMetricsConfig {
             bytes_received.emit(ByteSize(0));
             let metrics = generator.capture_metrics().await;
             let count = metrics.len();
-            if (out.send_batch(metrics).await).is_err() {
+            if let Err(error) = out.send_batch(metrics).await {
                 emit!(StreamClosedError { count });
-                return Err(());
+                return Err(error);
             }
         }
 
@@ -308,13 +361,18 @@ impl HostMetricsConfig {
     fn has_collector(&self, collector: Collector) -> bool {
         match &self.collectors {
             None => true,
-            Some(collectors) => collectors.iter().any(|&c| c == collector),
+            Some(collectors) => collectors.contains(&collector),
         }
     }
 }
 
 pub struct HostMetrics {
     config: HostMetricsConfig,
+    system: System,
+    // Kept across scrapes so that sysinfo-derived values such as
+    // `Component::max()` retain their refresh history instead of resetting on
+    // every collection (see `temperature_metrics`).
+    components: Components,
     #[cfg(target_os = "linux")]
     root_cgroup: Option<cgroups::CGroupRoot>,
     events_received: Registered<EventsReceived>,
@@ -322,29 +380,36 @@ pub struct HostMetrics {
 
 impl HostMetrics {
     #[cfg(not(target_os = "linux"))]
+    #[must_use]
     pub fn new(config: HostMetricsConfig) -> Self {
         Self {
             config,
+            system: System::new(),
+            components: Components::new_with_refreshed_list(),
             events_received: register!(EventsReceived),
         }
     }
 
     #[cfg(target_os = "linux")]
+    #[must_use]
     pub fn new(config: HostMetricsConfig) -> Self {
         let cgroups = config.cgroups.clone().unwrap_or_default();
         let root_cgroup = cgroups::CGroupRoot::new(&cgroups);
         Self {
             config,
+            system: System::new(),
+            components: Components::new_with_refreshed_list(),
             root_cgroup,
             events_received: register!(EventsReceived),
         }
     }
 
+    #[must_use]
     pub fn buffer(&self) -> MetricsBuffer {
         MetricsBuffer::new(self.config.namespace.clone())
     }
 
-    async fn capture_metrics(&self) -> Vec<Metric> {
+    async fn capture_metrics(&mut self) -> Vec<Metric> {
         let mut buffer = self.buffer();
 
         #[cfg(target_os = "linux")]
@@ -353,6 +418,9 @@ impl HostMetrics {
         }
         if self.config.has_collector(Collector::Cpu) {
             self.cpu_metrics(&mut buffer).await;
+        }
+        if self.config.has_collector(Collector::Process) {
+            self.process_metrics(&mut buffer);
         }
         if self.config.has_collector(Collector::Disk) {
             self.disk_metrics(&mut buffer).await;
@@ -369,12 +437,21 @@ impl HostMetrics {
         if self.config.has_collector(Collector::Memory) {
             self.memory_metrics(&mut buffer).await;
             self.swap_metrics(&mut buffer).await;
+            #[cfg(target_os = "linux")]
+            self.vmstat_metrics(&mut buffer).await;
         }
         if self.config.has_collector(Collector::Network) {
             self.network_metrics(&mut buffer).await;
         }
+        #[cfg(target_os = "linux")]
+        if self.config.has_collector(Collector::TCP) {
+            self.tcp_metrics(&mut buffer).await;
+        }
+        if self.config.has_collector(Collector::Temperature) {
+            self.temperature_metrics(&mut buffer);
+        }
 
-        let metrics = buffer.metrics;
+        let metrics = buffer.into_metrics();
         self.events_received.emit(CountByteSize(
             metrics.len(),
             metrics.estimated_json_encoded_size_of(),
@@ -388,18 +465,18 @@ impl HostMetrics {
         match heim::cpu::os::unix::loadavg().await {
             Ok(loadavg) => {
                 output.gauge(
-                    "load1",
-                    loadavg.0.get::<ratio>() as f64,
+                    GaugeName::Load1,
+                    f64::from(loadavg.0.get::<ratio>()),
                     MetricTags::default(),
                 );
                 output.gauge(
-                    "load5",
-                    loadavg.1.get::<ratio>() as f64,
+                    GaugeName::Load5,
+                    f64::from(loadavg.1.get::<ratio>()),
                     MetricTags::default(),
                 );
                 output.gauge(
-                    "load15",
-                    loadavg.2.get::<ratio>() as f64,
+                    GaugeName::Load15,
+                    f64::from(loadavg.2.get::<ratio>()),
                     MetricTags::default(),
                 );
             }
@@ -415,7 +492,11 @@ impl HostMetrics {
     pub async fn host_metrics(&self, output: &mut MetricsBuffer) {
         output.name = "host";
         match heim::host::uptime().await {
-            Ok(time) => output.gauge("uptime", time.get::<second>(), MetricTags::default()),
+            Ok(time) => output.gauge(
+                GaugeName::Uptime,
+                time.get::<second>(),
+                MetricTags::default(),
+            ),
             Err(error) => {
                 emit!(HostMetricsScrapeDetailError {
                     message: "Failed to load host uptime info",
@@ -425,7 +506,11 @@ impl HostMetrics {
         }
 
         match heim::host::boot_time().await {
-            Ok(time) => output.gauge("boot_time", time.get::<second>(), MetricTags::default()),
+            Ok(time) => output.gauge(
+                GaugeName::BootTime,
+                time.get::<second>(),
+                MetricTags::default(),
+            ),
             Err(error) => {
                 emit!(HostMetricsScrapeDetailError {
                     message: "Failed to load host boot time info",
@@ -438,7 +523,7 @@ impl HostMetrics {
 
 #[derive(Default)]
 pub struct MetricsBuffer {
-    pub metrics: Vec<Metric>,
+    metrics: Vec<Metric>,
     name: &'static str,
     host: Option<String>,
     timestamp: DateTime<Utc>,
@@ -456,6 +541,12 @@ impl MetricsBuffer {
         }
     }
 
+    /// Consumes the buffer, returning the collected metrics.
+    #[must_use]
+    pub fn into_metrics(self) -> Vec<Metric> {
+        self.metrics
+    }
+
     fn tags(&self, mut tags: MetricTags) -> MetricTags {
         tags.replace("collector".into(), self.name.to_string());
         if let Some(host) = &self.host {
@@ -464,22 +555,30 @@ impl MetricsBuffer {
         tags
     }
 
-    fn counter(&mut self, name: &str, value: f64, tags: MetricTags) {
+    fn counter(&mut self, name: CounterName, value: f64, tags: MetricTags) {
         self.metrics.push(
-            Metric::new(name, MetricKind::Absolute, MetricValue::Counter { value })
-                .with_namespace(self.namespace.clone())
-                .with_tags(Some(self.tags(tags)))
-                .with_timestamp(Some(self.timestamp)),
-        )
+            Metric::new(
+                name.as_str(),
+                MetricKind::Absolute,
+                MetricValue::Counter { value },
+            )
+            .with_namespace(self.namespace.clone())
+            .with_tags(Some(self.tags(tags)))
+            .with_timestamp(Some(self.timestamp)),
+        );
     }
 
-    fn gauge(&mut self, name: &str, value: f64, tags: MetricTags) {
+    fn gauge(&mut self, name: GaugeName, value: f64, tags: MetricTags) {
         self.metrics.push(
-            Metric::new(name, MetricKind::Absolute, MetricValue::Gauge { value })
-                .with_namespace(self.namespace.clone())
-                .with_tags(Some(self.tags(tags)))
-                .with_timestamp(Some(self.timestamp)),
-        )
+            Metric::new(
+                name.as_str(),
+                MetricKind::Absolute,
+                MetricValue::Gauge { value },
+            )
+            .with_namespace(self.namespace.clone())
+            .with_tags(Some(self.tags(tags)))
+            .with_timestamp(Some(self.timestamp)),
+        );
     }
 }
 
@@ -499,7 +598,13 @@ where
     filter_result_sync(result, message)
 }
 
-#[allow(clippy::missing_const_for_fn)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "#[cfg(linux)] calls non-const methods"
+    )
+)]
 fn init_roots() {
     #[cfg(target_os = "linux")]
     {
@@ -508,33 +613,31 @@ fn init_roots() {
         static INIT: Once = Once::new();
 
         INIT.call_once(|| {
-            match std::env::var_os("PROCFS_ROOT") {
-                Some(procfs_root) => {
-                    info!(
-                        message = "PROCFS_ROOT is set in envvars. Using custom for procfs.",
-                        custom = ?procfs_root
-                    );
-                    heim::os::linux::set_procfs_root(std::path::PathBuf::from(&procfs_root));
-                }
-                None => info!("PROCFS_ROOT is unset. Using default '/proc' for procfs root."),
-            };
+            if let Some(procfs_root) = std::env::var_os("PROCFS_ROOT") {
+                info!(
+                    message = "PROCFS_ROOT is set in envvars. Using custom for procfs.",
+                    custom = ?procfs_root
+                );
+                heim::os::linux::set_procfs_root(PathBuf::from(&procfs_root));
+            } else {
+                info!("PROCFS_ROOT is unset. Using default '/proc' for procfs root.");
+            }
 
-            match std::env::var_os("SYSFS_ROOT") {
-                Some(sysfs_root) => {
-                    info!(
-                        message = "SYSFS_ROOT is set in envvars. Using custom for sysfs.",
-                        custom = ?sysfs_root
-                    );
-                    heim::os::linux::set_sysfs_root(std::path::PathBuf::from(&sysfs_root));
-                }
-                None => info!("SYSFS_ROOT is unset. Using default '/sys' for sysfs root."),
+            if let Some(sysfs_root) = std::env::var_os("SYSFS_ROOT") {
+                info!(
+                    message = "SYSFS_ROOT is set in envvars. Using custom for sysfs.",
+                    custom = ?sysfs_root
+                );
+                heim::os::linux::set_sysfs_root(PathBuf::from(&sysfs_root));
+            } else {
+                info!("SYSFS_ROOT is unset. Using default '/sys' for sysfs root.");
             }
         });
     };
 }
 
 impl FilterList {
-    fn contains<T, M>(&self, value: &Option<T>, matches: M) -> bool
+    fn contains<T: ?Sized, M>(&self, value: Option<&T>, matches: M) -> bool
     where
         M: Fn(&PatternWrapper, &T) -> bool,
     {
@@ -547,9 +650,8 @@ impl FilterList {
             (Some(includes), Some(value)) => includes.iter().any(|pattern| matches(pattern, value)),
         }) && match (&self.excludes, value) {
             // No excludes, list excludes nothing
-            (None, _) => true,
             // No value, never excluded
-            (Some(_), None) => true,
+            (None, _) | (Some(_), None) => true,
             // Otherwise find the given value
             (Some(excludes), Some(value)) => {
                 !excludes.iter().any(|pattern| matches(pattern, value))
@@ -558,11 +660,11 @@ impl FilterList {
     }
 
     fn contains_str(&self, value: Option<&str>) -> bool {
-        self.contains(&value, |pattern, s| pattern.matches_str(s))
+        self.contains(value, PatternWrapper::matches_str)
     }
 
     fn contains_path(&self, value: Option<&Path>) -> bool {
-        self.contains(&value, |pattern, path| pattern.matches_path(path))
+        self.contains(value, PatternWrapper::matches_path)
     }
 
     #[cfg(test)]
@@ -628,10 +730,10 @@ impl From<PatternWrapper> for String {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_util::components::{run_and_assert_source_compliance, SOURCE_TAGS};
     use std::{collections::HashSet, future::Future, time::Duration};
 
     use super::*;
+    use crate::test_util::components::{SOURCE_TAGS, run_and_assert_source_compliance};
 
     #[test]
     fn filterlist_default_includes_everything() {
@@ -708,6 +810,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             Collector::CGroups,
             Collector::Cpu,
+            Collector::Process,
             Collector::Disk,
             Collector::Filesystem,
             Collector::Load,
@@ -724,8 +827,7 @@ mod tests {
 
             assert!(
                 all_metrics_count > some_metrics.len(),
-                "collector={:?}",
-                collector
+                "collector={collector:?}"
             );
         }
     }
@@ -736,12 +838,14 @@ mod tests {
             .capture_metrics()
             .await;
         let hostname = crate::get_hostname().expect("Broken hostname");
-        assert!(!metrics.into_iter().any(|event| event
-            .tags()
-            .expect("Missing tags")
-            .get("host")
-            .expect("Missing \"host\" tag")
-            != hostname));
+        assert!(!metrics.into_iter().any(|event| {
+            event
+                .tags()
+                .expect("Missing tags")
+                .get("host")
+                .expect("Missing \"host\" tag")
+                != hostname
+        }));
     }
 
     #[tokio::test]
@@ -753,9 +857,11 @@ mod tests {
         .capture_metrics()
         .await;
 
-        assert!(metrics
-            .into_iter()
-            .all(|event| event.namespace() == Some("other")));
+        assert!(
+            metrics
+                .into_iter()
+                .all(|event| event.namespace() == Some("other"))
+        );
     }
 
     #[tokio::test]
@@ -764,9 +870,11 @@ mod tests {
             .capture_metrics()
             .await;
 
-        assert!(metrics
-            .iter()
-            .all(|event| event.namespace() == Some("host")));
+        assert!(
+            metrics
+                .iter()
+                .all(|event| event.namespace() == Some("host"))
+        );
     }
 
     // Windows does not produce load average metrics.
@@ -777,14 +885,16 @@ mod tests {
         HostMetrics::new(HostMetricsConfig::default())
             .loadavg_metrics(&mut buffer)
             .await;
-        let metrics = buffer.metrics;
+        let metrics = buffer.into_metrics();
         assert_eq!(metrics.len(), 3);
         assert!(all_gauges(&metrics));
 
         // All metrics are named load*
-        assert!(!metrics
-            .iter()
-            .any(|metric| !metric.name().starts_with("load")));
+        assert!(
+            !metrics
+                .iter()
+                .any(|metric| !metric.name().starts_with("load"))
+        );
     }
 
     #[tokio::test]
@@ -793,7 +903,7 @@ mod tests {
         HostMetrics::new(HostMetricsConfig::default())
             .host_metrics(&mut buffer)
             .await;
-        let metrics = buffer.metrics;
+        let metrics = buffer.into_metrics();
         assert_eq!(metrics.len(), 2);
         assert!(all_gauges(&metrics));
     }
@@ -816,8 +926,7 @@ mod tests {
                 .tags()
                 .unwrap()
                 .get(tag)
-                .map(|value| !matches(value))
-                .unwrap_or(false)
+                .is_some_and(|value| !matches(value))
         })
     }
 
@@ -858,8 +967,13 @@ mod tests {
         let keys = collect_tag_values(&all_metrics, tag);
         // Pick an arbitrary key value
         if let Some(key) = keys.into_iter().next() {
-            let key_prefix = &key[..key.len() - 1].to_string();
-            let key_prefix_pattern = PatternWrapper::try_from(format!("{}*", key_prefix)).unwrap();
+            #[expect(
+                clippy::string_slice,
+                reason = "index from char_indices, always a char boundary"
+            )]
+            let key_prefix =
+                &key[..key.char_indices().next_back().map_or(0, |(i, _)| i)].to_string();
+            let key_prefix_pattern = PatternWrapper::try_from(format!("{key_prefix}*")).unwrap();
             let key_pattern = PatternWrapper::try_from(key.clone()).unwrap();
 
             let filter = FilterList {

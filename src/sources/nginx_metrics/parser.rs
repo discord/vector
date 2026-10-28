@@ -1,10 +1,11 @@
 use std::convert::TryFrom;
 
 use nom::{
+    Parser,
     bytes::complete::{tag, take_while_m_n},
     combinator::{all_consuming, map_res},
     error::ErrorKind,
-    sequence::{preceded, terminated, tuple},
+    sequence::{preceded, terminated},
 };
 use snafu::Snafu;
 
@@ -29,7 +30,8 @@ fn get_usize(input: &str) -> nom::IResult<&str, usize, nom::error::Error<&str>> 
     map_res(
         take_while_m_n(1, 20, |c: char| c.is_ascii_digit()),
         |s: &str| s.parse::<usize>(),
-    )(input)
+    )
+    .parse(input)
 }
 
 impl<'a> TryFrom<&'a str> for NginxStubStatus {
@@ -39,7 +41,7 @@ impl<'a> TryFrom<&'a str> for NginxStubStatus {
     // https://github.com/nginx/nginx/blob/master/src/http/modules/ngx_http_stub_status_module.c#L137-L145
     fn try_from(input: &'a str) -> Result<Self, Self::Error> {
         // `usize::MAX` eq `18446744073709551615` (20 characters)
-        match all_consuming(tuple((
+        match all_consuming((
             preceded(tag("Active connections: "), get_usize),
             preceded(tag(" \nserver accepts handled requests\n "), get_usize),
             preceded(tag(" "), get_usize),
@@ -47,19 +49,29 @@ impl<'a> TryFrom<&'a str> for NginxStubStatus {
             preceded(tag(" \nReading: "), get_usize),
             preceded(tag(" Writing: "), get_usize),
             terminated(preceded(tag(" Waiting: "), get_usize), tag(" \n")),
-        )))(input)
+        ))
+        .parse(input)
         {
-            Ok((_, (active, accepts, handled, requests, reading, writing, waiting))) => {
-                Ok(NginxStubStatus {
+            Ok((
+                _,
+                (
                     active,
                     accepts,
                     handled,
                     requests,
                     reading,
-                    writing,
-                    waiting,
-                })
-            }
+                    writing_connections,
+                    idle_connections,
+                ),
+            )) => Ok(NginxStubStatus {
+                active,
+                accepts,
+                handled,
+                requests,
+                reading,
+                writing: writing_connections,
+                waiting: idle_connections,
+            }),
             Err(error) => match error {
                 nom::Err::Error(error) => {
                     Err(ParseError::NginxStubStatusParseError { kind: error.code })
@@ -85,9 +97,9 @@ mod tests {
             NginxStubStatus::try_from(data).expect("valid data"),
             NginxStubStatus {
                 active: 291,
-                accepts: 16630948,
-                handled: 16630948,
-                requests: 31070465,
+                accepts: 16_630_948,
+                handled: 16_630_948,
+                requests: 31_070_465,
                 reading: 6,
                 writing: 179,
                 waiting: 106

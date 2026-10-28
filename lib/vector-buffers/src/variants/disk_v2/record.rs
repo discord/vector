@@ -3,14 +3,14 @@ use std::{mem, ptr::addr_of};
 use bytecheck::{CheckBytes, ErrorBox, StructCheckError};
 use crc32fast::Hasher;
 use rkyv::{
+    Archive, Archived, Serialize,
     boxed::ArchivedBox,
     with::{CopyOptimize, RefAsBox},
-    Archive, Archived, Serialize,
 };
 
 use super::{
     common::align16,
-    ser::{try_as_archive, DeserializeError},
+    ser::{DeserializeError, try_as_archive},
 };
 
 pub const RECORD_HEADER_LEN: usize = align16(mem::size_of::<ArchivedRecord<'_>>() + 8);
@@ -86,31 +86,35 @@ where
         value: *const Self,
         context: &mut C,
     ) -> Result<&'b Self, Self::Error> {
-        Archived::<u32>::check_bytes(addr_of!((*value).checksum), context).map_err(|e| {
-            StructCheckError {
-                field_name: "checksum",
-                inner: ErrorBox::new(e),
-            }
-        })?;
-        Archived::<u64>::check_bytes(addr_of!((*value).id), context).map_err(|e| {
-            StructCheckError {
-                field_name: "id",
-                inner: ErrorBox::new(e),
-            }
-        })?;
-        Archived::<u32>::check_bytes(addr_of!((*value).metadata), context).map_err(|e| {
-            StructCheckError {
-                field_name: "schema_metadata",
-                inner: ErrorBox::new(e),
-            }
-        })?;
-        ArchivedBox::<[u8]>::check_bytes(addr_of!((*value).payload), context).map_err(|e| {
-            StructCheckError {
-                field_name: "payload",
-                inner: ErrorBox::new(e),
-            }
-        })?;
-        Ok(&*value)
+        // SAFETY: The `CheckBytes` contract guarantees that `value` is aligned and points to enough
+        // bytes for `Self`; each field is validated before the final reference is created.
+        unsafe {
+            Archived::<u32>::check_bytes(addr_of!((*value).checksum), context).map_err(|e| {
+                StructCheckError {
+                    field_name: "checksum",
+                    inner: ErrorBox::new(e),
+                }
+            })?;
+            Archived::<u64>::check_bytes(addr_of!((*value).id), context).map_err(|e| {
+                StructCheckError {
+                    field_name: "id",
+                    inner: ErrorBox::new(e),
+                }
+            })?;
+            Archived::<u32>::check_bytes(addr_of!((*value).metadata), context).map_err(|e| {
+                StructCheckError {
+                    field_name: "schema_metadata",
+                    inner: ErrorBox::new(e),
+                }
+            })?;
+            ArchivedBox::<[u8]>::check_bytes(addr_of!((*value).payload), context).map_err(|e| {
+                StructCheckError {
+                    field_name: "payload",
+                    inner: ErrorBox::new(e),
+                }
+            })?;
+            Ok(&*value)
+        }
     }
 }
 
@@ -127,7 +131,7 @@ impl<'a> Record<'a> {
     }
 }
 
-impl<'a> ArchivedRecord<'a> {
+impl ArchivedRecord<'_> {
     /// Gets the metadata of this record.
     pub fn metadata(&self) -> u32 {
         self.metadata

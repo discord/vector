@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use vector_config_common::schema::{visit::Visitor, *};
+use vector_config_common::schema::{
+    Map, Schema, SchemaObject, SingleOrVec, get_cleaned_schema_reference, visit::Visitor,
+};
 
 /// A schema reference which can refer to either a schema definition or the root schema itself.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -15,7 +17,7 @@ pub enum SchemaReference {
 impl std::fmt::Display for SchemaReference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Definition(name) => write!(f, "{}", name),
+            Self::Definition(name) => write!(f, "{name}"),
             Self::Root => write!(f, "<root>"),
         }
     }
@@ -59,6 +61,7 @@ impl SchemaScopeStack {
         self.stack.pop_front()
     }
 
+    #[must_use]
     pub fn current(&self) -> Option<&SchemaReference> {
         self.stack.front()
     }
@@ -72,6 +75,11 @@ pub trait ScopedVisitor: Visitor {
     fn get_current_schema_scope(&self) -> &SchemaReference;
 }
 
+/// Visit a schema object while tracking its reference scope.
+///
+/// # Panics
+///
+/// Panics if a referenced schema is absent from the definitions.
 pub fn visit_schema_object_scoped<SV: ScopedVisitor + ?Sized>(
     sv: &mut SV,
     definitions: &mut Map<String, Schema>,
@@ -124,10 +132,10 @@ fn visit_box_scoped<SV: ScopedVisitor + ?Sized>(
     definitions: &mut Map<String, Schema>,
     target: &mut Option<Box<Schema>>,
 ) {
-    if let Some(s) = target {
-        if let Schema::Object(s) = s.as_mut() {
-            sv.visit_schema_object(definitions, s);
-        }
+    if let Some(s) = target
+        && let Schema::Object(s) = s.as_mut()
+    {
+        sv.visit_schema_object(definitions, s);
     }
 }
 

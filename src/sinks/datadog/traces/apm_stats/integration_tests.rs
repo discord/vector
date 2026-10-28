@@ -1,22 +1,27 @@
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+
+use http_body::Body as _;
+
 use axum::{
+    Router,
     body::Body,
     extract::Extension,
-    http::{header::CONTENT_TYPE, Request},
+    http::{Request, header::CONTENT_TYPE},
     routing::{get, post},
-    Router,
 };
 use chrono::Utc;
-use flate2::read::GzDecoder;
 use indoc::indoc;
 use rmp_serde;
 use serde::Serialize;
-use std::{collections::HashMap, io::Read, net::SocketAddr, sync::Arc};
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::time::{sleep, Duration};
+use tokio::{
+    sync::mpsc::{self, Receiver, Sender},
+    time::{Duration, sleep},
+};
+use vector_common::decompression::CappedDecoder;
 
 use crate::{
     config::ConfigBuilder,
-    sinks::datadog::traces::{apm_stats::StatsPayload, DatadogTracesConfig},
+    sinks::datadog::traces::{DatadogTracesConfig, apm_stats::StatsPayload},
     sources::datadog_agent::DatadogAgentConfig,
     test_util::{start_topology, trace_init},
     topology::{RunningTopology, ShutdownErrorReceiver},
@@ -76,7 +81,7 @@ async fn run_server(name: String, port: u16, tx: Sender<StatsPayload>) {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    info!("HTTP server for `{}` listening on {}", name, addr);
+    info!("HTTP server for `{name}` listening on {addr}");
 
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -95,52 +100,52 @@ async fn process_traces(Extension(_state): Extension<Arc<AppState>>, request: Re
     let content_type_header = request.headers().get(CONTENT_TYPE);
     let content_type = content_type_header.and_then(|value| value.to_str().ok());
 
-    if let Some(content_type) = content_type {
-        if content_type.starts_with("application/x-protobuf") {
-            debug!("Got trace payload.");
-        }
+    if let Some(content_type) = content_type
+        && content_type.starts_with("application/x-protobuf")
+    {
+        debug!("Got trace payload.");
     }
 }
 
 /// Process a POST request from the stats endpoint.
 /// De-compresses and De-serializes the payload, then forwards it on the Sender channel.
 async fn process_stats(Extension(state): Extension<Arc<AppState>>, mut request: Request<Body>) {
-    debug!(
-        "`{}` server process_stats request: {:?}",
-        state.name, request
-    );
+    debug!("`{}` server process_stats request: {request:?}", state.name);
 
     let content_type_header = request.headers().get(CONTENT_TYPE);
     let content_type = content_type_header.and_then(|value| value.to_str().ok());
 
-    if let Some(content_type) = content_type {
-        if content_type.starts_with("application/msgpack") {
-            debug!("`{}` server got stats payload.", state.name);
+    if let Some(content_type) = content_type
+        && content_type.starts_with("application/msgpack")
+    {
+        debug!("`{}` server got stats payload.", state.name);
 
-            let body = request.body_mut();
-            let compressed_body_bytes = hyper::body::to_bytes(body)
-                .await
-                .expect("could not decode body into bytes");
+        let body = request.body_mut();
+        let compressed_body_bytes = body
+            .collect()
+            .await
+            .expect("could not decode body into bytes")
+            .to_bytes();
 
-            let mut gz = GzDecoder::new(compressed_body_bytes.as_ref());
-            let mut decompressed_body_bytes = vec![];
-            gz.read_to_end(&mut decompressed_body_bytes)
-                .expect("unable to decompress gzip stats payload");
+        let decompressed_body_bytes = CappedDecoder::gzip(compressed_body_bytes.as_ref())
+            .decompress()
+            .expect("unable to decompress gzip stats payload");
 
-            let payload: StatsPayload = rmp_serde::from_slice(&decompressed_body_bytes).unwrap();
+        let payload: StatsPayload = rmp_serde::from_slice(&decompressed_body_bytes).unwrap();
 
-            info!(
-                "`{}` server received and deserialized stats payload.",
-                state.name
-            );
-            debug!("{:?}", payload);
+        info!(
+            "`{}` server received and deserialized stats payload.",
+            state.name
+        );
+        debug!("{payload:?}");
 
-            state.tx.send(payload).await.unwrap();
-        }
+        state.tx.send(payload).await.unwrap();
     }
 }
 
 #[derive(Serialize)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::struct_field_names, reason = "Match the Datadog span schema.")]
 struct Span {
     duration: i64,
     error: i32,
@@ -198,25 +203,27 @@ async fn send_agent_traces(urls: &Vec<String>, start: i64, duration: i64, span_i
                 .unwrap();
 
             if res.status() != hyper::StatusCode::OK {
-                error!("Error sending traces to {}, res: {:?}.", url, res);
+                error!("Error sending traces to {url}, res: {res:?}.");
                 return false;
             }
-            info!("Sent a trace to the Agent at {}.", url);
+            info!("Sent a trace to the Agent at {url}.");
         }
         true
     }
 
     // send first set of trace data
-    if !send_trace(urls, start, duration, span_id).await {
-        panic!("can't perform checks if traces aren't accepted by agent.");
-    }
+    assert!(
+        send_trace(urls, start, duration, span_id).await,
+        "can't perform checks if traces aren't accepted by agent."
+    );
 
     sleep(Duration::from_millis(100)).await;
 
     // send second set of trace data
-    if !send_trace(urls, start, duration, span_id + 1).await {
-        panic!("can't perform checks if traces aren't accepted by agent.");
-    }
+    assert!(
+        send_trace(urls, start, duration, span_id + 1).await,
+        "can't perform checks if traces aren't accepted by agent."
+    );
 }
 
 /// Receives the stats payloads from the Receiver channels from both of the server instances.
@@ -253,7 +260,7 @@ async fn receive_the_stats(
                     break;
                 }
             },
-            _ = &mut timeout => break,
+            () = &mut timeout => break,
         }
     }
 
@@ -288,8 +295,8 @@ fn validate_stats(agent_stats: &StatsPayload, vector_stats: &StatsPayload) {
     let agent_s = agent_bucket.stats.first().unwrap();
     let vector_s = vector_bucket.stats.first().unwrap();
 
-    info!("\nagent_stats : {:?}", agent_s);
-    info!("\nvector_stats : {:?}", vector_s);
+    info!("\nagent_stats : {agent_s:?}");
+    info!("\nvector_stats : {vector_s:?}");
 
     assert!(agent_s.service == vector_s.service);
     assert!(agent_s.name == vector_s.name);
@@ -322,10 +329,10 @@ fn validate_stats(agent_stats: &StatsPayload, vector_stats: &StatsPayload) {
 async fn start_vector() -> (RunningTopology, ShutdownErrorReceiver) {
     let dd_agent_address = format!("0.0.0.0:{}", vector_receive_port());
 
-    let source_config = toml::from_str::<DatadogAgentConfig>(&format!(
+    let source_config = serde_yaml::from_str::<DatadogAgentConfig>(&format!(
         indoc! { r#"
-            address = "{}"
-            multiple_outputs = true
+            address: "{}"
+            multiple_outputs: true
         "#},
         dd_agent_address,
     ))
@@ -337,9 +344,10 @@ async fn start_vector() -> (RunningTopology, ShutdownErrorReceiver) {
     let dd_traces_endpoint = format!("http://127.0.0.1:{}", server_port_for_vector());
     let cfg = format!(
         indoc! { r#"
-            default_api_key = "atoken"
-            endpoint = "{}"
-            batch.max_events = 1
+            default_api_key: "atoken"
+            endpoint: "{}"
+            batch:
+              max_events: 1
         "#},
         dd_traces_endpoint
     );
@@ -349,7 +357,7 @@ async fn start_vector() -> (RunningTopology, ShutdownErrorReceiver) {
     assert!(!api_key.is_empty(), "TEST_DATADOG_API_KEY required");
     let cfg = cfg.replace("atoken", &api_key);
 
-    let sink_config = toml::from_str::<DatadogTracesConfig>(&cfg).unwrap();
+    let sink_config = serde_yaml::from_str::<DatadogTracesConfig>(&cfg).unwrap();
 
     builder.add_sink("out", &["in.traces"], sink_config);
 

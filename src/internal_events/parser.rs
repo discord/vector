@@ -1,23 +1,32 @@
+#![allow(dead_code)] // TODO requires optional feature compilation
+
 use std::borrow::Cow;
 
-use metrics::counter;
-use vector_lib::internal_event::InternalEvent;
-use vector_lib::internal_event::{error_stage, error_type, ComponentEventsDropped, UNINTENTIONAL};
+use vector_lib::{
+    NamedInternalEvent, counter,
+    internal_event::{
+        ComponentEventsDropped, CounterName, InternalEvent, UNINTENTIONAL, error_stage, error_type,
+    },
+};
 
-fn truncate_string_at(s: &str, maxlen: usize) -> Cow<str> {
+fn truncate_string_at(s: &str, maxlen: usize) -> Cow<'_, str> {
     let ellipsis: &str = "[...]";
     if s.len() >= maxlen {
         let mut len = maxlen - ellipsis.len();
         while !s.is_char_boundary(len) {
             len -= 1;
         }
-        format!("{}{}", &s[..len], ellipsis).into()
+        #[expect(
+            clippy::string_slice,
+            reason = "len is adjusted to a char boundary in the loop above"
+        )]
+        format!("{}{ellipsis}", &s[..len]).into()
     } else {
         s.into()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ParserMatchError<'a> {
     pub value: &'a [u8],
 }
@@ -29,11 +38,10 @@ impl InternalEvent for ParserMatchError<'_> {
             error_code = "no_match_found",
             error_type = error_type::CONDITION_FAILED,
             stage = error_stage::PROCESSING,
-            field = &truncate_string_at(&String::from_utf8_lossy(self.value), 60)[..],
-            internal_log_rate_limit = true
+            field = truncate_string_at(&String::from_utf8_lossy(self.value), 60).as_ref()
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_code" => "no_match_found",
             "error_type" => error_type::CONDITION_FAILED,
             "stage" => error_stage::PROCESSING,
@@ -47,7 +55,7 @@ pub const DROP_EVENT: bool = true;
 #[allow(dead_code)]
 pub const RETAIN_EVENT: bool = false;
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ParserMissingFieldError<'a, const DROP_EVENT: bool> {
     pub field: &'a str,
 }
@@ -60,11 +68,10 @@ impl<const DROP_EVENT: bool> InternalEvent for ParserMissingFieldError<'_, DROP_
             field = %self.field,
             error_code = "field_not_found",
             error_type = error_type::CONDITION_FAILED,
-            stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true
+            stage = error_stage::PROCESSING
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_code" => "field_not_found",
             "error_type" => error_type::CONDITION_FAILED,
             "stage" => error_stage::PROCESSING,
@@ -78,13 +85,13 @@ impl<const DROP_EVENT: bool> InternalEvent for ParserMissingFieldError<'_, DROP_
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ParserConversionError<'a> {
     pub name: &'a str,
     pub error: crate::types::Error,
 }
 
-impl<'a> InternalEvent for ParserConversionError<'a> {
+impl InternalEvent for ParserConversionError<'_> {
     fn emit(self) {
         error!(
             message = "Could not convert types.",
@@ -92,11 +99,10 @@ impl<'a> InternalEvent for ParserConversionError<'a> {
             error = ?self.error,
             error_code = "type_conversion",
             error_type = error_type::CONVERSION_FAILED,
-            stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true
+            stage = error_stage::PROCESSING
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_code" => "type_conversion",
             "error_type" => error_type::CONVERSION_FAILED,
             "stage" => error_stage::PROCESSING,

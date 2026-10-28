@@ -63,9 +63,10 @@ impl RenderData {
     /// other than the leaf segment, points to a value that is not an object/map, this method will
     /// panic.
     pub fn write<V: Into<Value>>(&mut self, path: &str, value: V) {
-        if !path.starts_with('/') {
-            panic!("Paths must always start with a leading forward slash (`/`).");
-        }
+        assert!(
+            path.starts_with('/'),
+            "Paths must always start with a leading forward slash (`/`)."
+        );
 
         self.with_mut_object(|map| {
             // Split the path, and take the last element as the actual map key to write to.
@@ -79,9 +80,8 @@ impl RenderData {
             while let Some(segment) = segments.pop_front() {
                 if destination.contains_key(segment) {
                     match destination.get_mut(segment) {
-                        Some(Value::Object(ref mut next)) => {
+                        Some(Value::Object(next)) => {
                             destination = next;
-                            continue;
                         }
                         Some(_) => {
                             panic!("Only leaf nodes should be allowed to be non-object values.")
@@ -91,7 +91,7 @@ impl RenderData {
                 } else {
                     destination.insert(segment.to_string(), Value::Object(Map::new()));
                     match destination.get_mut(segment) {
-                        Some(Value::Object(ref mut next)) => {
+                        Some(Value::Object(next)) => {
                             destination = next;
                         }
                         _ => panic!("New object was just inserted."),
@@ -122,9 +122,10 @@ impl RenderData {
     /// other than the leaf segment, points to a value that is not an object/map, this method will
     /// panic.
     pub fn delete(&mut self, path: &str) -> bool {
-        if !path.starts_with('/') {
-            panic!("Paths must always start with a leading forward slash (`/`).");
-        }
+        assert!(
+            path.starts_with('/'),
+            "Paths must always start with a leading forward slash (`/`)."
+        );
 
         self.with_mut_object(|map| {
             // Split the path, and take the last element as the actual map key to write to.
@@ -139,9 +140,8 @@ impl RenderData {
             let mut destination = map;
             while let Some(segment) = segments.pop_front() {
                 match destination.get_mut(segment) {
-                    Some(Value::Object(ref mut next)) => {
+                    Some(Value::Object(next)) => {
                         destination = next;
-                        continue;
                     }
                     Some(_) => panic!("Only leaf nodes should be allowed to be non-object values."),
                     // If the next segment doesn't exist, there's nothing for us to delete, so return `false`.
@@ -166,9 +166,10 @@ impl RenderData {
     ///
     /// If the path does not start with a forward slash, this method will panic.
     pub fn exists(&self, path: &str) -> bool {
-        if !path.starts_with('/') {
-            panic!("Paths must always start with a leading forward slash (`/`).");
-        }
+        assert!(
+            path.starts_with('/'),
+            "Paths must always start with a leading forward slash (`/`)."
+        );
 
         // The root path always exists.
         if path == "/" {
@@ -199,7 +200,7 @@ impl RenderData {
     /// is an array, the value on the `other` side is appended to that array, regardless of the
     /// contents of the array.
     pub fn merge(&mut self, _other: Self) {
-        todo!()
+        unimplemented!()
     }
 }
 
@@ -266,12 +267,9 @@ where
             debug!("Cleared description for items schema from top-level array schema.");
         }
 
-        // Apply any necessary defaults, descriptions, and so on, to the rendered schema.
+        // Apply metadata and descriptions to the rendered schema.
         //
-        // This must happen here because there could be callsite-specific overrides to default
-        // values/descriptions/etc which must take precedence, so that must occur after any nested
-        // rendering in order to maintain that precedence.
-        apply_schema_default_value(&schema, &mut data)?;
+        // Callsite-specific metadata and descriptions take precedence over nested rendering.
         apply_schema_metadata(&schema, &mut data)?;
         apply_schema_description(&schema, &mut data)?;
 
@@ -300,7 +298,7 @@ fn render_bare_schema<T: QueryableSchema>(
             // All we need to do is figure out the rendered type for the constant value, so we can
             // generate the right type path and stick the constant value in it.
             let rendered_const_type = get_rendered_value_type(&schema, const_value)?;
-            let const_type_path = format!("/type/{}/const", rendered_const_type);
+            let const_type_path = format!("/type/{rendered_const_type}/const");
             data.write(const_type_path.as_str(), const_value.clone());
         }
         SchemaType::Enum(enum_values) => {
@@ -355,17 +353,10 @@ fn render_bare_schema<T: QueryableSchema>(
             // instance type groupings, knowing that _we_ never generate schemas like that, but it's
             // still technically possible in a real-world JSON Schema document... so we should at
             // least make the error message half-way decent so that it explains as much.
-            todo!()
+            unimplemented!()
         }
     }
 
-    Ok(())
-}
-
-fn apply_schema_default_value<T: QueryableSchema>(
-    _schema: T,
-    _data: &mut RenderData,
-) -> Result<(), RenderError> {
     Ok(())
 }
 
@@ -403,7 +394,7 @@ fn get_rendered_value_type<T: QueryableSchema>(
     _schema: T,
     _value: &Value,
 ) -> Result<String, RenderError> {
-    todo!()
+    unimplemented!()
 }
 
 fn render_schema_description<T: QueryableSchema>(schema: T) -> Result<Option<String>, RenderError> {
@@ -417,7 +408,7 @@ fn render_schema_description<T: QueryableSchema>(schema: T) -> Result<Option<Str
         (None, None) => Ok(None),
         (None, Some(description)) => Ok(Some(description.trim().to_string())),
         (Some(title), Some(description)) => {
-            let concatenated = format!("{}\n\n{}", title, description);
+            let concatenated = format!("{title}\n\n{description}");
             Ok(Some(concatenated.trim().to_string()))
         }
     }

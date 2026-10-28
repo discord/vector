@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use tokio::sync::oneshot::{channel, Receiver};
-use vector_lib::config::ComponentKey;
-use vector_lib::config::OutputId;
-use vector_lib::event::{Event, EventArray, EventContainer, LogEvent};
+use tokio::sync::oneshot::{Receiver, channel};
+use vector_lib::{
+    config::{ComponentKey, OutputId},
+    event::{Event, EventArray, EventContainer, LogEvent},
+};
 
-use crate::config::schema::Definition;
 use crate::{
-    config::{unit_test::UnitTestSourceConfig, ConfigBuilder},
+    config::{ConfigBuilder, schema::Definition, unit_test::UnitTestSourceConfig},
     test_util::{
         components::assert_transform_compliance,
         mock::{
@@ -18,6 +18,19 @@ use crate::{
     },
     topology::RunningTopology,
 };
+
+const TEST_SOURCE_COMPONENT_ID: &str = "in";
+const TEST_UPSTREAM_COMPONENT_ID: &str = "transform";
+const TEST_SOURCE_TYPE: &str = "unit_test";
+
+fn set_expected_source_metadata(event: &mut Event) {
+    event.set_source_id(Arc::new(ComponentKey::from(TEST_SOURCE_COMPONENT_ID)));
+    event.set_upstream_id(Arc::new(OutputId::from(TEST_UPSTREAM_COMPONENT_ID)));
+    event.set_source_type(TEST_SOURCE_TYPE);
+    event
+        .metadata_mut()
+        .set_schema_definition(&Arc::new(Definition::default_legacy_namespace()));
+}
 
 async fn create_topology(
     event: Event,
@@ -48,7 +61,7 @@ async fn create_topology(
 
 #[tokio::test]
 async fn test_function_transform_single_event() {
-    assert_transform_compliance(async {
+    Box::pin(assert_transform_compliance(async {
         let mut original_event = Event::Log(LogEvent::from("function transform being tested"));
 
         let (topology, rx) = create_topology(original_event.clone(), TransformType::Function).await;
@@ -58,21 +71,17 @@ async fn test_function_transform_single_event() {
         let mut events = events.into_events().collect::<Vec<_>>();
         assert_eq!(events.len(), 1);
 
-        original_event.set_source_id(Arc::new(ComponentKey::from("in")));
-        original_event.set_upstream_id(Arc::new(OutputId::from("transform")));
-        original_event
-            .metadata_mut()
-            .set_schema_definition(&Arc::new(Definition::default_legacy_namespace()));
+        set_expected_source_metadata(&mut original_event);
 
         let event = events.remove(0);
         assert_eq!(original_event, event);
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn test_sync_transform_single_event() {
-    assert_transform_compliance(async {
+    Box::pin(assert_transform_compliance(async {
         let mut original_event = Event::Log(LogEvent::from("function transform being tested"));
 
         let (topology, rx) =
@@ -83,21 +92,17 @@ async fn test_sync_transform_single_event() {
         let mut events = events.into_events().collect::<Vec<_>>();
         assert_eq!(events.len(), 1);
 
-        original_event.set_source_id(Arc::new(ComponentKey::from("in")));
-        original_event.set_upstream_id(Arc::new(OutputId::from("transform")));
-        original_event
-            .metadata_mut()
-            .set_schema_definition(&Arc::new(Definition::default_legacy_namespace()));
+        set_expected_source_metadata(&mut original_event);
 
         let event = events.remove(0);
         assert_eq!(original_event, event);
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn test_task_transform_single_event() {
-    assert_transform_compliance(async {
+    Box::pin(assert_transform_compliance(async {
         let mut original_event = Event::Log(LogEvent::from("function transform being tested"));
 
         let (topology, rx) = create_topology(original_event.clone(), TransformType::Task).await;
@@ -107,14 +112,10 @@ async fn test_task_transform_single_event() {
         let mut events = events.into_events().collect::<Vec<_>>();
         assert_eq!(events.len(), 1);
 
-        original_event.set_source_id(Arc::new(ComponentKey::from("in")));
-        original_event.set_upstream_id(Arc::new(OutputId::from("transform")));
-        original_event
-            .metadata_mut()
-            .set_schema_definition(&Arc::new(Definition::default_legacy_namespace()));
+        set_expected_source_metadata(&mut original_event);
 
         let event = events.remove(0);
         assert_eq!(original_event, event);
-    })
+    }))
     .await;
 }

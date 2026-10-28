@@ -11,7 +11,7 @@ sources:
   file:
     type: "file"
     include:
-      - "/tmp/file-gen-*.log"
+      - "/smp-shared/*.log"
 
 ##
 ## Sinks
@@ -19,14 +19,14 @@ sources:
 
 sinks:
   prometheus:
-    type:    "prometheus_exporter"
-    inputs: [ "internal_metrics" ]
+    type: "prometheus_exporter"
+    inputs: ["internal_metrics"]
     address: "0.0.0.0:9090"
 
   socket_sink:
-    type:    "socket"
-    inputs: [ "file" ]
-    mode:    "tcp"
+    type: "socket"
+    inputs: ["file"]
+    mode: "tcp"
     address: "127.0.0.1:15400"
     encoding:
       codec: "json"

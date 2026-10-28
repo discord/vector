@@ -1,16 +1,18 @@
 use mlua::prelude::*;
 
-use super::super::{Event, LogEvent, Metric};
-use super::metric::LuaMetric;
+use super::{
+    super::{Event, LogEvent, Metric},
+    metric::LuaMetric,
+};
+use crate::event::MetricTagMode;
 
 pub struct LuaEvent {
     pub event: Event,
-    pub metric_multi_value_tags: bool,
+    pub metric_tag_mode: MetricTagMode,
 }
 
-impl<'a> IntoLua<'a> for LuaEvent {
-    #![allow(clippy::wrong_self_convention)] // this trait is defined by mlua
-    fn into_lua(self, lua: &'a Lua) -> LuaResult<LuaValue> {
+impl IntoLua for LuaEvent {
+    fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
         let table = lua.create_table()?;
         match self.event {
             Event::Log(log) => table.raw_set("log", log.into_lua(lua)?)?,
@@ -18,28 +20,28 @@ impl<'a> IntoLua<'a> for LuaEvent {
                 "metric",
                 LuaMetric {
                     metric,
-                    multi_value_tags: self.metric_multi_value_tags,
+                    tag_mode: self.metric_tag_mode,
                 }
                 .into_lua(lua)?,
             )?,
             Event::Trace(_) => {
                 return Err(LuaError::ToLuaConversionError {
-                    from: "Event",
+                    from: String::from("Event"),
                     to: "table",
                     message: Some("Trace are not supported".to_string()),
-                })
+                });
             }
         }
         Ok(LuaValue::Table(table))
     }
 }
 
-impl<'a> FromLua<'a> for Event {
-    fn from_lua(value: LuaValue<'a>, lua: &'a Lua) -> LuaResult<Self> {
+impl FromLua for Event {
+    fn from_lua(value: LuaValue, lua: &Lua) -> LuaResult<Self> {
         let LuaValue::Table(table) = &value else {
             return Err(LuaError::FromLuaConversionError {
                 from: value.type_name(),
-                to: "Event",
+                to: String::from("Event"),
                 message: Some("Event should be a Lua table".to_string()),
             });
         };
@@ -53,7 +55,7 @@ impl<'a> FromLua<'a> for Event {
             )?)),
             _ => Err(LuaError::FromLuaConversionError {
                 from: value.type_name(),
-                to: "Event",
+                to: String::from("Event"),
                 message: Some(
                     "Event should contain either \"log\" or \"metric\" key at the top level"
                         .to_string(),
@@ -67,8 +69,8 @@ impl<'a> FromLua<'a> for Event {
 mod test {
     use super::*;
     use crate::event::{
-        metric::{MetricKind, MetricValue},
         Metric, Value,
+        metric::{MetricKind, MetricValue},
     };
 
     fn assert_event(event: Event, assertions: Vec<&'static str>) {
@@ -78,23 +80,23 @@ mod test {
                 "event",
                 LuaEvent {
                     event,
-                    metric_multi_value_tags: false,
+                    metric_tag_mode: MetricTagMode::Single,
                 },
             )
             .unwrap();
         for assertion in assertions {
             assert!(
                 lua.load(assertion).eval::<bool>().expect(assertion),
-                "{}",
-                assertion
+                "{assertion}"
             );
         }
     }
 
     #[test]
     fn into_lua_log() {
+        use vrl::event_path;
         let mut event = LogEvent::default();
-        event.insert("field", "value");
+        event.insert(event_path!("field"), "value");
 
         let assertions = vec![
             "type(event) == 'table'",

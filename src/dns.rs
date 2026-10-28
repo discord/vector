@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use hyper::client::connect::dns::Name;
 use snafu::ResultExt;
 use tokio::task::spawn_blocking;
@@ -32,13 +32,12 @@ impl Resolver {
             ))
         } else {
             spawn_blocking(move || {
-                let name_ref = match name.as_str() {
-                    // strip IPv6 prefix and suffix
-                    name if name.starts_with('[') && name.ends_with(']') => {
-                        &name[1..name.len() - 1]
-                    }
-                    name => name,
-                };
+                // strip IPv6 prefix and suffix
+                let name_str = name.as_str();
+                let name_ref = name_str
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(name_str);
                 (name_ref, dummy_port).to_socket_addrs()
             })
             .await

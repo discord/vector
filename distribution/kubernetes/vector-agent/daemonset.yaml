@@ -4,12 +4,12 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: vector
+  namespace: "default"
   labels:
     app.kubernetes.io/name: vector
     app.kubernetes.io/instance: vector
     app.kubernetes.io/component: Agent
-    app.kubernetes.io/version: "0.41.1-distroless-libc"
-  annotations: {}
+    app.kubernetes.io/version: "0.59.0-distroless-libc"
 spec:
   selector:
     matchLabels:
@@ -30,7 +30,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
         - name: vector
-          image: "timberio/vector:0.41.1-distroless-libc"
+          image: "docker.io/timberio/vector:0.59.0-distroless-libc"
           imagePullPolicy: IfNotPresent
           args:
             - --config-dir
@@ -58,6 +58,10 @@ spec:
             - name: prom-exporter
               containerPort: 9090
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8686
           volumeMounts:
             - name: data
               mountPath: "/vector-data-dir"

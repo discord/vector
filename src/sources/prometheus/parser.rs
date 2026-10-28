@@ -1,50 +1,75 @@
-use std::cmp::Ordering;
-
+#[cfg(feature = "sources-prometheus_remote_write")]
+use super::remote_write::MetadataConflictStrategy;
 use chrono::{DateTime, TimeZone, Utc};
-#[cfg(feature = "sources-prometheus-remote-write")]
-use vector_lib::prometheus::parser::proto;
 use vector_lib::prometheus::parser::{GroupKind, MetricGroup, ParserError};
-
-use crate::event::{
-    metric::{Bucket, Metric, MetricKind, MetricTags, MetricValue, Quantile},
-    Event,
+#[cfg(feature = "sources-prometheus_remote_write")]
+use vector_lib::prometheus::parser::{
+    MetadataConflictStrategy as ParserMetadataConflictStrategy, proto,
 };
 
+use crate::event::{
+    Event,
+    metric::{Bucket, Metric, MetricKind, MetricTags, MetricValue, Quantile},
+};
+
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn utc_timestamp(timestamp: Option<i64>, default: DateTime<Utc>) -> DateTime<Utc> {
     timestamp
         .and_then(|timestamp| {
-            Utc.timestamp_opt(timestamp / 1000, (timestamp % 1000) as u32 * 1000000)
+            Utc.timestamp_opt(timestamp / 1000, (timestamp % 1000) as u32 * 1_000_000)
                 .latest()
         })
         .unwrap_or(default)
 }
 
-#[cfg(any(test, feature = "sources-prometheus-scrape"))]
+#[cfg(any(test, feature = "sources-prometheus_scrape"))]
 pub(super) fn parse_text(packet: &str) -> Result<Vec<Event>, ParserError> {
     vector_lib::prometheus::parser::parse_text(packet)
-        .map(|group| reparse_groups(group, vec![], false))
+        .map(|group| reparse_groups(group, vec![], false, false))
 }
 
-#[cfg(any(test, feature = "sources-prometheus-pushgateway"))]
+#[cfg(any(test, feature = "sources-prometheus_pushgateway"))]
 pub(super) fn parse_text_with_overrides(
     packet: &str,
     tag_overrides: impl IntoIterator<Item = (String, String)> + Clone,
     aggregate_metrics: bool,
 ) -> Result<Vec<Event>, ParserError> {
     vector_lib::prometheus::parser::parse_text(packet)
-        .map(|group| reparse_groups(group, tag_overrides, aggregate_metrics))
+        .map(|group| reparse_groups(group, tag_overrides, aggregate_metrics, false))
 }
 
-#[cfg(feature = "sources-prometheus-remote-write")]
-pub(super) fn parse_request(request: proto::WriteRequest) -> Result<Vec<Event>, ParserError> {
-    vector_lib::prometheus::parser::parse_request(request)
-        .map(|group| reparse_groups(group, vec![], false))
+#[cfg(test)]
+fn parse_text_with_nan_filtering(packet: &str) -> Result<Vec<Event>, ParserError> {
+    vector_lib::prometheus::parser::parse_text(packet)
+        .map(|group| reparse_groups(group, vec![], false, true))
 }
 
+#[cfg(feature = "sources-prometheus_remote_write")]
+pub(super) fn parse_request(
+    request: proto::WriteRequest,
+    metadata_conflict_strategy: MetadataConflictStrategy,
+    skip_nan_values: bool,
+) -> Result<Vec<Event>, ParserError> {
+    vector_lib::prometheus::parser::parse_request(request, metadata_conflict_strategy.into())
+        .map(|group| reparse_groups(group, vec![], false, skip_nan_values))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Changing this source helper signature is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn reparse_groups(
     groups: Vec<MetricGroup>,
     tag_overrides: impl IntoIterator<Item = (String, String)> + Clone,
     aggregate_metrics: bool,
+    skip_nan_values: bool,
 ) -> Vec<Event> {
     let mut result = Vec::new();
     let start = Utc::now();
@@ -59,6 +84,10 @@ fn reparse_groups(
         match group.metrics {
             GroupKind::Counter(metrics) => {
                 for (key, metric) in metrics {
+                    if skip_nan_values && metric.value.is_nan() {
+                        continue;
+                    }
+
                     let tags = combine_tags(key.labels, tag_overrides.clone());
 
                     let counter = Metric::new(
@@ -76,6 +105,10 @@ fn reparse_groups(
             }
             GroupKind::Gauge(metrics) | GroupKind::Untyped(metrics) => {
                 for (key, metric) in metrics {
+                    if skip_nan_values && metric.value.is_nan() {
+                        continue;
+                    }
+
                     let tags = combine_tags(key.labels, tag_overrides.clone());
 
                     let gauge = Metric::new(
@@ -94,16 +127,24 @@ fn reparse_groups(
             }
             GroupKind::Histogram(metrics) => {
                 for (key, metric) in metrics {
+                    if skip_nan_values
+                        && (metric.sum.is_nan() || metric.buckets.iter().any(|b| b.bucket.is_nan()))
+                    {
+                        continue;
+                    }
+
                     let tags = combine_tags(key.labels, tag_overrides.clone());
 
                     let mut buckets = metric.buckets;
-                    buckets.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                    buckets.sort_unstable_by(|a, b| {
+                        a.bucket.total_cmp(&b.bucket).then(a.count.cmp(&b.count))
+                    });
                     for i in (1..buckets.len()).rev() {
                         buckets[i].count = buckets[i].count.saturating_sub(buckets[i - 1].count);
                     }
                     let drop_last = buckets
                         .last()
-                        .map_or(false, |bucket| bucket.bucket == f64::INFINITY);
+                        .is_some_and(|bucket| bucket.bucket == f64::INFINITY);
                     if drop_last {
                         buckets.pop();
                     }
@@ -132,6 +173,16 @@ fn reparse_groups(
             }
             GroupKind::Summary(metrics) => {
                 for (key, metric) in metrics {
+                    if skip_nan_values
+                        && (metric.sum.is_nan()
+                            || metric
+                                .quantiles
+                                .iter()
+                                .any(|q| q.quantile.is_nan() || q.value.is_nan()))
+                    {
+                        continue;
+                    }
+
                     let tags = combine_tags(key.labels, tag_overrides.clone());
 
                     result.push(
@@ -164,12 +215,22 @@ fn reparse_groups(
     result
 }
 
+#[cfg(feature = "sources-prometheus_remote_write")]
+impl From<MetadataConflictStrategy> for ParserMetadataConflictStrategy {
+    fn from(strategy: MetadataConflictStrategy) -> Self {
+        match strategy {
+            MetadataConflictStrategy::Ignore => Self::Ignore,
+            MetadataConflictStrategy::Reject => Self::Reject,
+        }
+    }
+}
+
 fn combine_tags(
     base_tags: impl Into<MetricTags>,
     tag_overrides: impl IntoIterator<Item = (String, String)>,
 ) -> MetricTags {
     let mut tags = base_tags.into();
-    for (k, v) in tag_overrides.into_iter() {
+    for (k, v) in tag_overrides {
         tags.replace(k, v);
     }
 
@@ -178,16 +239,18 @@ fn combine_tags(
 
 #[cfg(test)]
 mod test {
+    use core::f64;
+    use std::sync::LazyLock;
+
     use chrono::{TimeZone, Timelike, Utc};
-    use once_cell::sync::Lazy;
+    use itertools::Itertools;
     use similar_asserts::assert_eq;
-    use vector_lib::assert_event_data_eq;
-    use vector_lib::metric_tags;
+    use vector_lib::{assert_event_data_eq, metric_tags};
 
     use super::*;
     use crate::event::metric::{Metric, MetricKind, MetricValue};
 
-    static TIMESTAMP: Lazy<DateTime<Utc>> = Lazy::new(|| {
+    static TIMESTAMP: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
         Utc.with_ymd_and_hms(2021, 2, 4, 4, 5, 6)
             .single()
             .and_then(|t| t.with_nanosecond(789 * 1_000_000))
@@ -203,11 +266,11 @@ mod test {
     #[test]
     fn adds_timestamp_if_missing() {
         let now = Utc::now();
-        let exp = r##"
+        let exp = r"
             # HELP counter Some counter
             # TYPE count counter
             http_requests_total 1027
-            "##;
+            ";
         let result = events_to_metrics(parse_text(exp)).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].timestamp().unwrap() >= now);
@@ -215,29 +278,31 @@ mod test {
 
     #[test]
     fn test_counter() {
-        let exp = r##"
+        let exp = r"
             # HELP uptime A counter
             # TYPE uptime counter
             uptime 123.0 1612411506789
-            "##;
+            ";
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "uptime",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 123.0 },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "uptime",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 123.0 },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
     #[test]
     fn test_counter_empty() {
-        let exp = r##"
+        let exp = r"
             # HELP hidden A counter
             # TYPE hidden counter
-            "##;
+            ";
 
         assert_event_data_eq!(events_to_metrics(parse_text(exp)), Ok(vec![]));
     }
@@ -326,7 +391,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 1027.0 },
                 )
-                .with_timestamp(Utc.timestamp_opt(1395066363, 0).latest())
+                .with_timestamp(Utc.timestamp_opt(1_395_066_363, 0).latest())
                 .with_tags(Some(metric_tags!(
                     "method" => "post",
                     "code" => "200",
@@ -336,7 +401,7 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Counter { value: 3.0 },
                 )
-                .with_timestamp(Utc.timestamp_opt(1395066363, 0).latest())
+                .with_timestamp(Utc.timestamp_opt(1_395_066_363, 0).latest())
                 .with_tags(Some(metric_tags!(
                     "method" => "post",
                     "code" => "400"
@@ -347,54 +412,60 @@ mod test {
 
     #[test]
     fn test_gauge() {
-        let exp = r##"
+        let exp = r"
             # HELP latency A gauge
             # TYPE latency gauge
             latency 123.0 1612411506789
-            "##;
+            ";
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "latency",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 123.0 },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "latency",
+                    MetricKind::Absolute,
+                    MetricValue::Gauge { value: 123.0 },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
     #[test]
     fn test_gauge_minimalistic() {
-        let exp = r##"
+        let exp = r"
             metric_without_timestamp_and_labels 12.47 1612411506789
-            "##;
+            ";
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "metric_without_timestamp_and_labels",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 12.47 },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "metric_without_timestamp_and_labels",
+                    MetricKind::Absolute,
+                    MetricValue::Gauge { value: 12.47 },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
     #[test]
     fn test_gauge_empty_labels() {
-        let exp = r##"
+        let exp = r"
             no_labels{} 3 1612411506789
-            "##;
+            ";
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "no_labels",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 3.0 },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "no_labels",
+                    MetricKind::Absolute,
+                    MetricValue::Gauge { value: 3.0 },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -406,18 +477,20 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "msdos_file_access_time_seconds",
-                MetricKind::Absolute,
-                MetricValue::Gauge {
-                    value: 1458255915.0
-                },
-            )
-            .with_tags(Some(metric_tags!(
-                "path" => "C:\\DIR\\FILE.TXT",
-                "error" => "Cannot find file:\n\"FILE.TXT\"",
-            )))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "msdos_file_access_time_seconds",
+                    MetricKind::Absolute,
+                    MetricValue::Gauge {
+                        value: 1_458_255_915.0
+                    },
+                )
+                .with_tags(Some(metric_tags!(
+                    "path" => "C:\\DIR\\FILE.TXT",
+                    "error" => "Cannot find file:\n\"FILE.TXT\"",
+                )))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -430,13 +503,15 @@ mod test {
             "#;
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "name",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 0.0 },
-            )
-            .with_tags(Some(metric_tags! { "tag" => "}" }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "name",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 0.0 },
+                )
+                .with_tags(Some(metric_tags! { "tag" => "}" }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -449,13 +524,15 @@ mod test {
             "#;
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "name",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 0.0 },
-            )
-            .with_tags(Some(metric_tags! { "tag" => "a,b" }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "name",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 0.0 },
+                )
+                .with_tags(Some(metric_tags! { "tag" => "a,b" }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -468,13 +545,15 @@ mod test {
             "#;
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "name",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 0.0 },
-            )
-            .with_tags(Some(metric_tags! { "tag" => "\\n" }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "name",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 0.0 },
+                )
+                .with_tags(Some(metric_tags! { "tag" => "\\n" }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -487,13 +566,15 @@ mod test {
             "#;
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "name",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 0.0 },
-            )
-            .with_tags(Some(metric_tags! { "tag" => " * " }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "name",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 0.0 },
+                )
+                .with_tags(Some(metric_tags! { "tag" => " * " }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -505,14 +586,16 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "telemetry_scrape_size_bytes_count",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 1890.0 },
-            )
-            .with_tags(Some(metric_tags!( "registry" => "default",
+            Ok(vec![
+                Metric::new(
+                    "telemetry_scrape_size_bytes_count",
+                    MetricKind::Absolute,
+                    MetricValue::Gauge { value: 1890.0 },
+                )
+                .with_tags(Some(metric_tags!( "registry" => "default",
                     "content_type" => "text/plain; version=0.0.4" )))
-            .with_timestamp(Some(*TIMESTAMP))]),
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -542,17 +625,17 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "something_weird",
-                MetricKind::Absolute,
-                MetricValue::Gauge {
-                    value: f64::INFINITY
-                },
-            )
-            .with_timestamp(Utc.timestamp_opt(-3982045, 0).latest())
-            .with_tags(Some(
-                metric_tags!("problem" => "division by zero")
-            ))]),
+            Ok(vec![
+                Metric::new(
+                    "something_weird",
+                    MetricKind::Absolute,
+                    MetricValue::Gauge {
+                        value: f64::INFINITY
+                    },
+                )
+                .with_timestamp(Utc.timestamp_opt(-3_982_045, 0).latest())
+                .with_tags(Some(metric_tags!("problem" => "division by zero")))
+            ]),
         );
     }
 
@@ -572,14 +655,14 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::Gauge { value: 1.0 },
                 )
-                .with_timestamp(Utc.timestamp_opt(1395066363, 0).latest())
+                .with_timestamp(Utc.timestamp_opt(1_395_066_363, 0).latest())
                 .with_tags(Some(metric_tags!("env" => "production"))),
                 Metric::new(
                     "latency",
                     MetricKind::Absolute,
                     MetricValue::Gauge { value: 2.0 },
                 )
-                .with_timestamp(Utc.timestamp_opt(1395066363, 0).latest())
+                .with_timestamp(Utc.timestamp_opt(1_395_066_363, 0).latest())
                 .with_tags(Some(metric_tags!("env" => "testing")))
             ]),
         );
@@ -587,14 +670,14 @@ mod test {
 
     #[test]
     fn test_mixed() {
-        let exp = r##"
+        let exp = r"
             # TYPE uptime counter
             uptime 123.0 1612411506789
             # TYPE temperature gauge
             temperature -1.5 1612411506789
             # TYPE launch_count counter
             launch_count 10.0 1612411506789
-            "##;
+            ";
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
@@ -633,24 +716,24 @@ mod test {
 
     #[test]
     fn test_no_name() {
-        let exp = r##"
+        let exp = r"
             # TYPE uptime counter
             123.0 1612411506789
-            "##;
+            ";
 
         assert!(events_to_metrics(parse_text(exp)).is_err());
     }
 
     #[test]
     fn test_mixed_and_loosely_typed() {
-        let exp = r##"
+        let exp = r"
             # TYPE uptime counter
             uptime 123.0 1612411506789
             last_downtime 4.0 1612411506789
             # TYPE temperature gauge
             temperature -1.5 1612411506789
             temperature_7_days_average 0.1 1612411506789
-            "##;
+            ";
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
@@ -700,18 +783,63 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "http_request_duration_seconds",
-                MetricKind::Absolute,
-                MetricValue::AggregatedHistogram {
-                    buckets: vector_lib::buckets![
-                        0.05 => 24054, 0.1 => 9390, 0.2 => 66948, 0.5 => 28997, 1.0 => 4599
-                    ],
-                    count: 144320,
-                    sum: 53423.0,
-                },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "http_request_duration_seconds",
+                    MetricKind::Absolute,
+                    MetricValue::AggregatedHistogram {
+                        buckets: vector_lib::buckets![
+                            0.05 => 24054, 0.1 => 9390, 0.2 => 66948, 0.5 => 28997, 1.0 => 4599
+                        ],
+                        count: 144_320,
+                        sum: 53423.0,
+                    },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_histogram_doesnt_panic() {
+        let mut exp = r"
+            # HELP http_request_duration_seconds A histogram of the request duration.
+            # TYPE http_request_duration_seconds histogram
+            "
+        .to_string();
+
+        let to_float = |v: i32| -> f64 { f64::from(v) };
+        exp += &(0..=15)
+            .map(to_float)
+            .chain(std::iter::once(f64::NAN))
+            .chain((16..=20).map(to_float))
+            .rev()
+            .map(|f| format!("http_request_duration_seconds_bucket{{le=\"{f}\"}} 0 1612411506789"))
+            .join("\n");
+
+        assert_event_data_eq!(
+            events_to_metrics(parse_text(&exp)),
+            Ok(vec![
+                Metric::new(
+                    "http_request_duration_seconds",
+                    MetricKind::Absolute,
+                    MetricValue::AggregatedHistogram {
+                        // These bucket values don't mean/test anything, they just test that the
+                        // sort works without panicking
+                        buckets: (0..=20)
+                            .map(to_float)
+                            .chain(std::iter::once(f64::NAN))
+                            .map(|upper_limit| Bucket {
+                                upper_limit,
+                                count: 0
+                            })
+                            .collect(),
+                        count: 0,
+                        sum: 0.0,
+                    },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -728,16 +856,18 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "duration",
-                MetricKind::Absolute,
-                MetricValue::AggregatedHistogram {
-                    buckets: vector_lib::buckets![1.0 => 133988],
-                    count: 144320,
-                    sum: 53423.0,
-                },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "duration",
+                    MetricKind::Absolute,
+                    MetricValue::AggregatedHistogram {
+                        buckets: vector_lib::buckets![1.0 => 133_988],
+                        count: 144_320,
+                        sum: 53423.0,
+                    },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -755,16 +885,18 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text(exp)),
-            Ok(vec![Metric::new(
-                "duration",
-                MetricKind::Absolute,
-                MetricValue::AggregatedHistogram {
-                    buckets: vector_lib::buckets![1.0 => 2000, 10.0 => 0],
-                    count: 2000,
-                    sum: 2000.0,
-                },
-            )
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "duration",
+                    MetricKind::Absolute,
+                    MetricValue::AggregatedHistogram {
+                        buckets: vector_lib::buckets![1.0 => 2000, 10.0 => 0],
+                        count: 2000,
+                        sum: 2000.0,
+                    },
+                )
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -832,7 +964,7 @@ mod test {
                             36000.0 => 0
                         ],
                         count: 536,
-                        sum: 19690.129384881966,
+                        sum: 19_690.129_384_881_966,
                     },
                 )
                     .with_tags(Some(metric_tags!("runner" => "z")))
@@ -852,7 +984,7 @@ mod test {
                             36000.0 => 0
                         ],
                         count: 1,
-                        sum: 28.975436316,
+                        sum: 28.975_436_316,
                     },
                 )
                     .with_tags(Some(metric_tags!("runner" => "x")))
@@ -864,7 +996,7 @@ mod test {
                             7200.0 => 0, 10800.0 => 0, 18000.0 => 0, 36000.0 => 0
                         ],
                         count: 3255,
-                        sum: 381111.7498891335,
+                        sum: 381_111.749_889_133_5,
                     },
                 )
                     .with_tags(Some(metric_tags!("runner" => "y")))
@@ -911,7 +1043,7 @@ mod test {
                             0.99 => 76656.0
                         ],
                         count: 2693,
-                        sum: 1.7560473e+07,
+                        sum: 1.756_047_3e+07,
                     },
                 )
                 .with_tags(Some(metric_tags!("service" => "a")))
@@ -921,14 +1053,14 @@ mod test {
                     MetricKind::Absolute,
                     MetricValue::AggregatedSummary {
                         quantiles: vector_lib::quantiles![
-                            0.0 => 0.009460965,
-                            0.25 => 0.009793382,
-                            0.5 => 0.009870205,
-                            0.75 => 0.01001838,
-                            1.0 => 0.018827136
+                            0.0 => 0.009_460_965,
+                            0.25 => 0.009_793_382,
+                            0.5 => 0.009_870_205,
+                            0.75 => 0.010_018_38,
+                            1.0 => 0.018_827_136
                         ],
-                        count: 602767,
-                        sum: 4668.551713715,
+                        count: 602_767,
+                        sum: 4_668.551_713_715,
                     },
                 )
                 .with_timestamp(Some(*TIMESTAMP)),
@@ -937,6 +1069,10 @@ mod test {
     }
 
     // https://github.com/vectordotdev/vector/issues/3276
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this fixture is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn test_nginx() {
         let exp = r#"
@@ -975,14 +1111,14 @@ mod test {
                 Metric::new(
                     "nginx_server_bytes",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 263719.0 },
+                    MetricValue::Counter { value: 263_719.0 },
                 )
                 .with_tags(Some(metric_tags! { "direction" => "in", "host" => "*" }))
                 .with_timestamp(Some(*TIMESTAMP)),
                 Metric::new(
                     "nginx_server_bytes",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 255061.0 },
+                    MetricValue::Counter { value: 255_061.0 },
                 )
                 .with_tags(Some(metric_tags! { "direction" => "in", "host" => "_" }))
                 .with_timestamp(Some(*TIMESTAMP)),
@@ -998,21 +1134,21 @@ mod test {
                 Metric::new(
                     "nginx_server_bytes",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 944199.0 },
+                    MetricValue::Counter { value: 944_199.0 },
                 )
                 .with_tags(Some(metric_tags! { "direction" => "out", "host" => "*" }))
                 .with_timestamp(Some(*TIMESTAMP)),
                 Metric::new(
                     "nginx_server_bytes",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 360775.0 },
+                    MetricValue::Counter { value: 360_775.0 },
                 )
                 .with_tags(Some(metric_tags! { "direction" => "out", "host" => "_" }))
                 .with_timestamp(Some(*TIMESTAMP)),
                 Metric::new(
                     "nginx_server_bytes",
                     MetricKind::Absolute,
-                    MetricValue::Counter { value: 583424.0 },
+                    MetricValue::Counter { value: 583_424.0 },
                 )
                 .with_tags(Some(
                     metric_tags! { "direction" => "out", "host" => "nginx-vts-status" }
@@ -1076,13 +1212,15 @@ mod test {
 
         assert_event_data_eq!(
             events_to_metrics(parse_text_with_overrides(exp, vec![], false)),
-            Ok(vec![Metric::new(
-                "jobs_total",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 1.0 },
-            )
-            .with_tags(Some(metric_tags! { "type" => "a" }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "jobs_total",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 1.0 },
+                )
+                .with_tags(Some(metric_tags! { "type" => "a" }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -1100,13 +1238,15 @@ mod test {
                 vec![("type".to_owned(), "b".to_owned())],
                 false
             )),
-            Ok(vec![Metric::new(
-                "jobs_total",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 1.0 },
-            )
-            .with_tags(Some(metric_tags! { "type" => "b" }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "jobs_total",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 1.0 },
+                )
+                .with_tags(Some(metric_tags! { "type" => "b" }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -1129,13 +1269,15 @@ mod test {
                 ],
                 false
             )),
-            Ok(vec![Metric::new(
-                "jobs_total",
-                MetricKind::Absolute,
-                MetricValue::Counter { value: 1.0 },
-            )
-            .with_tags(Some(metric_tags! { "type" => "c" }))
-            .with_timestamp(Some(*TIMESTAMP))]),
+            Ok(vec![
+                Metric::new(
+                    "jobs_total",
+                    MetricKind::Absolute,
+                    MetricValue::Counter { value: 1.0 },
+                )
+                .with_tags(Some(metric_tags! { "type" => "c" }))
+                .with_timestamp(Some(*TIMESTAMP))
+            ]),
         );
     }
 
@@ -1275,5 +1417,132 @@ mod test {
                 .with_timestamp(Some(*TIMESTAMP)),
             ]),
         );
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "These deterministic fixture values are compared exactly."
+    )]
+    #[test]
+    fn test_skip_nan_counter_enabled() {
+        let exp = r#"
+            # TYPE name counter
+            name{labelname="val1"} NaN 1612411506789
+            name{labelname="val2"} 123.0 1612411506789
+            "#;
+
+        let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name(), "name");
+        match result[0].value() {
+            MetricValue::Counter { value } => {
+                assert_eq!(*value, 123.0);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(result[0].tags().unwrap().get("labelname").unwrap(), "val2");
+    }
+
+    #[test]
+    fn test_skip_nan_counter_disabled() {
+        let exp = r#"
+            # TYPE name counter
+            name{labelname="val1"} NaN 1612411506789
+            name{labelname="val2"} 123.0 1612411506789
+            "#;
+
+        let result = events_to_metrics(parse_text(exp)).unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Find the NaN metric
+        let nan_metric = result
+            .iter()
+            .find(|m| m.tags().as_ref().and_then(|tags| tags.get("labelname")) == Some("val1"))
+            .unwrap();
+
+        match nan_metric.value() {
+            MetricValue::Counter { value } => {
+                assert!(value.is_nan());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "These deterministic fixture values are compared exactly."
+    )]
+    #[test]
+    fn test_skip_nan_gauge_enabled() {
+        let exp = r#"
+            # TYPE name gauge
+            name{labelname="val1"} NaN 1612411506789
+            name{labelname="val2"} 123.0 1612411506789
+            "#;
+
+        let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name(), "name");
+        match result[0].value() {
+            MetricValue::Gauge { value } => {
+                assert_eq!(*value, 123.0);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_skip_nan_histogram_bucket_enabled() {
+        let exp = r#"
+            # TYPE duration histogram
+            duration_bucket{le="1"} 133988 1612411506789
+            duration_bucket{le="NaN"} 144320 1612411506789
+            duration_sum 53423 1612411506789
+            duration_count 144320 1612411506789
+            "#;
+
+        let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
+        assert_eq!(result.len(), 0); // Should skip entire histogram due to NaN bucket le value
+    }
+
+    #[test]
+    fn test_skip_nan_histogram_sum_enabled() {
+        let exp = r#"
+            # TYPE duration histogram
+            duration_bucket{le="1"} 133988 1612411506789
+            duration_bucket{le="+Inf"} 144320 1612411506789
+            duration_sum NaN 1612411506789
+            duration_count 144320 1612411506789
+            "#;
+
+        let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
+        assert_eq!(result.len(), 0); // Should skip entire histogram due to NaN sum
+    }
+
+    #[test]
+    fn test_skip_nan_summary_enabled() {
+        let exp = r#"
+            # TYPE duration summary
+            duration{quantile="0.5"} NaN 1612411506789
+            duration{quantile="0.99"} 76656 1612411506789
+            duration_sum 1.7560473e+07 1612411506789
+            duration_count 2693 1612411506789
+            "#;
+
+        let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
+        assert_eq!(result.len(), 0); // Should skip entire summary due to NaN quantile value
+    }
+
+    #[test]
+    fn test_skip_nan_all_valid_values() {
+        let exp = r"
+            # TYPE counter_metric counter
+            counter_metric 123.0 1612411506789
+            # TYPE gauge_metric gauge
+            gauge_metric 456.0 1612411506789
+            ";
+
+        let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
+        assert_eq!(result.len(), 2); // Both should be preserved
     }
 }

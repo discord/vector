@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::Arc,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
@@ -9,24 +9,23 @@ use futures_util::future::BoxFuture;
 use http::Request;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::PollSemaphore;
 use tower::Service;
 use uuid::Uuid;
-use vector_lib::event::EventStatus;
-use vector_lib::request_metadata::MetaDescriptive;
+use vector_lib::{event::EventStatus, request_metadata::MetaDescriptive};
 
 use super::{
-    acknowledgements::{run_acknowledgements, HecClientAcknowledgementsConfig},
     EndpointTarget,
+    acknowledgements::{HecClientAcknowledgementsConfig, run_acknowledgements},
 };
 use crate::{
     http::HttpClient,
     internal_events::{SplunkIndexerAcknowledgementUnavailableError, SplunkResponseParseError},
     sinks::{
-        splunk_hec::common::{build_uri, request::HecRequest, response::HecResponse},
-        util::{sink::Response, Compression},
         UriParseSnafu,
+        splunk_hec::common::{build_uri, request::HecRequest, response::HecResponse},
+        util::{Compression, sink::Response},
     },
 };
 
@@ -59,10 +58,10 @@ where
         let max_pending_acks = indexer_acknowledgements.max_pending_acks.get();
         let tx = if let Some(ack_client) = ack_client {
             let (tx, rx) = mpsc::channel(128);
-            tokio::spawn(run_acknowledgements(
+            crate::spawn_in_current_span(run_acknowledgements(
                 rx,
                 ack_client,
-                Arc::clone(&http_request_builder),
+                http_request_builder,
                 indexer_acknowledgements,
             ));
             Some(tx)
@@ -70,6 +69,11 @@ where
             None
         };
 
+        // https://github.com/vectordotdev/vector/issues/23659
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "Preserve the existing limit conversion."
+        )]
         let ack_slots = PollSemaphore::new(Arc::new(Semaphore::new(max_pending_acks as usize)));
         Self {
             inner,
@@ -129,7 +133,7 @@ where
                             if let Some(ack_id) = body.ack_id {
                                 let (tx, rx) = oneshot::channel();
                                 match ack_finalizer_tx.send((ack_id, tx)).await {
-                                    Ok(_) => rx.await.unwrap_or(EventStatus::Rejected),
+                                    Ok(()) => rx.await.unwrap_or(EventStatus::Rejected),
                                     // If we cannot send ack ids to the ack client, fall back to default behavior
                                     Err(error) => {
                                         emit!(SplunkIndexerAcknowledgementUnavailableError {
@@ -178,6 +182,7 @@ impl ResponseExt for http::Response<Bytes> {
     }
 }
 
+#[derive(Clone)]
 pub struct HttpRequestBuilder {
     pub endpoint_target: EndpointTarget,
     pub endpoint: String,
@@ -197,6 +202,7 @@ pub(super) struct MetadataFields {
 }
 
 impl HttpRequestBuilder {
+    #[must_use]
     pub fn new(
         endpoint: String,
         endpoint_target: EndpointTarget,
@@ -205,8 +211,8 @@ impl HttpRequestBuilder {
     ) -> Self {
         let channel = Uuid::new_v4().hyphenated().to_string();
         Self {
-            endpoint,
             endpoint_target,
+            endpoint,
             default_token,
             compression,
             channel,
@@ -271,40 +277,40 @@ mod tests {
     use std::{
         collections::HashMap,
         future::poll_fn,
-        num::{NonZeroU64, NonZeroU8, NonZeroUsize},
+        num::{NonZeroU8, NonZeroU64, NonZeroUsize},
         sync::{
-            atomic::{AtomicU64, Ordering},
             Arc,
+            atomic::{AtomicU64, Ordering},
         },
         task::Poll,
     };
 
     use bytes::Bytes;
-    use futures_util::{poll, stream::FuturesUnordered, StreamExt};
-    use tower::{util::BoxService, Service, ServiceExt};
-    use vector_lib::internal_event::CountByteSize;
+    use futures_util::{StreamExt, future::BoxFuture, poll, stream::FuturesUnordered};
+    use tower::{Service, ServiceExt};
     use vector_lib::{
         config::proxy::ProxyConfig,
         event::{EventFinalizers, EventStatus},
+        internal_event::CountByteSize,
     };
     use wiremock::{
-        matchers::{header, header_exists, method, path},
         Mock, MockServer, Request, Respond, ResponseTemplate,
+        matchers::{header, header_exists, method, path},
     };
 
     use crate::{
         http::HttpClient,
         sinks::{
             splunk_hec::common::{
+                EndpointTarget,
                 acknowledgements::{
                     HecAckStatusRequest, HecAckStatusResponse, HecClientAcknowledgementsConfig,
                 },
                 build_http_batch_service,
                 request::HecRequest,
                 service::{HecAckResponseBody, HecService, HttpRequestBuilder},
-                EndpointTarget,
             },
-            util::{metadata::RequestMetadataBuilder, Compression},
+            util::{Compression, http::HttpBatchService, metadata::RequestMetadataBuilder},
         },
     };
 
@@ -314,7 +320,12 @@ mod tests {
     fn get_hec_service(
         endpoint: String,
         acknowledgements_config: HecClientAcknowledgementsConfig,
-    ) -> HecService<BoxService<HecRequest, http::Response<Bytes>, crate::Error>> {
+    ) -> HecService<
+        HttpBatchService<
+            BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>>,
+            HecRequest,
+        >,
+    > {
         let client = HttpClient::new(None, &ProxyConfig::default()).unwrap();
         let http_request_builder = Arc::new(HttpRequestBuilder::new(
             endpoint,
@@ -329,7 +340,7 @@ mod tests {
             false,
         );
         HecService::new(
-            BoxService::new(http_service),
+            http_service,
             Some(client),
             http_request_builder,
             acknowledgements_config,
@@ -370,10 +381,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/services/collector/event"))
-            .and(header(
-                "Authorization",
-                format!("Splunk {}", TOKEN).as_str(),
-            ))
+            .and(header("Authorization", format!("Splunk {TOKEN}").as_str()))
             .and(header_exists("X-Splunk-Request-Channel"))
             .respond_with(move |_: &Request| {
                 let ack_id =
@@ -385,10 +393,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/services/collector/ack"))
-            .and(header(
-                "Authorization",
-                format!("Splunk {}", TOKEN).as_str(),
-            ))
+            .and(header("Authorization", format!("Splunk {TOKEN}").as_str()))
             .and(header_exists("X-Splunk-Request-Channel"))
             .respond_with(ack_response)
             .mount(&mock_server)
@@ -431,7 +436,7 @@ mod tests {
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
-        assert_eq!(EventStatus::Delivered, response.event_status)
+        assert_eq!(EventStatus::Delivered, response.event_status);
     }
 
     #[tokio::test]
@@ -449,7 +454,7 @@ mod tests {
         responses.push(service.ready().await.unwrap().call(get_hec_request()));
         responses.push(service.ready().await.unwrap().call(get_hec_request()));
         while let Some(response) = responses.next().await {
-            assert_eq!(EventStatus::Delivered, response.unwrap().event_status)
+            assert_eq!(EventStatus::Delivered, response.unwrap().event_status);
         }
     }
 
@@ -466,7 +471,7 @@ mod tests {
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
-        assert_eq!(EventStatus::Delivered, response.event_status)
+        assert_eq!(EventStatus::Delivered, response.event_status);
     }
 
     #[tokio::test]
@@ -482,7 +487,7 @@ mod tests {
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
-        assert_eq!(EventStatus::Rejected, response.event_status)
+        assert_eq!(EventStatus::Rejected, response.event_status);
     }
 
     #[tokio::test]
@@ -502,7 +507,7 @@ mod tests {
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
-        assert_eq!(EventStatus::Delivered, response.event_status)
+        assert_eq!(EventStatus::Delivered, response.event_status);
     }
 
     #[tokio::test]
@@ -519,7 +524,7 @@ mod tests {
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
-        assert_eq!(EventStatus::Errored, response.event_status)
+        assert_eq!(EventStatus::Errored, response.event_status);
     }
 
     #[tokio::test]
@@ -528,10 +533,7 @@ mod tests {
         // Override the usual event endpoint
         Mock::given(method("POST"))
             .and(path("/services/collector/event"))
-            .and(header(
-                "Authorization",
-                format!("Splunk {}", TOKEN).as_str(),
-            ))
+            .and(header("Authorization", format!("Splunk {TOKEN}").as_str()))
             .and(header_exists("X-Splunk-Request-Channel"))
             .respond_with(move |_: &Request| {
                 ResponseTemplate::new(200).set_body_json(r#"{ "new": "a new response body" }"#)
@@ -548,13 +550,16 @@ mod tests {
 
         let request = get_hec_request();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
-        assert_eq!(EventStatus::Delivered, response.event_status)
+        assert_eq!(EventStatus::Delivered, response.event_status);
     }
 
     #[tokio::test]
     async fn service_poll_ready_multiple_times() {
         let mock_server = get_hec_mock_server(true, ack_response_always_fail).await;
-        let mut service = get_hec_service(mock_server.uri(), Default::default());
+        let mut service = get_hec_service(
+            mock_server.uri(),
+            HecClientAcknowledgementsConfig::default(),
+        );
 
         assert!(service.ready().await.is_ok());
         // Consecutive poll_ready returns OK since an ack slot has been granted
@@ -563,10 +568,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic]
+    #[should_panic(expected = "poll_ready not called before invoking call")]
     async fn service_call_without_poll_ready() {
         let mock_server = get_hec_mock_server(true, ack_response_always_fail).await;
-        let mut service = get_hec_service(mock_server.uri(), Default::default());
+        let mut service = get_hec_service(
+            mock_server.uri(),
+            HecClientAcknowledgementsConfig::default(),
+        );
 
         _ = service.call(get_hec_request()).await;
     }
@@ -597,7 +605,7 @@ mod tests {
         // The service should now be ready for additional requests
         assert!(matches!(
             poll!(poll_fn(|cx| service.poll_ready(cx))),
-            Poll::Ready(Ok(_))
+            Poll::Ready(Ok(()))
         ));
     }
 }

@@ -4,10 +4,9 @@ use std::pin::Pin;
 
 use bytecheck::CheckBytes;
 use rkyv::{
-    archived_root, check_archived_root,
-    ser::{serializers::AllocSerializer, Serializer},
+    Archive, Serialize, archived_root, check_archived_root,
+    ser::{Serializer, serializers::AllocSerializer},
     validation::validators::DefaultValidator,
-    Archive, Serialize,
 };
 
 use super::ser::{DeserializeError, SerializeError};
@@ -87,6 +86,7 @@ where
 
     /// Gets a reference to the archived value.
     pub fn get_archive_ref(&self) -> &T::Archived {
+        // SAFETY: The backing was validated during construction.
         unsafe { archived_root::<T>(self.backing.as_ref()) }
     }
 }
@@ -140,6 +140,7 @@ where
         use rkyv::archived_root_mut;
 
         let pinned = Pin::new(self.backing.as_mut());
+        // SAFETY: The backing was validated during construction and is exclusively borrowed.
         unsafe { archived_root_mut::<T>(pinned) }
     }
 }

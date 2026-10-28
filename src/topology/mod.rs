@@ -28,11 +28,12 @@ use futures::{Future, FutureExt};
 use tokio::sync::mpsc;
 use vector_lib::buffers::topology::channel::{BufferReceiverStream, BufferSender};
 
-pub use self::builder::TopologyPieces;
-pub use self::controller::{ReloadOutcome, SharedTopologyController, TopologyController};
-pub use self::running::{RunningTopology, ShutdownErrorReceiver};
-
 use self::task::{Task, TaskError, TaskResult};
+pub use self::{
+    builder::TopologyPieces,
+    controller::{ReloadOutcome, SharedTopologyController, TopologyController},
+    running::{ReloadError, RunningTopology, ShutdownErrorReceiver},
+};
 use crate::{
     config::{ComponentKey, Config, ConfigDiff},
     event::EventArray,
@@ -64,10 +65,14 @@ async fn handle_errors(
     AssertUnwindSafe(task)
         .catch_unwind()
         .await
-        .map_err(|_| TaskError::Panicked)
+        .map_err(|payload| TaskError::panicked(payload.as_ref()))
         .and_then(|res| res)
         .map_err(|e| {
-            error!("An error occurred that Vector couldn't handle: {}.", e);
+            let panic = match &e {
+                TaskError::Panicked { panic } => Some(panic.as_str()),
+                _ => None,
+            };
+            error!(panic, "An error occurred that Vector couldn't handle: {e}.");
             _ = abort_tx.send(error(e.to_string()));
             e
         })

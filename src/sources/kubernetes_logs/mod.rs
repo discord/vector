@@ -1,57 +1,66 @@
 //! This mod implements `kubernetes_logs` source.
 //! The scope of this source is to consume the log files that a kubelet keeps
 //! at "/var/log/pods" on the host of the Kubernetes Node when Vector itself is
-//! running inside the cluster as a DaemonSet.
+//! running inside the cluster as a `DaemonSet`.
 
 #![deny(missing_docs)]
-use std::{path::PathBuf, time::Duration};
+use std::{
+    cmp::min,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{future::FutureExt, stream::StreamExt};
 use futures_util::Stream;
+use http_1::{HeaderName, HeaderValue};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use k8s_paths_provider::K8sPathsProvider;
 use kube::{
+    Client, Config as ClientConfig,
     api::Api,
     config::{self, KubeConfigOptions},
-    runtime::{reflector, watcher, WatchStreamExt},
-    Client, Config as ClientConfig,
+    runtime::{WatchStreamExt, reflector, watcher},
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
-use vector_lib::codecs::{BytesDeserializer, BytesDeserializerConfig};
-use vector_lib::configurable::configurable_component;
-use vector_lib::file_source::{
-    calculate_ignore_before, Checkpointer, FileServer, FileServerShutdown, FingerprintStrategy,
-    Fingerprinter, Line, ReadFrom, ReadFromConfig,
-};
-use vector_lib::lookup::{lookup_v2::OptionalTargetPath, owned_value_path, path, OwnedTargetPath};
-use vector_lib::{config::LegacyKey, config::LogNamespace, EstimatedJsonEncodedSizeOf};
 use vector_lib::{
+    EstimatedJsonEncodedSizeOf, TimeZone,
+    codecs::{BytesDeserializer, BytesDeserializerConfig, OversizedAction},
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    file_source::file_server::{
+        FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before,
+    },
+    file_source_common::{
+        Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
+    },
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
-    TimeZone,
+    lookup::{OwnedTargetPath, lookup_v2::OptionalTargetPath, owned_value_path, path},
 };
-use vrl::value::{kind::Collection, Kind};
+use vrl::value::{Kind, Value, kind::Collection};
 
-use crate::sources::kubernetes_logs::partial_events_merger::merge_partial_events;
 use crate::{
+    SourceSender,
+    built_info::{PKG_NAME, PKG_VERSION},
     config::{
-        log_schema, ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig,
-        SourceContext, SourceOutput,
+        ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig, SourceContext,
+        SourceOutput, log_schema,
     },
     event::Event,
     internal_events::{
         FileInternalMetricsConfig, FileSourceInternalEventsEmitter, KubernetesLifecycleError,
         KubernetesLogsEventAnnotationError, KubernetesLogsEventNamespaceAnnotationError,
-        KubernetesLogsEventNodeAnnotationError, KubernetesLogsEventsReceived,
-        KubernetesLogsPodInfo, StreamClosedError,
+        KubernetesLogsEventNodeAnnotationError, KubernetesLogsEventsReceived, PodCountersCache,
+        StreamClosedError,
     },
     kubernetes::{custom_reflector, meta_cache::MetaCache},
     shutdown::ShutdownSignal,
     sources,
+    sources::kubernetes_logs::partial_events_merger::merge_partial_events,
     transforms::{FunctionTransform, OutputBuffer},
-    SourceSender,
 };
 
 mod k8s_paths_provider;
@@ -65,14 +74,19 @@ mod pod_metadata_annotator;
 mod transform_utils;
 mod util;
 
-use self::namespace_metadata_annotator::NamespaceMetadataAnnotator;
-use self::node_metadata_annotator::NodeMetadataAnnotator;
-use self::parser::Parser;
-use self::pod_metadata_annotator::PodMetadataAnnotator;
+use self::{
+    namespace_metadata_annotator::NamespaceMetadataAnnotator,
+    node_metadata_annotator::NodeMetadataAnnotator, parser::Parser,
+    pod_metadata_annotator::PodMetadataAnnotator,
+};
 
 /// The `self_node_name` value env var key.
 const SELF_NODE_NAME_ENV_KEY: &str = "VECTOR_SELF_NODE_NAME";
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Restructuring these source configuration fields is deferred to preserve the existing API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 /// Configuration for the `kubernetes_logs` source.
 #[serde_as]
 #[configurable_component(source("kubernetes_logs", "Collect Pod logs from Kubernetes Nodes."))]
@@ -102,6 +116,15 @@ pub struct Config {
         docs::examples = "my_custom_label!=my_value,my_other_custom_label=my_value"
     ))]
     extra_namespace_label_selector: String,
+
+    /// Specifies whether or not to enrich logs with namespace fields.
+    ///
+    /// Setting to `false` prevents Vector from pulling in namespaces and thus namespace label fields will not
+    /// be available. This helps reduce load on the `kube-apiserver` and lowers daemonset memory usage in clusters
+    /// with many namespaces.
+    ///
+    #[serde(default = "default_insert_namespace_fields")]
+    insert_namespace_fields: bool,
 
     /// The name of the Kubernetes [Node][node] that is running.
     ///
@@ -142,14 +165,11 @@ pub struct Config {
     #[configurable(metadata(docs::human_name = "Data Directory"))]
     data_dir: Option<PathBuf>,
 
-    #[configurable(derived)]
     #[serde(alias = "annotation_fields")]
     pod_annotation_fields: pod_metadata_annotator::FieldsSpec,
 
-    #[configurable(derived)]
     namespace_annotation_fields: namespace_metadata_annotator::FieldsSpec,
 
-    #[configurable(derived)]
     node_annotation_fields: node_metadata_annotator::FieldsSpec,
 
     /// A list of glob patterns to include while reading the files.
@@ -160,7 +180,6 @@ pub struct Config {
     #[configurable(metadata(docs::examples = "**/exclude/**"))]
     exclude_paths_glob_patterns: Vec<PathBuf>,
 
-    #[configurable(derived)]
     #[serde(default = "default_read_from")]
     read_from: ReadFromConfig,
 
@@ -189,11 +208,41 @@ pub struct Config {
     #[configurable(metadata(docs::type_unit = "bytes"))]
     max_line_bytes: usize,
 
+    /// The maximum number of bytes a line can contain after merging partial events.
+    ///
+    /// This protects against malformed lines or tailing incorrect files.
+    /// The behavior when a merged line exceeds this limit is controlled by
+    /// `max_merged_line_action`: `drop` (default) discards the line, `truncate` truncates
+    /// it to this limit and appends a `..TRUNCATED` suffix.
+    ///
+    /// Note that, if `auto_partial_merge` is false, this config will be ignored. Also, if
+    /// `max_line_bytes` is too small to reach the continuation character, then this config
+    /// will have no practical impact (the same is true of `auto_partial_merge`).
+    ///
+    /// When `max_merged_line_action` is `drop`, the smaller of `max_merged_line_bytes` and
+    /// `max_line_bytes` is used as the file-level read limit to avoid wasted I/O.
+    /// When `max_merged_line_action` is `truncate`, individual lines up to `max_line_bytes`
+    /// are allowed through so the merger can truncate the combined result. Note that
+    /// `max_line_bytes` still applies at the file level and always drops individual lines
+    /// that exceed it; truncation at that level is not currently supported.
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    max_merged_line_bytes: Option<usize>,
+
+    /// The behavior when a merged line exceeds `max_merged_line_bytes`.
+    ///
+    /// When set to `drop` (the default), the entire oversized merged line is discarded.
+    /// When set to `truncate`, the line is truncated to `max_merged_line_bytes` bytes and
+    /// emitted as a partial event. Any remaining partial events for that line are discarded.
+    ///
+    /// This option has no effect if `max_merged_line_bytes` is not set.
+    #[serde(default)]
+    max_merged_line_action: OversizedAction,
+
     /// The number of lines to read for generating the checksum.
     ///
     /// If your files share a common header that is not always a fixed size,
     ///
-    /// If the file has less than this amount of lines, it won’t be read at all.
+    /// If the file has less than this amount of lines, it won't be read at all.
     #[configurable(metadata(docs::type_unit = "lines"))]
     fingerprint_lines: usize,
 
@@ -244,7 +293,6 @@ pub struct Config {
     #[serde(default)]
     log_namespace: Option<bool>,
 
-    #[configurable(derived)]
     #[serde(default)]
     internal_metrics: FileInternalMetricsConfig,
 
@@ -261,8 +309,8 @@ const fn default_read_from() -> ReadFromConfig {
 }
 
 impl GenerateConfig for Config {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self {
             self_node_name: default_self_node_name_env_template(),
             auto_partial_merge: true,
             ..Default::default()
@@ -274,10 +322,11 @@ impl GenerateConfig for Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            extra_label_selector: "".to_string(),
-            extra_namespace_label_selector: "".to_string(),
+            extra_label_selector: String::new(),
+            extra_namespace_label_selector: String::new(),
+            insert_namespace_fields: true,
             self_node_name: default_self_node_name_env_template(),
-            extra_field_selector: "".to_string(),
+            extra_field_selector: String::new(),
             auto_partial_merge: true,
             data_dir: None,
             pod_annotation_fields: pod_metadata_annotator::FieldsSpec::default(),
@@ -290,6 +339,8 @@ impl Default for Config {
             max_read_bytes: default_max_read_bytes(),
             oldest_first: default_oldest_first(),
             max_line_bytes: default_max_line_bytes(),
+            max_merged_line_bytes: None,
+            max_merged_line_action: OversizedAction::Drop,
             fingerprint_lines: default_fingerprint_lines(),
             glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(),
             ingestion_timestamp_field: None,
@@ -298,7 +349,7 @@ impl Default for Config {
             use_apiserver_cache: false,
             delay_deletion_ms: default_delay_deletion_ms(),
             log_namespace: None,
-            internal_metrics: Default::default(),
+            internal_metrics: FileInternalMetricsConfig::default(),
             rotate_wait: default_rotate_wait(),
         }
     }
@@ -317,11 +368,16 @@ impl SourceConfig for Config {
                 .map(|result| {
                     result.map_err(|error| {
                         error!(message = "Source future failed.", %error);
+                        crate::sources::SourceError::from(error)
                     })
                 }),
         ))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
         let schema_definition = BytesDeserializerConfig
@@ -377,6 +433,17 @@ impl SourceConfig for Config {
                     .clone()
                     .map(|x| LegacyKey::Overwrite(x.path)),
                 &owned_value_path!("namespace_labels"),
+                Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
+                None,
+            )
+            .with_source_metadata(
+                Self::NAME,
+                self.namespace_annotation_fields
+                    .namespace_annotations
+                    .path
+                    .clone()
+                    .map(|x| LegacyKey::Overwrite(x.path)),
+                &owned_value_path!("namespace_annotations"),
                 Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
                 None,
             )
@@ -501,6 +568,16 @@ impl SourceConfig for Config {
             )
             .with_source_metadata(
                 Self::NAME,
+                Some(LegacyKey::Overwrite(owned_value_path!(
+                    "kubernetes",
+                    "pod_log_directory_id"
+                ))),
+                &owned_value_path!("pod_log_directory_id"),
+                Kind::bytes().or_undefined(),
+                None,
+            )
+            .with_source_metadata(
+                Self::NAME,
                 Some(LegacyKey::Overwrite(owned_value_path!("stream"))),
                 &owned_value_path!("stream"),
                 Kind::bytes(),
@@ -529,6 +606,10 @@ impl SourceConfig for Config {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Restructuring these source configuration fields is deferred to preserve the existing API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 #[derive(Clone)]
 struct Source {
     client: Client,
@@ -540,6 +621,7 @@ struct Source {
     field_selector: String,
     label_selector: String,
     namespace_label_selector: String,
+    insert_namespace_fields: bool,
     node_selector: String,
     self_node_name: String,
     include_paths: Vec<glob::Pattern>,
@@ -549,6 +631,8 @@ struct Source {
     max_read_bytes: usize,
     oldest_first: bool,
     max_line_bytes: usize,
+    max_merged_line_bytes: Option<usize>,
+    max_merged_line_action: OversizedAction,
     fingerprint_lines: usize,
     glob_minimum_cooldown: Duration,
     use_apiserver_cache: bool,
@@ -556,6 +640,7 @@ struct Source {
     delay_deletion: Duration,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    pod_counters_sweep_interval: Option<Duration>,
 }
 
 impl Source {
@@ -569,8 +654,7 @@ impl Source {
         {
             std::env::var(SELF_NODE_NAME_ENV_KEY).map_err(|_| {
                 format!(
-                    "self_node_name config value or {} env var is not set",
-                    SELF_NODE_NAME_ENV_KEY
+                    "self_node_name config value or {SELF_NODE_NAME_ENV_KEY} env var is not set"
                 )
             })?
         } else {
@@ -586,7 +670,7 @@ impl Source {
         // If the user passed a custom Kubeconfig use it, otherwise
         // we attempt to load the local kubeconfig, followed by the
         // in-cluster environment variables
-        let client_config = match &config.kube_config_file {
+        let mut client_config = match &config.kube_config_file {
             Some(kc) => {
                 ClientConfig::from_custom_kubeconfig(
                     config::Kubeconfig::read_from(kc)?,
@@ -596,6 +680,11 @@ impl Source {
             }
             None => ClientConfig::infer().await?,
         };
+        if let Ok(user_agent) = HeaderValue::from_str(&format!("{PKG_NAME}/{PKG_VERSION}")) {
+            client_config
+                .headers
+                .push((HeaderName::from_static("user-agent"), user_agent));
+        }
         let client = Client::try_from(client_config)?;
 
         let data_dir = globals.resolve_and_make_data_subdir(config.data_dir.as_ref(), key.id())?;
@@ -623,6 +712,7 @@ impl Source {
             field_selector,
             label_selector,
             namespace_label_selector,
+            insert_namespace_fields: config.insert_namespace_fields,
             node_selector,
             self_node_name,
             include_paths,
@@ -632,6 +722,8 @@ impl Source {
             max_read_bytes: config.max_read_bytes,
             oldest_first: config.oldest_first,
             max_line_bytes: config.max_line_bytes,
+            max_merged_line_bytes: config.max_merged_line_bytes,
+            max_merged_line_action: config.max_merged_line_action,
             fingerprint_lines: config.fingerprint_lines,
             glob_minimum_cooldown,
             use_apiserver_cache: config.use_apiserver_cache,
@@ -639,9 +731,14 @@ impl Source {
             delay_deletion,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            pod_counters_sweep_interval: pod_counters_sweep_interval(globals),
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     async fn run(
         self,
         mut out: SourceSender,
@@ -658,6 +755,7 @@ impl Source {
             field_selector,
             label_selector,
             namespace_label_selector,
+            insert_namespace_fields,
             node_selector,
             self_node_name,
             include_paths,
@@ -667,6 +765,8 @@ impl Source {
             max_read_bytes,
             oldest_first,
             max_line_bytes,
+            max_merged_line_bytes,
+            max_merged_line_action,
             fingerprint_lines,
             glob_minimum_cooldown,
             use_apiserver_cache,
@@ -674,6 +774,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag,
             rotate_wait,
+            pod_counters_sweep_interval,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -692,15 +793,17 @@ impl Source {
                 field_selector: Some(field_selector),
                 label_selector: Some(label_selector),
                 list_semantic: list_semantic.clone(),
+                page_size: get_page_size(use_apiserver_cache),
                 ..Default::default()
             },
         )
-        .backoff(watcher::default_backoff());
+        .backoff(watcher::DefaultBackoff::default());
+
         let pod_store_w = reflector::store::Writer::default();
         let pod_state = pod_store_w.as_reader();
         let pod_cacher = MetaCache::new();
 
-        reflectors.push(tokio::spawn(custom_reflector(
+        reflectors.push(crate::spawn_in_current_span(custom_reflector(
             pod_store_w,
             pod_cacher,
             pod_watcher,
@@ -709,26 +812,28 @@ impl Source {
 
         // -----------------------------------------------------------------
 
-        let namespaces = Api::<Namespace>::all(client.clone());
-        let ns_watcher = watcher(
-            namespaces,
-            watcher::Config {
-                label_selector: Some(namespace_label_selector),
-                list_semantic: list_semantic.clone(),
-                ..Default::default()
-            },
-        )
-        .backoff(watcher::default_backoff());
         let ns_store_w = reflector::store::Writer::default();
         let ns_state = ns_store_w.as_reader();
-        let ns_cacher = MetaCache::new();
+        if insert_namespace_fields {
+            let namespaces = Api::<Namespace>::all(client.clone());
+            let ns_watcher = watcher(
+                namespaces,
+                watcher::Config {
+                    label_selector: Some(namespace_label_selector),
+                    list_semantic: list_semantic.clone(),
+                    page_size: get_page_size(use_apiserver_cache),
+                    ..Default::default()
+                },
+            )
+            .backoff(watcher::DefaultBackoff::default());
 
-        reflectors.push(tokio::spawn(custom_reflector(
-            ns_store_w,
-            ns_cacher,
-            ns_watcher,
-            delay_deletion,
-        )));
+            reflectors.push(crate::spawn_in_current_span(custom_reflector(
+                ns_store_w,
+                MetaCache::new(),
+                ns_watcher,
+                delay_deletion,
+            )));
+        }
 
         // -----------------------------------------------------------------
 
@@ -738,15 +843,16 @@ impl Source {
             watcher::Config {
                 field_selector: Some(node_selector),
                 list_semantic,
+                page_size: get_page_size(use_apiserver_cache),
                 ..Default::default()
             },
         )
-        .backoff(watcher::default_backoff());
+        .backoff(watcher::DefaultBackoff::default());
         let node_store_w = reflector::store::Writer::default();
         let node_state = node_store_w.as_reader();
         let node_cacher = MetaCache::new();
 
-        reflectors.push(tokio::spawn(custom_reflector(
+        reflectors.push(crate::spawn_in_current_span(custom_reflector(
             node_store_w,
             node_cacher,
             node_watcher,
@@ -758,6 +864,7 @@ impl Source {
             ns_state.clone(),
             include_paths,
             exclude_paths,
+            insert_namespace_fields,
         );
         let annotator = PodMetadataAnnotator::new(pod_state, pod_fields_spec, log_namespace);
         let ns_annotator =
@@ -765,6 +872,13 @@ impl Source {
         let node_annotator = NodeMetadataAnnotator::new(node_state, node_field_spec, log_namespace);
 
         let ignore_before = calculate_ignore_before(ignore_older_secs);
+
+        let resolved_max_line_bytes = resolve_max_line_bytes(
+            max_line_bytes,
+            max_merged_line_bytes,
+            auto_partial_merge,
+            max_merged_line_action,
+        );
 
         // TODO: maybe more of the parameters have to be configurable.
 
@@ -790,7 +904,7 @@ impl Source {
             ignore_before,
             // The maximum number of bytes a line can contain before being discarded. This
             // protects against malformed lines or tailing incorrect files.
-            max_line_bytes,
+            max_line_bytes: resolved_max_line_bytes,
             // Delimiter bytes that is used to read the file line-by-line
             line_delimiter: Bytes::from("\n"),
             // The directory where to keep the checkpoints.
@@ -801,16 +915,16 @@ impl Source {
             // The shape of the log files is well-known in the Kubernetes
             // environment, so we pick the a specially crafted fingerprinter
             // for the log files.
-            fingerprinter: Fingerprinter {
-                strategy: FingerprintStrategy::FirstLinesChecksum {
+            fingerprinter: Fingerprinter::new(
+                FingerprintStrategy::FirstLinesChecksum {
                     // Max line length to expect during fingerprinting, see the
                     // explanation above.
                     ignored_header_bytes: 0,
                     lines: fingerprint_lines,
                 },
-                max_line_length: max_line_bytes,
-                ignore_not_found: true,
-            },
+                resolved_max_line_bytes,
+                true,
+            ),
             oldest_first,
             // We do not remove the log files, `kubelet` is responsible for it.
             remove_after: None,
@@ -819,7 +933,6 @@ impl Source {
                 include_file_metric_tag,
             },
             // A handle to the current tokio runtime
-            handle: tokio::runtime::Handle::current(),
             rotate_wait,
         };
 
@@ -828,6 +941,10 @@ impl Source {
         let checkpoints = checkpointer.view();
         let events = file_source_rx.flat_map(futures::stream::iter);
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
+        // The line stream and the sweep below both run on this task, so the lock is never
+        // contended.
+        let pod_counters = Arc::new(Mutex::new(PodCountersCache::default()));
+        let swept_pod_counters = Arc::clone(&pod_counters);
         let events = events.map(move |line| {
             let byte_size = line.text.len();
             bytes_received.emit(ByteSize(byte_size));
@@ -841,13 +958,15 @@ impl Source {
 
             let file_info = annotator.annotate(&mut event, &line.filename);
 
+            let event_json_size = event.estimated_json_encoded_size_of();
+
             emit!(KubernetesLogsEventsReceived {
                 file: &line.filename,
-                byte_size: event.estimated_json_encoded_size_of(),
-                pod_info: file_info.as_ref().map(|info| KubernetesLogsPodInfo {
-                    name: info.pod_name.to_owned(),
-                    namespace: info.pod_namespace.to_owned(),
-                }),
+                byte_size: event_json_size,
+                pod: file_info
+                    .as_ref()
+                    .map(|info| (info.pod_name, info.pod_namespace)),
+                counters: &mut pod_counters.lock().expect("Pod counters mutex is poisoned"),
             });
 
             if file_info.is_none() {
@@ -855,12 +974,11 @@ impl Source {
             } else {
                 let namespace = file_info.as_ref().map(|info| info.pod_namespace);
 
-                if let Some(name) = namespace {
-                    let ns_info = ns_annotator.annotate(&mut event, name);
-
-                    if ns_info.is_none() {
-                        emit!(KubernetesLogsEventNamespaceAnnotationError { event: &event });
-                    }
+                if insert_namespace_fields
+                    && let Some(name) = namespace
+                    && ns_annotator.annotate(&mut event, name).is_none()
+                {
+                    emit!(KubernetesLogsEventNamespaceAnnotationError { event: &event });
                 }
 
                 let node_info = node_annotator.annotate(&mut event, self_node_name.as_str());
@@ -884,7 +1002,13 @@ impl Source {
         let (events_count, _) = events.size_hint();
 
         let mut stream = if auto_partial_merge {
-            merge_partial_events(events, log_namespace).left_stream()
+            merge_partial_events(
+                events,
+                log_namespace,
+                max_merged_line_bytes,
+                max_merged_line_action,
+            )
+            .left_stream()
         } else {
             events.right_stream()
         };
@@ -912,19 +1036,39 @@ impl Source {
                 shutdown,
                 Duration::from_secs(30), // more than enough time to propagate
             )
-            .map(|result| {
-                match result {
-                    Ok(Ok(())) => info!(message = "Event processing loop completed gracefully."),
-                    Ok(Err(_)) => emit!(StreamClosedError {
-                        count: events_count
-                    }),
-                    Err(error) => emit!(KubernetesLifecycleError {
-                        error,
-                        message: "Event processing loop timed out during the shutdown.",
-                        count: events_count,
-                    }),
-                };
+            .map(|result| match result {
+                Ok(Ok(())) => info!(message = "Event processing loop completed gracefully."),
+                Ok(Err(_)) => emit!(StreamClosedError {
+                    count: events_count
+                }),
+                Err(error) => emit!(KubernetesLifecycleError {
+                    error,
+                    message: "Event processing loop timed out during the shutdown.",
+                    count: events_count,
+                }),
             });
+            slot.bind(Box::pin(fut));
+        }
+        if let Some(sweep_interval) = pod_counters_sweep_interval {
+            let (slot, mut shutdown) = lifecycle.add();
+            let fut = async move {
+                let mut sweeps = tokio::time::interval_at(
+                    tokio::time::Instant::now() + sweep_interval,
+                    sweep_interval,
+                );
+                sweeps.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        () = &mut shutdown => break,
+                        _ = sweeps.tick() => {
+                            swept_pod_counters
+                                .lock()
+                                .expect("Pod counters mutex is poisoned")
+                                .remove_idle();
+                        }
+                    }
+                }
+            };
             slot.bind(Box::pin(fut));
         }
 
@@ -936,6 +1080,37 @@ impl Source {
         info!(message = "Done.");
         Ok(())
     }
+}
+
+// Set page size to None if use_apiserver_cache is true, to make the list requests containing `resourceVersion=0`` parameters.
+fn get_page_size(use_apiserver_cache: bool) -> Option<u32> {
+    if use_apiserver_cache {
+        None
+    } else {
+        watcher::Config::default().page_size
+    }
+}
+
+/// Returns how often the source releases the cached counters of the pods that stopped logging.
+///
+/// A held handle keeps its metric from expiring, and a pod keeps its handles for at most twice
+/// this interval after its last line. Use half the shortest configured expiry, clamped to at
+/// least one millisecond to avoid excessive polling for very short expiries. Returns `None`
+/// when metrics never expire, since held handles then block nothing.
+fn pod_counters_sweep_interval(globals: &GlobalOptions) -> Option<Duration> {
+    let per_metric_set = globals
+        .expire_metrics_per_metric_set
+        .iter()
+        .flatten()
+        .map(|set| set.expire_secs);
+    let shortest = globals
+        .effective_expire_metrics_secs()
+        .into_iter()
+        .chain(per_metric_set)
+        .min_by(f64::total_cmp)?;
+    Duration::try_from_secs_f64(shortest / 2.0)
+        .ok()
+        .map(|interval| interval.max(Duration::from_millis(1)))
 }
 
 fn create_event(
@@ -959,7 +1134,7 @@ fn create_event(
         &mut log,
         log_schema().source_type_key(),
         path!("source_type"),
-        Bytes::from(Config::NAME),
+        Value::from_static_str(Config::NAME),
     );
     match (log_namespace, ingestion_timestamp_field) {
         // When using LogNamespace::Vector always set the ingest_timestamp.
@@ -970,11 +1145,11 @@ fn create_event(
         }
         // When LogNamespace::Legacy, only set when the `ingestion_timestamp_field` is configured.
         (LogNamespace::Legacy, Some(ingestion_timestamp_field)) => {
-            log.try_insert(ingestion_timestamp_field, Utc::now())
+            log.try_insert(ingestion_timestamp_field, Utc::now());
         }
         // The CRI/Docker parsers handle inserting the `log_schema().timestamp_key()` value.
         (LogNamespace::Legacy, None) => (),
-    };
+    }
 
     log.into()
 }
@@ -1003,6 +1178,11 @@ const fn default_oldest_first() -> bool {
     true
 }
 
+// It might make sense to disable this for clusters with a very large number of namespaces.
+const fn default_insert_namespace_fields() -> bool {
+    true
+}
+
 const fn default_max_line_bytes() -> usize {
     // NOTE: The below comment documents an incorrect assumption, see
     // https://github.com/vectordotdev/vector/issues/6967
@@ -1017,7 +1197,7 @@ const fn default_max_line_bytes() -> usize {
 }
 
 const fn default_glob_minimum_cooldown_ms() -> Duration {
-    Duration::from_millis(60_000)
+    Duration::from_mins(1)
 }
 
 const fn default_fingerprint_lines() -> usize {
@@ -1025,7 +1205,7 @@ const fn default_fingerprint_lines() -> usize {
 }
 
 const fn default_delay_deletion_ms() -> Duration {
-    Duration::from_millis(60_000)
+    Duration::from_mins(1)
 }
 
 const fn default_rotate_wait() -> Duration {
@@ -1070,27 +1250,32 @@ fn prepare_glob_patterns(paths: &[PathBuf], op: &str) -> crate::Result<Vec<glob:
 
 // This function constructs the effective field selector to use, based on
 // the specified configuration.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Removing this fallible API is deferred to keep source construction and error handling unchanged. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn prepare_field_selector(config: &Config, self_node_name: &str) -> crate::Result<String> {
     info!(
         message = "Obtained Kubernetes Node name to collect logs for (self).",
         ?self_node_name
     );
 
-    let field_selector = format!("spec.nodeName={}", self_node_name);
+    let field_selector = format!("spec.nodeName={self_node_name}");
 
     if config.extra_field_selector.is_empty() {
         return Ok(field_selector);
     }
 
-    Ok(format!(
-        "{},{}",
-        field_selector, config.extra_field_selector
-    ))
+    Ok(format!("{field_selector},{}", config.extra_field_selector))
 }
 
 // This function constructs the selector for a node to annotate entries with a node metadata.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Removing this fallible API is deferred to keep source construction and error handling unchanged. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn prepare_node_selector(self_node_name: &str) -> crate::Result<String> {
-    Ok(format!("metadata.name={}", self_node_name))
+    Ok(format!("metadata.name={self_node_name}"))
 }
 
 // This function constructs the effective label selector to use, based on
@@ -1102,23 +1287,146 @@ fn prepare_label_selector(selector: &str) -> String {
         return BUILT_IN.to_string();
     }
 
-    format!("{},{}", BUILT_IN, selector)
+    format!("{BUILT_IN},{selector}")
+}
+
+fn resolve_max_line_bytes(
+    max_line_bytes: usize,
+    max_merged_line_bytes: Option<usize>,
+    auto_partial_merge: bool,
+    max_merged_line_action: OversizedAction,
+) -> usize {
+    if auto_partial_merge && max_merged_line_action == OversizedAction::Drop {
+        min(
+            max_line_bytes,
+            max_merged_line_bytes.unwrap_or(max_line_bytes),
+        )
+    } else {
+        max_line_bytes
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use similar_asserts::assert_eq;
-    use vector_lib::lookup::{owned_value_path, OwnedTargetPath};
-    use vector_lib::{config::LogNamespace, schema::Definition};
-    use vrl::value::{kind::Collection, Kind};
+    use std::time::Duration;
 
-    use crate::config::SourceConfig;
+    use indoc::indoc;
+    use similar_asserts::assert_eq;
+    use vector_lib::{
+        codecs::OversizedAction,
+        config::LogNamespace,
+        lookup::{OwnedTargetPath, owned_value_path},
+        schema::Definition,
+    };
+    use vrl::value::{Kind, kind::Collection};
 
     use super::Config;
+    use crate::config::SourceConfig;
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<Config>();
+    }
+
+    #[test]
+    fn pod_counters_sweep_interval_follows_shortest_metric_expiry() {
+        let sweep_interval =
+            |yaml: &str| super::pod_counters_sweep_interval(&serde_yaml::from_str(yaml).unwrap());
+
+        // Metrics expire after 300 seconds by default.
+        assert_eq!(sweep_interval(""), Some(Duration::from_secs(150)));
+        assert_eq!(sweep_interval("expire_metrics_secs: -1.0"), None);
+        assert_eq!(
+            sweep_interval(indoc! {"
+                expire_metrics_secs: 600.0
+                expire_metrics_per_metric_set:
+                  - expire_secs: 60.0
+            "}),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn pod_counters_sweep_interval_has_millisecond_minimum() {
+        let sweep_interval =
+            |yaml: &str| super::pod_counters_sweep_interval(&serde_yaml::from_str(yaml).unwrap());
+
+        assert_eq!(
+            sweep_interval("expire_metrics_secs: 0.0000000001"),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            sweep_interval("expire_metrics_secs: 0.001"),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            sweep_interval("expire_metrics_secs: 0.004"),
+            Some(Duration::from_millis(2))
+        );
+        assert_eq!(
+            sweep_interval(indoc! {"
+                expire_metrics_secs: 600.0
+                expire_metrics_per_metric_set:
+                  - name:
+                      type: exact
+                      value: unrelated_metric
+                    expire_secs: 0.0000000001
+            "}),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn test_default_config_insert_namespace_fields() {
+        let config = Config::default();
+        assert_eq!(config.insert_namespace_fields, true);
+    }
+
+    #[test]
+    fn test_config_insert_namespace_fields_disabled() {
+        let config = Config {
+            insert_namespace_fields: false,
+            ..Default::default()
+        };
+        assert_eq!(config.insert_namespace_fields, false);
+    }
+
+    #[test]
+    fn test_config_serialization_insert_namespace_fields() {
+        // Test that the flag serializes/deserializes correctly from YAML
+        let yaml_config = indoc! {r"
+            insert_namespace_fields: false
+        "};
+        let config: Config = serde_yaml::from_str(yaml_config).unwrap();
+        assert_eq!(config.insert_namespace_fields, false);
+
+        let default_yaml = "";
+        let default_config: Config = serde_yaml::from_str(default_yaml).unwrap();
+        assert_eq!(default_config.insert_namespace_fields, true);
+    }
+
+    #[test]
+    fn test_insert_namespace_fields_affects_behavior() {
+        // Test that the config field properly controls namespace watching behavior
+        // This is a unit test for the conditional logic in the run method
+        let enabled_config = Config {
+            insert_namespace_fields: true,
+            ..Default::default()
+        };
+        let disabled_config = Config {
+            insert_namespace_fields: false,
+            ..Default::default()
+        };
+
+        // The main validation is that the flag is passed through correctly
+        // and can be used in conditional logic
+        assert!(should_watch_namespaces(&enabled_config));
+        assert!(!should_watch_namespaces(&disabled_config));
+    }
+
+    // Helper function to simulate the conditional logic from the run method
+    fn should_watch_namespaces(config: &Config) -> bool {
+        config.insert_namespace_fields
     }
 
     #[test]
@@ -1178,7 +1486,7 @@ mod tests {
             (
                 Config {
                     self_node_name: "qwe".to_owned(),
-                    extra_field_selector: "".to_owned(),
+                    extra_field_selector: String::new(),
                     ..Default::default()
                 },
                 "spec.nodeName=qwe",
@@ -1212,7 +1520,7 @@ mod tests {
             ),
             (
                 Config {
-                    extra_label_selector: "".to_owned(),
+                    extra_label_selector: String::new(),
                     ..Default::default()
                 }
                 .extra_label_selector,
@@ -1220,7 +1528,7 @@ mod tests {
             ),
             (
                 Config {
-                    extra_namespace_label_selector: "".to_owned(),
+                    extra_namespace_label_selector: String::new(),
                     ..Default::default()
                 }
                 .extra_namespace_label_selector,
@@ -1250,9 +1558,13 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this fixture is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn test_output_schema_definition_vector_namespace() {
-        let definitions = toml::from_str::<Config>("")
+        let definitions = serde_yaml::from_str::<Config>("")
             .unwrap()
             .outputs(LogNamespace::Vector)
             .remove(0)
@@ -1284,6 +1596,12 @@ mod tests {
                     )
                     .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "namespace_labels"),
+                        Kind::object(Collection::empty().with_unknown(Kind::bytes()))
+                            .or_undefined(),
+                        None
+                    )
+                    .with_metadata_field(
+                        &owned_value_path!("kubernetes_logs", "namespace_annotations"),
                         Kind::object(Collection::empty().with_unknown(Kind::bytes()))
                             .or_undefined(),
                         None
@@ -1342,6 +1660,11 @@ mod tests {
                         None
                     )
                     .with_metadata_field(
+                        &owned_value_path!("kubernetes_logs", "pod_log_directory_id"),
+                        Kind::bytes().or_undefined(),
+                        None
+                    )
+                    .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "stream"),
                         Kind::bytes(),
                         None
@@ -1363,12 +1686,16 @@ mod tests {
                     )
                     .with_meaning(OwnedTargetPath::event_root(), "message")
             )
-        )
+        );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this fixture is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[test]
     fn test_output_schema_definition_legacy_namespace() {
-        let definitions = toml::from_str::<Config>("")
+        let definitions = serde_yaml::from_str::<Config>("")
             .unwrap()
             .outputs(LogNamespace::Legacy)
             .remove(0)
@@ -1404,6 +1731,11 @@ mod tests {
                 )
                 .with_event_field(
                     &owned_value_path!("kubernetes", "namespace_labels"),
+                    Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
+                    None
+                )
+                .with_event_field(
+                    &owned_value_path!("kubernetes", "namespace_annotations"),
                     Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
                     None
                 )
@@ -1457,6 +1789,11 @@ mod tests {
                     Kind::bytes().or_undefined(),
                     None
                 )
+                .with_event_field(
+                    &owned_value_path!("kubernetes", "pod_log_directory_id"),
+                    Kind::bytes().or_undefined(),
+                    None
+                )
                 .with_event_field(&owned_value_path!("stream"), Kind::bytes(), None)
                 .with_event_field(
                     &owned_value_path!("timestamp"),
@@ -1469,6 +1806,61 @@ mod tests {
                     None
                 )
             )
-        )
+        );
+    }
+
+    #[test]
+    fn resolve_max_line_bytes_caps_in_drop_mode() {
+        let result = super::resolve_max_line_bytes(
+            1_000_000,     // max_line_bytes
+            Some(100_000), // max_merged_line_bytes
+            true,          // auto_partial_merge
+            OversizedAction::Drop,
+        );
+        assert_eq!(result, 100_000);
+    }
+
+    #[test]
+    fn resolve_max_line_bytes_no_cap_in_truncate_mode() {
+        let result = super::resolve_max_line_bytes(
+            1_000_000,     // max_line_bytes
+            Some(100_000), // max_merged_line_bytes
+            true,          // auto_partial_merge
+            OversizedAction::Truncate,
+        );
+        assert_eq!(result, 1_000_000);
+    }
+
+    #[test]
+    fn resolve_max_line_bytes_no_cap_without_auto_partial_merge() {
+        let result = super::resolve_max_line_bytes(
+            1_000_000,     // max_line_bytes
+            Some(100_000), // max_merged_line_bytes
+            false,         // auto_partial_merge
+            OversizedAction::Drop,
+        );
+        assert_eq!(result, 1_000_000);
+    }
+
+    #[test]
+    fn resolve_max_line_bytes_no_merged_limit_set() {
+        let result = super::resolve_max_line_bytes(
+            1_000_000, // max_line_bytes
+            None,      // max_merged_line_bytes
+            true,      // auto_partial_merge
+            OversizedAction::Drop,
+        );
+        assert_eq!(result, 1_000_000);
+    }
+
+    #[test]
+    fn resolve_max_line_bytes_merged_larger_than_line() {
+        let result = super::resolve_max_line_bytes(
+            100_000,       // max_line_bytes
+            Some(500_000), // max_merged_line_bytes > max_line_bytes
+            true,          // auto_partial_merge
+            OversizedAction::Drop,
+        );
+        assert_eq!(result, 100_000);
     }
 }

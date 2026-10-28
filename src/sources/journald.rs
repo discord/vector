@@ -4,18 +4,17 @@ use std::{
     path::PathBuf,
     process::Stdio,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
-use futures::{poll, stream::BoxStream, task::Poll, StreamExt};
+use futures::{StreamExt, poll, stream::BoxStream, task::Poll};
 use nix::{
-    sys::signal::{kill, Signal},
+    sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use once_cell::sync::Lazy;
 use serde_json::{Error as JsonError, Value as JsonValue};
 use snafu::{ResultExt, Snafu};
 use tokio::{
@@ -26,27 +25,28 @@ use tokio::{
     time::sleep,
 };
 use tokio_util::codec::FramedRead;
-use vector_lib::codecs::{decoding::BoxedFramingError, CharacterDelimitedDecoder};
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::{metadata_path, owned_value_path, path};
 use vector_lib::{
-    config::{LegacyKey, LogNamespace},
-    schema::Definition,
     EstimatedJsonEncodedSizeOf,
-};
-use vector_lib::{
+    codecs::{CharacterDelimitedDecoder, decoding::BoxedFramingError},
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
     finalizer::OrderedFinalizer,
     internal_event::{
         ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
     },
+    lookup::{metadata_path, owned_value_path, path},
+    schema::Definition,
 };
-use vrl::event_path;
-use vrl::value::{kind::Collection, Kind, Value};
+use vrl::{
+    event_path,
+    value::{Kind, Value, kind::Collection, value::simdutf_bytes_utf8_lossy},
+};
 
 use crate::{
+    SourceSender,
     config::{
-        log_schema, DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext,
-        SourceOutput,
+        DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
+        log_schema,
     },
     event::{BatchNotifier, BatchStatus, BatchStatusReceiver, LogEvent},
     internal_events::{
@@ -54,9 +54,7 @@ use crate::{
         JournaldInvalidRecordError, JournaldReadError, JournaldStartJournalctlError,
         StreamClosedError,
     },
-    serde::bool_or_struct,
     shutdown::ShutdownSignal,
-    SourceSender,
 };
 
 const BATCH_TIMEOUT: Duration = Duration::from_millis(10);
@@ -71,12 +69,14 @@ const RECEIVED_TIMESTAMP: &str = "__REALTIME_TIMESTAMP";
 
 const BACKOFF_DURATION: Duration = Duration::from_secs(1);
 
-static JOURNALCTL: Lazy<PathBuf> = Lazy::new(|| "journalctl".into());
+static JOURNALCTL: LazyLock<PathBuf> = LazyLock::new(|| "journalctl".into());
 
 #[derive(Debug, Snafu)]
 enum BuildError {
     #[snafu(display("journalctl failed to execute: {}", source))]
     JournalctlSpawn { source: io::Error },
+    #[snafu(display("failed to parse output of `journalctl --version`: {:?}", output))]
+    JournalctlParseVersion { output: String },
     #[snafu(display(
         "The unit {:?} is duplicated in both include_units and exclude_units",
         unit
@@ -88,10 +88,19 @@ enum BuildError {
         value,
     ))]
     DuplicatedMatches { field: String, value: String },
+    #[snafu(display(
+        "`current_boot_only: false` not supported for systemd versions 250 through 257 (got {}).",
+        systemd_version
+    ))]
+    AllBootsNotSupported { systemd_version: u32 },
 }
 
 type Matches = HashMap<String, HashSet<String>>;
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Restructuring these source configuration fields is deferred to preserve the existing API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 /// Configuration for the `journald` source.
 #[configurable_component(source("journald", "Collect logs from JournalD."))]
 #[derive(Clone, Debug)]
@@ -110,6 +119,10 @@ pub struct JournaldConfig {
     /// If empty or not present, all units are accepted.
     ///
     /// Unit names lacking a `.` have `.service` appended to make them a valid service unit name.
+    ///
+    /// **Note:** This option matches only the `_SYSTEMD_UNIT` field, which is narrower than `journalctl --unit`.
+    /// Messages from systemd about unit lifecycle (start/stop) have `_SYSTEMD_UNIT=init.scope` and will not match.
+    /// To capture these, explicitly include `init.scope` or use `include_matches` for finer control.
     #[serde(default)]
     #[configurable(metadata(docs::examples = "ntpd", docs::examples = "sysinit.target"))]
     pub include_units: Vec<String>,
@@ -194,8 +207,7 @@ pub struct JournaldConfig {
     #[serde(default)]
     pub journal_namespace: Option<String>,
 
-    #[configurable(derived)]
-    #[serde(default, deserialize_with = "bool_or_struct")]
+    #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     acknowledgements: SourceAcknowledgementsConfig,
 
     /// Enables remapping the `PRIORITY` field from an integer to string value.
@@ -253,7 +265,7 @@ impl JournaldConfig {
     }
 
     /// Builds the `schema::Definition` for this source using the provided `LogNamespace`.
-    fn schema_definition(&self, log_namespace: LogNamespace) -> Definition {
+    fn schema_definition(log_namespace: LogNamespace) -> Definition {
         let schema_definition = match log_namespace {
             LogNamespace::Vector => Definition::new_with_default_metadata(
                 Kind::bytes().or_null(),
@@ -306,15 +318,15 @@ impl Default for JournaldConfig {
             current_boot_only: true,
             include_units: vec![],
             exclude_units: vec![],
-            include_matches: Default::default(),
-            exclude_matches: Default::default(),
+            include_matches: HashMap::default(),
+            exclude_matches: HashMap::default(),
             data_dir: None,
             batch_size: default_batch_size(),
             journalctl_path: None,
             journal_directory: None,
             journal_namespace: None,
             extra_args: vec![],
-            acknowledgements: Default::default(),
+            acknowledgements: SourceAcknowledgementsConfig::default(),
             remap_priority: false,
             log_namespace: None,
             emit_cursor: false,
@@ -331,7 +343,9 @@ type Record = HashMap<String, String>;
 impl SourceConfig for JournaldConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         if self.remap_priority {
-            warn!("DEPRECATION, option `remap_priority` has been deprecated. Please use the `remap` transform and function `to_syslog_level` instead.");
+            warn!(
+                "DEPRECATION, option `remap_priority` has been deprecated. Please use the `remap` transform and function `to_syslog_level` instead."
+            );
         }
 
         let data_dir = cx
@@ -363,8 +377,16 @@ impl SourceConfig for JournaldConfig {
             .clone()
             .unwrap_or_else(|| JOURNALCTL.clone());
 
+        let systemd_version = get_systemd_version_from_journalctl(&journalctl_path).await?;
+
+        if !self.current_boot_only && (250..=257).contains(&systemd_version) {
+            // https://github.com/vectordotdev/vector/issues/18068
+            return Err(BuildError::AllBootsNotSupported { systemd_version }.into());
+        }
+
         let starter = StartJournalctl::new(
             journalctl_path,
+            systemd_version,
             self.journal_directory.clone(),
             self.journal_namespace.clone(),
             self.current_boot_only,
@@ -395,7 +417,7 @@ impl SourceConfig for JournaldConfig {
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let schema_definition =
-            self.schema_definition(global_log_namespace.merge(self.log_namespace));
+            Self::schema_definition(global_log_namespace.merge(self.log_namespace));
 
         vec![SourceOutput::new_maybe_logs(
             DataType::Log,
@@ -422,18 +444,22 @@ struct JournaldSource {
 }
 
 impl JournaldSource {
-    async fn run_shutdown(self, shutdown: ShutdownSignal) -> Result<(), ()> {
+    async fn run_shutdown(
+        self,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), crate::sources::SourceError> {
         let checkpointer = StatefulCheckpointer::new(self.checkpoint_path.clone())
             .await
             .map_err(|error| {
                 emit!(JournaldCheckpointFileOpenError {
-                    error,
+                    error: &error,
                     path: self
                         .checkpoint_path
                         .to_str()
                         .unwrap_or("unknown")
                         .to_string(),
                 });
+                crate::sources::SourceError::from(error)
             })?;
 
         let checkpointer = SharedCheckpointer::new(checkpointer);
@@ -462,8 +488,11 @@ impl JournaldSource {
             info!("Starting journalctl.");
             let cursor = checkpointer.lock().await.cursor.clone();
             match self.starter.start(cursor.as_deref()) {
-                Ok((stream, running)) => {
-                    if !self.run_stream(stream, &finalizer, shutdown.clone()).await {
+                Ok((stdout_stream, stderr_stream, running)) => {
+                    if !self
+                        .run_stream(stdout_stream, stderr_stream, &finalizer, shutdown.clone())
+                        .await
+                    {
                         return;
                     }
                     // Explicit drop to ensure it isn't dropped earlier.
@@ -478,7 +507,7 @@ impl JournaldSource {
             // so it is an error if we reach here.
             tokio::select! {
                 _ = &mut shutdown => break,
-                _ = sleep(BACKOFF_DURATION) => (),
+                () = sleep(BACKOFF_DURATION) => (),
             }
         }
     }
@@ -487,25 +516,33 @@ impl JournaldSource {
     /// Return `true` if should restart `journalctl`.
     async fn run_stream<'a>(
         &'a mut self,
-        mut stream: JournalStream,
+        mut stdout_stream: JournalStream,
+        stderr_stream: JournalStream,
         finalizer: &'a Finalizer,
         mut shutdown: ShutdownSignal,
     ) -> bool {
         let bytes_received = register!(BytesReceived::from(Protocol::from("journald")));
         let events_received = register!(EventsReceived);
 
+        // Spawn stderr handler task
+        let stderr_handler = crate::spawn_in_current_span(Self::handle_stderr(stderr_stream));
+
         let batch_size = self.batch_size;
-        loop {
+        let result = loop {
             let mut batch = Batch::new(self);
 
             // Start the timeout counter only once we have received a
             // valid and non-filtered event.
             while batch.events.is_empty() {
                 let item = tokio::select! {
-                    _ = &mut shutdown => return false,
-                    item = stream.next() => item,
+                    _ = &mut shutdown => {
+                        stderr_handler.abort();
+                        return false;
+                    },
+                    item = stdout_stream.next() => item,
                 };
                 if !batch.handle_next(item) {
+                    stderr_handler.abort();
                     return true;
                 }
             }
@@ -515,8 +552,8 @@ impl JournaldSource {
 
             for _ in 1..batch_size {
                 tokio::select! {
-                    _ = &mut timeout => break,
-                    result = stream.next() => if !batch.handle_next(result) {
+                    () = &mut timeout => break,
+                    result = stdout_stream.next() => if !batch.handle_next(result) {
                         break;
                     }
                 }
@@ -527,10 +564,36 @@ impl JournaldSource {
             {
                 break x;
             }
+        };
+
+        stderr_handler.abort();
+        result
+    }
+
+    /// Handle stderr stream from journalctl process
+    async fn handle_stderr(mut stderr_stream: JournalStream) {
+        while let Some(result) = stderr_stream.next().await {
+            match result {
+                Ok(line) => {
+                    let line_str = String::from_utf8_lossy(&line);
+                    let trimmed = line_str.trim();
+                    if !trimmed.is_empty() {
+                        warn!("Warning journalctl stderr: {trimmed}");
+                    }
+                }
+                Err(err) => {
+                    error!("Error reading journalctl stderr: {err}");
+                    break;
+                }
+            }
         }
     }
 }
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "Restructuring these source configuration fields is deferred to preserve the existing API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 struct Batch<'a> {
     events: Vec<LogEvent>,
     record_size: usize,
@@ -624,17 +687,14 @@ impl<'a> Batch<'a> {
             let byte_size = self.events.estimated_json_encoded_size_of();
             events_received.emit(CountByteSize(count, byte_size));
 
-            match self.source.out.send_batch(self.events).await {
-                Ok(_) => {
-                    if let Some(cursor) = self.cursor {
-                        finalizer.finalize(cursor, self.receiver).await;
-                    }
+            if self.source.out.send_batch(self.events).await.is_ok() {
+                if let Some(cursor) = self.cursor {
+                    finalizer.finalize(cursor, self.receiver).await;
                 }
-                Err(_) => {
-                    emit!(StreamClosedError { count });
-                    // `out` channel is closed, don't restart journalctl.
-                    self.exiting = Some(false);
-                }
+            } else {
+                emit!(StreamClosedError { count });
+                // `out` channel is closed, don't restart journalctl.
+                self.exiting = Some(false);
             }
         }
         self.exiting
@@ -645,6 +705,7 @@ type JournalStream = BoxStream<'static, Result<Bytes, BoxedFramingError>>;
 
 struct StartJournalctl {
     path: PathBuf,
+    systemd_version: u32,
     journal_dir: Option<PathBuf>,
     journal_namespace: Option<String>,
     current_boot_only: bool,
@@ -655,6 +716,7 @@ struct StartJournalctl {
 impl StartJournalctl {
     const fn new(
         path: PathBuf,
+        systemd_version: u32,
         journal_dir: Option<PathBuf>,
         journal_namespace: Option<String>,
         current_boot_only: bool,
@@ -663,6 +725,7 @@ impl StartJournalctl {
     ) -> Self {
         Self {
             path,
+            systemd_version,
             journal_dir,
             journal_namespace,
             current_boot_only,
@@ -674,6 +737,7 @@ impl StartJournalctl {
     fn make_command(&self, checkpoint: Option<&str>) -> Command {
         let mut command = Command::new(&self.path);
         command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
         command.arg("--follow");
         command.arg("--all");
         command.arg("--show-cursor");
@@ -684,15 +748,23 @@ impl StartJournalctl {
         }
 
         if let Some(namespace) = &self.journal_namespace {
-            command.arg(format!("--namespace={}", namespace));
+            command.arg(format!("--namespace={namespace}"));
         }
 
+        // By default entries from all boots are included
+        // systemd 242 introduces support for --boot=all
+        // systemd 250 lets --follow imply --boot (with no facility to override)
+        // systemd 258 allows to override --boot as implied by --follow
         if self.current_boot_only {
-            command.arg("--boot");
+            if self.systemd_version < 250 {
+                command.arg("--boot");
+            }
+        } else if self.systemd_version >= 258 {
+            command.arg("--boot=all");
         }
 
         if let Some(cursor) = checkpoint {
-            command.arg(format!("--after-cursor={}", cursor));
+            command.arg(format!("--after-cursor={cursor}"));
         } else if self.since_now {
             command.arg("--since=now");
         } else {
@@ -710,18 +782,24 @@ impl StartJournalctl {
     fn start(
         &mut self,
         checkpoint: Option<&str>,
-    ) -> crate::Result<(JournalStream, RunningJournalctl)> {
+    ) -> crate::Result<(JournalStream, JournalStream, RunningJournalctl)> {
         let mut command = self.make_command(checkpoint);
 
         let mut child = command.spawn().context(JournalctlSpawnSnafu)?;
 
-        let stream = FramedRead::new(
+        let stdout_stream = FramedRead::new(
             child.stdout.take().unwrap(),
             CharacterDelimitedDecoder::new(b'\n'),
-        )
-        .boxed();
+        );
 
-        Ok((stream, RunningJournalctl(child)))
+        let stderr = child.stderr.take().unwrap();
+        let stderr_stream = FramedRead::new(stderr, CharacterDelimitedDecoder::new(b'\n'));
+
+        Ok((
+            stdout_stream.boxed(),
+            stderr_stream.boxed(),
+            RunningJournalctl(child),
+        ))
     }
 }
 
@@ -735,12 +813,47 @@ impl Drop for RunningJournalctl {
     }
 }
 
+async fn get_systemd_version_from_journalctl(journalctl_path: &PathBuf) -> crate::Result<u32> {
+    let stdout = Command::new(journalctl_path)
+        .arg("--version")
+        .output()
+        .await
+        .context(JournalctlSpawnSnafu)?
+        .stdout;
+
+    // output format: `systemd {version_number} ({full_version}){newline}{config ...}`
+    let stdout = String::from_utf8_lossy(&stdout);
+    Ok(stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| BuildError::JournalctlParseVersion {
+            output: {
+                let cutoff = 40;
+                let length = stdout.chars().count();
+                format!(
+                    "{}{}",
+                    stdout.chars().take(cutoff).collect::<String>(),
+                    if length > cutoff {
+                        format!(" ..{} more char(s)", length - cutoff)
+                    } else {
+                        String::new()
+                    }
+                )
+            },
+        })?)
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing numeric conversion semantics of this source. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn enrich_log_event(log: &mut LogEvent, log_namespace: LogNamespace) {
     match log_namespace {
         LogNamespace::Vector => {
             if let Some(host) = log
                 .get(metadata_path!(JournaldConfig::NAME, "metadata"))
-                .and_then(|meta| meta.get(HOSTNAME))
+                .and_then(|meta| meta.get(path!(HOSTNAME)))
             {
                 log.insert(metadata_path!(JournaldConfig::NAME, "host"), host.clone());
             }
@@ -763,8 +876,8 @@ fn enrich_log_event(log: &mut LogEvent, log_namespace: LogNamespace) {
         LogNamespace::Vector => log
             .get(metadata_path!(JournaldConfig::NAME, "metadata"))
             .and_then(|meta| {
-                meta.get(SOURCE_TIMESTAMP)
-                    .or_else(|| meta.get(RECEIVED_TIMESTAMP))
+                meta.get(path!(SOURCE_TIMESTAMP))
+                    .or_else(|| meta.get(path!(RECEIVED_TIMESTAMP)))
             }),
         LogNamespace::Legacy => log
             .get(event_path!(SOURCE_TIMESTAMP))
@@ -773,11 +886,7 @@ fn enrich_log_event(log: &mut LogEvent, log_namespace: LogNamespace) {
 
     let timestamp = timestamp_value
         .filter(|&ts| ts.is_bytes())
-        .and_then(|ts| {
-            String::from_utf8_lossy(ts.as_bytes().unwrap())
-                .parse::<u64>()
-                .ok()
-        })
+        .and_then(|ts| ts.to_str_lossy().unwrap().parse::<u64>().ok())
         .map(|ts| {
             chrono::Utc
                 .timestamp_opt((ts / 1_000_000) as i64, (ts % 1_000_000) as u32 * 1_000)
@@ -810,6 +919,10 @@ fn enrich_log_event(log: &mut LogEvent, log_namespace: LogNamespace) {
     );
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "Keep optional batch notifiers consistent with the event finalization API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 fn create_log_event_from_record(
     mut record: Record,
     batch: &Option<BatchNotifier>,
@@ -817,19 +930,16 @@ fn create_log_event_from_record(
 ) -> LogEvent {
     match log_namespace {
         LogNamespace::Vector => {
-            let message_value = record
-                .remove(MESSAGE)
-                .map(|msg| Value::Bytes(Bytes::from(msg)))
-                .unwrap_or(Value::Null);
+            let message_value = record.remove(MESSAGE).map_or(Value::Null, Value::from);
 
             let mut log = LogEvent::from(message_value).with_batch_notifier_option(batch);
 
             // Add the remaining fields from the Record to the log event into an object to avoid collisions.
-            record.iter().for_each(|(key, value)| {
+            for (key, value) in &record {
                 log.metadata_mut()
                     .value_mut()
                     .insert(path!(JournaldConfig::NAME, "metadata", key), value.as_str());
-            });
+            }
 
             log
         }
@@ -851,12 +961,12 @@ fn fixup_unit(unit: &str) -> String {
     if unit.contains('.') {
         unit.into()
     } else {
-        format!("{}.service", unit)
+        format!("{unit}.service")
     }
 }
 
 fn decode_record(line: &[u8], remap: bool) -> Result<Record, JsonError> {
-    let mut record = serde_json::from_str::<JsonValue>(&String::from_utf8_lossy(line))?;
+    let mut record = serde_json::from_str::<JsonValue>(&simdutf_bytes_utf8_lossy(line))?;
     // journalctl will output non-ASCII values using an array
     // of integers. Look for those values and re-parse them.
     if let Some(record) = record.as_object_mut() {
@@ -883,14 +993,9 @@ fn decode_array_as_bytes(array: &[JsonValue]) -> Option<JsonValue> {
     // array was not a valid byte.
     array
         .iter()
-        .map(|item| {
-            item.as_u64().and_then(|num| match num {
-                num if num <= u8::MAX as u64 => Some(num as u8),
-                _ => None,
-            })
-        })
+        .map(|item| item.as_u64().and_then(|num| u8::try_from(num).ok()))
         .collect::<Option<Vec<u8>>>()
-        .map(|array| String::from_utf8_lossy(&array).into())
+        .map(|array| simdutf_bytes_utf8_lossy(&array).into())
 }
 
 fn remap_priority(priority: &mut JsonValue) {
@@ -920,12 +1025,7 @@ fn filter_matches(record: &Record, includes: &Matches, excludes: &Matches) -> bo
 }
 
 fn contains_match(record: &Record, matches: &Matches) -> bool {
-    let f = move |(field, value)| {
-        matches
-            .get(field)
-            .map(|x| x.contains(value))
-            .unwrap_or(false)
-    };
+    let f = move |(field, value)| matches.get(field).is_some_and(|x| x.contains(value));
     record.iter().any(f)
 }
 
@@ -958,7 +1058,7 @@ impl Finalizer {
     ) -> Self {
         if acknowledgements {
             let (finalizer, mut ack_stream) = OrderedFinalizer::new(Some(shutdown));
-            tokio::spawn(async move {
+            crate::spawn_in_current_span(async move {
                 while let Some((status, cursor)) = ack_stream.next().await {
                     if status == BatchStatus::Delivered {
                         checkpointer.lock().await.set(cursor).await;
@@ -1001,22 +1101,18 @@ impl Checkpointer {
 
     async fn set(&mut self, token: &str) -> Result<(), io::Error> {
         self.file.seek(SeekFrom::Start(0)).await?;
-        self.file.write_all(format!("{}\n", token).as_bytes()).await
+        self.file.write_all(format!("{token}\n").as_bytes()).await
     }
 
     async fn get(&mut self) -> Result<Option<String>, io::Error> {
         let mut buf = Vec::<u8>::new();
         self.file.seek(SeekFrom::Start(0)).await?;
         self.file.read_to_end(&mut buf).await?;
-        match buf.len() {
-            0 => Ok(None),
-            _ => {
-                let text = String::from_utf8_lossy(&buf);
-                match text.find('\n') {
-                    Some(nl) => Ok(Some(String::from(&text[..nl]))),
-                    None => Ok(None), // Maybe return an error?
-                }
-            }
+        if buf.is_empty() {
+            Ok(None)
+        } else {
+            let text = String::from_utf8_lossy(&buf);
+            Ok(text.split_once('\n').map(|(line, _)| line.to_string()))
         }
     }
 }
@@ -1096,7 +1192,7 @@ mod checkpointer_tests {
         assert_eq!(checkpointer.get().await.unwrap().unwrap(), "first test");
         let contents = read_to_string(filename.clone())
             .await
-            .unwrap_or_else(|_| panic!("Failed to read: {:?}", filename));
+            .unwrap_or_else(|_| panic!("Failed to read: {filename:?}"));
         assert!(contents.starts_with("first test\n"));
 
         checkpointer
@@ -1106,7 +1202,7 @@ mod checkpointer_tests {
         assert_eq!(checkpointer.get().await.unwrap().unwrap(), "second");
         let contents = read_to_string(filename.clone())
             .await
-            .unwrap_or_else(|_| panic!("Failed to read: {:?}", filename));
+            .unwrap_or_else(|_| panic!("Failed to read: {filename:?}"));
         assert!(contents.starts_with("second\n"));
     }
 }
@@ -1116,12 +1212,13 @@ mod tests {
     use std::{fs, path::Path};
 
     use tempfile::tempdir;
-    use tokio::time::{sleep, timeout, Duration, Instant};
-    use vrl::value::{kind::Collection, Value};
+    use tokio::time::{Duration, Instant, sleep, timeout};
+    use vrl::value::{Value, kind::Collection};
 
     use super::*;
     use crate::{
-        config::ComponentKey, event::Event, event::EventStatus,
+        config::ComponentKey,
+        event::{Event, EventStatus},
         test_util::components::assert_source_compliance,
     };
 
@@ -1177,7 +1274,8 @@ mod tests {
             let source = config.build(cx).await.unwrap();
             tokio::spawn(async move { source.await.unwrap() });
 
-            sleep(Duration::from_millis(100)).await;
+            // Hack: Sleep to ensure journalctl process starts and emits events before shutdown.
+            sleep(Duration::from_secs(1)).await;
             shutdown
                 .shutdown_all(Some(Instant::now() + Duration::from_secs(1)))
                 .await;
@@ -1219,10 +1317,16 @@ mod tests {
             received[0].as_log()[log_schema().source_type_key().unwrap().to_string()],
             "journald".into()
         );
-        assert_eq!(timestamp(&received[0]), value_ts(1578529839, 140001000));
+        assert_eq!(
+            timestamp(&received[0]),
+            value_ts(1_578_529_839, 140_001_000)
+        );
         assert_eq!(priority(&received[0]), Value::Bytes("INFO".into()));
         assert_eq!(message(&received[1]), Value::Bytes("unit message".into()));
-        assert_eq!(timestamp(&received[1]), value_ts(1578529839, 140002000));
+        assert_eq!(
+            timestamp(&received[1]),
+            value_ts(1_578_529_839, 140_002_000)
+        );
         assert_eq!(priority(&received[1]), Value::Bytes("DEBUG".into()));
     }
 
@@ -1268,12 +1372,18 @@ mod tests {
             message(&received[0]),
             Value::Bytes("Different timestamps".into())
         );
-        assert_eq!(timestamp(&received[0]), value_ts(1578529839, 140005000));
+        assert_eq!(
+            timestamp(&received[0]),
+            value_ts(1_578_529_839, 140_005_000)
+        );
         assert_eq!(
             message(&received[1]),
             Value::Bytes("Non-ASCII in other field".into())
         );
-        assert_eq!(timestamp(&received[1]), value_ts(1578529839, 140005000));
+        assert_eq!(
+            timestamp(&received[1]),
+            value_ts(1_578_529_839, 140_005_000)
+        );
     }
 
     #[tokio::test]
@@ -1281,7 +1391,10 @@ mod tests {
         let matches = create_matches(vec![("_TRANSPORT", "kernel")]);
         let received = run_journal(matches, HashMap::new(), None, false).await;
         assert_eq!(received.len(), 1);
-        assert_eq!(timestamp(&received[0]), value_ts(1578529839, 140006000));
+        assert_eq!(
+            timestamp(&received[0]),
+            value_ts(1_578_529_839, 140_006_000)
+        );
         assert_eq!(message(&received[0]), Value::Bytes("audit log".into()));
     }
 
@@ -1290,11 +1403,26 @@ mod tests {
         let matches = create_matches(vec![("PRIORITY", "INFO"), ("PRIORITY", "DEBUG")]);
         let received = run_journal(HashMap::new(), matches, None, false).await;
         assert_eq!(received.len(), 5);
-        assert_eq!(timestamp(&received[0]), value_ts(1578529839, 140003000));
-        assert_eq!(timestamp(&received[1]), value_ts(1578529839, 140004000));
-        assert_eq!(timestamp(&received[2]), value_ts(1578529839, 140005000));
-        assert_eq!(timestamp(&received[3]), value_ts(1578529839, 140005000));
-        assert_eq!(timestamp(&received[4]), value_ts(1578529839, 140006000));
+        assert_eq!(
+            timestamp(&received[0]),
+            value_ts(1_578_529_839, 140_003_000)
+        );
+        assert_eq!(
+            timestamp(&received[1]),
+            value_ts(1_578_529_839, 140_004_000)
+        );
+        assert_eq!(
+            timestamp(&received[2]),
+            value_ts(1_578_529_839, 140_005_000)
+        );
+        assert_eq!(
+            timestamp(&received[3]),
+            value_ts(1_578_529_839, 140_005_000)
+        );
+        assert_eq!(
+            timestamp(&received[4]),
+            value_ts(1_578_529_839, 140_006_000)
+        );
     }
 
     #[tokio::test]
@@ -1302,7 +1430,10 @@ mod tests {
         let received = run_with_units(&[], &[], Some("1")).await;
         assert_eq!(received.len(), 7);
         assert_eq!(message(&received[0]), Value::Bytes("unit message".into()));
-        assert_eq!(timestamp(&received[0]), value_ts(1578529839, 140002000));
+        assert_eq!(
+            timestamp(&received[0]),
+            value_ts(1_578_529_839, 140_002_000)
+        );
     }
 
     #[tokio::test]
@@ -1336,8 +1467,14 @@ mod tests {
     async fn handles_missing_timestamp() {
         let received = run_with_units(&["stdout"], &[], None).await;
         assert_eq!(received.len(), 2);
-        assert_eq!(timestamp(&received[0]), value_ts(1578529839, 140004000));
-        assert_eq!(timestamp(&received[1]), value_ts(1578529839, 140005000));
+        assert_eq!(
+            timestamp(&received[0]),
+            value_ts(1_578_529_839, 140_004_000)
+        );
+        assert_eq!(
+            timestamp(&received[1]),
+            value_ts(1_578_529_839, 140_005_000)
+        );
     }
 
     #[tokio::test]
@@ -1369,7 +1506,8 @@ mod tests {
         // Make sure the checkpointer cursor is empty
         assert_eq!(checkpointer.get().await.unwrap(), None);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Hack: Sleep to ensure journalctl process starts and emits events.
+        sleep(Duration::from_secs(1)).await;
 
         // Acknowledge all the received events.
         let mut count = 0;
@@ -1381,7 +1519,7 @@ mod tests {
         }
         assert_eq!(count, 8);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(checkpointer.get().await.unwrap().as_deref(), Some("8"));
     }
 
@@ -1426,8 +1564,8 @@ mod tests {
 
         let journald_config = JournaldConfig {
             include_units,
-            include_matches,
             exclude_units,
+            include_matches,
             exclude_matches,
             ..Default::default()
         };
@@ -1477,6 +1615,7 @@ mod tests {
     fn command_options() {
         let path = PathBuf::from("journalctl");
 
+        let systemd_version = 239;
         let journal_dir = None;
         let journal_namespace = None;
         let current_boot_only = false;
@@ -1486,6 +1625,7 @@ mod tests {
 
         let command = create_command(
             &path,
+            systemd_version,
             journal_dir,
             journal_namespace,
             current_boot_only,
@@ -1493,10 +1633,10 @@ mod tests {
             cursor,
             extra_args,
         );
-        let cmd_line = format!("{:?}", command);
+        let cmd_line = format!("{command:?}");
         assert!(!cmd_line.contains("--directory="));
         assert!(!cmd_line.contains("--namespace="));
-        assert!(!cmd_line.contains("--boot"));
+        assert!(!cmd_line.contains("--boot=all"));
         assert!(cmd_line.contains("--since=2000-01-01"));
 
         let journal_dir = None;
@@ -1506,6 +1646,7 @@ mod tests {
 
         let command = create_command(
             &path,
+            systemd_version,
             journal_dir,
             journal_namespace,
             current_boot_only,
@@ -1513,7 +1654,7 @@ mod tests {
             cursor,
             extra_args,
         );
-        let cmd_line = format!("{:?}", command);
+        let cmd_line = format!("{command:?}");
         assert!(cmd_line.contains("--since=now"));
 
         let journal_dir = Some(PathBuf::from("/tmp/journal-dir"));
@@ -1524,6 +1665,7 @@ mod tests {
 
         let command = create_command(
             &path,
+            systemd_version,
             journal_dir,
             journal_namespace,
             current_boot_only,
@@ -1531,16 +1673,37 @@ mod tests {
             cursor,
             extra_args,
         );
-        let cmd_line = format!("{:?}", command);
+        let cmd_line = format!("{command:?}");
         assert!(cmd_line.contains("--directory=/tmp/journal-dir"));
         assert!(cmd_line.contains("--namespace=my_namespace"));
         assert!(cmd_line.contains("--boot"));
         assert!(cmd_line.contains("--after-cursor="));
         assert!(cmd_line.contains("--merge"));
+
+        let systemd_version = 258;
+        let journal_dir = None;
+        let journal_namespace = None;
+        let current_boot_only = false;
+        let extra_args = vec![];
+
+        let command = create_command(
+            &path,
+            systemd_version,
+            journal_dir,
+            journal_namespace,
+            current_boot_only,
+            since_now,
+            cursor,
+            extra_args,
+        );
+        let cmd_line = format!("{command:?}");
+        assert!(cmd_line.contains("--boot=all"));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_command(
         path: &Path,
+        systemd_version: u32,
         journal_dir: Option<PathBuf>,
         journal_namespace: Option<String>,
         current_boot_only: bool,
@@ -1550,6 +1713,7 @@ mod tests {
     ) -> Command {
         StartJournalctl::new(
             path.into(),
+            systemd_version,
             journal_dir,
             journal_namespace,
             current_boot_only,
@@ -1624,7 +1788,7 @@ mod tests {
                     Some("host"),
                 );
 
-        assert_eq!(definitions, Some(expected_definition))
+        assert_eq!(definitions, Some(expected_definition));
     }
 
     #[test]
@@ -1649,7 +1813,7 @@ mod tests {
         )
         .unknown_fields(Kind::bytes());
 
-        assert_eq!(definitions, Some(expected_definition))
+        assert_eq!(definitions, Some(expected_definition));
     }
 
     fn matches_schema(config: &JournaldConfig, namespace: LogNamespace) {
@@ -1682,7 +1846,9 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(record).unwrap();
         let mut event = Event::from(LogEvent::from(vrl::value::Value::from(json)));
 
-        event.as_mut_log().insert("timestamp", chrono::Utc::now());
+        event
+            .as_mut_log()
+            .insert(event_path!("timestamp"), chrono::Utc::now());
 
         let definitions = config.outputs(namespace).remove(0).schema_definition(true);
 
@@ -1693,6 +1859,6 @@ mod tests {
     fn matches_schema_legacy() {
         let config = JournaldConfig::default();
 
-        matches_schema(&config, LogNamespace::Legacy)
+        matches_schema(&config, LogNamespace::Legacy);
     }
 }

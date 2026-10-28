@@ -1,59 +1,107 @@
-use metrics::counter;
-use vector_lib::internal_event::{ComponentEventsDropped, InternalEvent, INTENTIONAL};
+use vector_lib::{
+    NamedInternalEvent, counter, gauge,
+    internal_event::{ComponentEventsDropped, CounterName, GaugeName, INTENTIONAL, InternalEvent},
+};
 
+#[derive(NamedInternalEvent)]
 pub struct TagCardinalityLimitRejectingEvent<'a> {
     pub metric_name: &'a str,
     pub tag_key: &'a str,
     pub tag_value: &'a str,
+    pub include_extended_tags: bool,
 }
 
-impl<'a> InternalEvent for TagCardinalityLimitRejectingEvent<'a> {
+impl InternalEvent for TagCardinalityLimitRejectingEvent<'_> {
     fn emit(self) {
         debug!(
             message = "Event containing tag with new value after hitting configured 'value_limit'; discarding event.",
             metric_name = self.metric_name,
             tag_key = self.tag_key,
             tag_value = self.tag_value,
-            internal_log_rate_limit = true,
         );
-        counter!("tag_value_limit_exceeded_total").increment(1);
+        if self.include_extended_tags {
+            counter!(
+                CounterName::TagValueLimitExceededTotal,
+                "metric_name" => self.metric_name.to_string(),
+                "tag_key" => self.tag_key.to_string(),
+            )
+            .increment(1);
+        } else {
+            counter!(CounterName::TagValueLimitExceededTotal).increment(1);
+        }
 
         emit!(ComponentEventsDropped::<INTENTIONAL> {
             count: 1,
             reason: "Tag value limit exceeded."
-        })
+        });
     }
 }
 
+#[derive(NamedInternalEvent)]
 pub struct TagCardinalityLimitRejectingTag<'a> {
     pub metric_name: &'a str,
     pub tag_key: &'a str,
     pub tag_value: &'a str,
+    pub include_extended_tags: bool,
 }
 
-impl<'a> InternalEvent for TagCardinalityLimitRejectingTag<'a> {
+impl InternalEvent for TagCardinalityLimitRejectingTag<'_> {
     fn emit(self) {
         debug!(
             message = "Rejecting tag after hitting configured 'value_limit'.",
             metric_name = self.metric_name,
             tag_key = self.tag_key,
             tag_value = self.tag_value,
-            internal_log_rate_limit = true,
         );
-        counter!("tag_value_limit_exceeded_total").increment(1);
+        if self.include_extended_tags {
+            counter!(
+                CounterName::TagValueLimitExceededTotal,
+                "metric_name" => self.metric_name.to_string(),
+                "tag_key" => self.tag_key.to_string(),
+            )
+            .increment(1);
+        } else {
+            counter!(CounterName::TagValueLimitExceededTotal).increment(1);
+        }
     }
 }
 
+#[derive(NamedInternalEvent)]
 pub struct TagCardinalityValueLimitReached<'a> {
     pub key: &'a str,
 }
 
-impl<'a> InternalEvent for TagCardinalityValueLimitReached<'a> {
+impl InternalEvent for TagCardinalityValueLimitReached<'_> {
     fn emit(self) {
         debug!(
             message = "Value_limit reached for key. New values for this key will be rejected.",
             key = %self.key,
         );
-        counter!("value_limit_reached_total").increment(1);
+        counter!(CounterName::ValueLimitReachedTotal).increment(1);
+    }
+}
+
+#[derive(NamedInternalEvent)]
+pub struct TagCardinalityLimitUntracked;
+
+impl InternalEvent for TagCardinalityLimitUntracked {
+    fn emit(self) {
+        debug!(
+            message = "Max tracked keys limit reached; forwarding one or more metric tags without cardinality checks."
+        );
+        counter!(CounterName::TagCardinalityUntrackedEventsTotal).increment(1);
+    }
+}
+
+#[derive(NamedInternalEvent)]
+pub struct TagCardinalityTrackedKeys {
+    pub count: usize,
+}
+
+impl InternalEvent for TagCardinalityTrackedKeys {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::cast_precision_loss, reason = "Metrics use f64")]
+    fn emit(self) {
+        gauge!(GaugeName::TagCardinalityTrackedKeys).set(self.count as f64);
     }
 }

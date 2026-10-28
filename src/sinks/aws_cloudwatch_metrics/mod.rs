@@ -3,39 +3,46 @@ mod integration_tests;
 #[cfg(test)]
 mod tests;
 
-use aws_config::Region;
-use aws_sdk_cloudwatch::error::SdkError;
-use aws_sdk_cloudwatch::operation::put_metric_data::PutMetricDataError;
-use aws_sdk_cloudwatch::types::{Dimension, MetricDatum};
-use aws_sdk_cloudwatch::Client as CloudwatchClient;
-use aws_smithy_types::DateTime as AwsDateTime;
-use futures::{stream, FutureExt, SinkExt};
-use futures_util::{future, future::BoxFuture};
-use std::task::{Context, Poll};
-use tower::Service;
-use vector_lib::configurable::configurable_component;
-use vector_lib::{sink::VectorSink, ByteSizeOf, EstimatedJsonEncodedSizeOf};
+use std::{
+    fmt,
+    task::{Context, Poll},
+};
 
-use crate::{
-    aws::{
-        auth::AwsAuthentication, create_client, is_retriable_error, ClientBuilder, RegionOrEndpoint,
-    },
-    config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
-    event::{
-        metric::{Metric, MetricTags, MetricValue},
-        Event,
-    },
-    sinks::util::{
-        batch::BatchConfig,
-        buffer::metrics::{MetricNormalize, MetricNormalizer, MetricSet, MetricsBuffer},
-        retries::RetryLogic,
-        Compression, EncodedEvent, PartitionBuffer, PartitionInnerBuffer, SinkBatchSettings,
-        TowerRequestConfig,
-    },
-    tls::TlsConfig,
+use aws_config::Region;
+use aws_sdk_cloudwatch::{
+    Client as CloudwatchClient,
+    error::SdkError,
+    operation::put_metric_data::PutMetricDataError,
+    types::{Dimension, MetricDatum},
+};
+use aws_smithy_types::DateTime as AwsDateTime;
+use futures::{FutureExt, SinkExt, stream};
+use futures_util::{future, future::BoxFuture};
+use indexmap::IndexMap;
+use tower::Service;
+use vector_lib::{
+    ByteSizeOf, EstimatedJsonEncodedSizeOf, configurable::configurable_component, sink::VectorSink,
 };
 
 use super::util::service::TowerRequestConfigDefaults;
+use crate::{
+    aws::{
+        ClientBuilder, RegionOrEndpoint, auth::AwsAuthentication, create_client, is_retriable_error,
+    },
+    config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext, ValidatedSink},
+    event::{
+        Event,
+        metric::{Metric, MetricTags, MetricValue},
+    },
+    sinks::util::{
+        Compression, EncodedEvent, PartitionBuffer, PartitionInnerBuffer, SinkBatchSettings,
+        TowerRequestConfig,
+        batch::{BatchConfig, BatchSettings},
+        buffer::metrics::{MetricNormalize, MetricNormalizer, MetricSet, MetricsBuffer},
+        retries::RetryLogic,
+    },
+    tls::TlsConfig,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CloudWatchMetricsDefaultBatchSettings;
@@ -77,19 +84,15 @@ pub struct CloudWatchMetricsSinkConfig {
     #[serde(flatten)]
     pub region: RegionOrEndpoint,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub compression: Compression,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<CloudWatchMetricsDefaultBatchSettings>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub request: TowerRequestConfig<CloudWatchMetricsTowerRequestConfigDefaults>,
 
-    #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
     /// The ARN of an [IAM role][iam_role] to assume at startup.
@@ -99,17 +102,24 @@ pub struct CloudWatchMetricsSinkConfig {
     #[configurable(metadata(docs::hidden))]
     assume_role: Option<String>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub auth: AwsAuthentication,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
         skip_serializing_if = "crate::serde::is_default"
     )]
     acknowledgements: AcknowledgementsConfig,
+
+    /// A map from metric name to AWS storage resolution.
+    /// Valid values are 1 (high resolution) and 60 (standard resolution).
+    /// If unset, the AWS SDK default of 60 (standard resolution) is used.
+    /// See [AWS Metrics Resolution](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_concepts.html#Resolution_definition)
+    /// See [MetricDatum::storage_resolution](https://docs.rs/aws-sdk-cloudwatch/1.91.0/aws_sdk_cloudwatch/types/struct.MetricDatum.html#structfield.storage_resolution)
+    #[configurable(metadata(docs::additional_props_description = "An AWS storage resolution."))]
+    #[serde(default)]
+    pub storage_resolution: IndexMap<String, i32>,
 }
 
 impl_generate_config_from_default!(CloudWatchMetricsSinkConfig);
@@ -119,7 +129,7 @@ struct CloudwatchMetricsClientBuilder;
 impl ClientBuilder for CloudwatchMetricsClientBuilder {
     type Client = aws_sdk_cloudwatch::client::Client;
 
-    fn build(config: &aws_types::SdkConfig) -> Self::Client {
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
         aws_sdk_cloudwatch::client::Client::new(config)
     }
 }
@@ -127,22 +137,53 @@ impl ClientBuilder for CloudwatchMetricsClientBuilder {
 #[async_trait::async_trait]
 #[typetag::serde(name = "aws_cloudwatch_metrics")]
 impl SinkConfig for CloudWatchMetricsSinkConfig {
-    async fn build(
-        &self,
-        cx: SinkContext,
-    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
-        let client = self.create_client(&cx.proxy).await?;
-        let healthcheck = self.clone().healthcheck(client.clone()).boxed();
-        let sink = CloudWatchMetricsSvc::new(self.clone(), client)?;
-        Ok((sink, healthcheck))
-    }
-
     fn input(&self) -> Input {
         Input::metric()
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+}
+
+pub struct ValidatedCloudWatchMetrics {
+    batch: BatchSettings<MetricsBuffer>,
+    storage_resolution: IndexMap<String, i32>,
+}
+
+impl fmt::Debug for ValidatedCloudWatchMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedCloudWatchMetrics")
+            .field("batch_size_bytes", &self.batch.size.bytes)
+            .field("batch_size_events", &self.batch.size.events)
+            .field("batch_timeout", &self.batch.timeout)
+            .field("storage_resolution", &self.storage_resolution)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for CloudWatchMetricsSinkConfig {
+    type Validated = ValidatedCloudWatchMetrics;
+
+    fn validate(&self) -> crate::Result<ValidatedCloudWatchMetrics> {
+        let batch = self.batch.into_batch_settings()?;
+        let storage_resolution = validate_storage_resolutions(self.storage_resolution.clone())?;
+        Ok(ValidatedCloudWatchMetrics {
+            batch,
+            storage_resolution,
+        })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedCloudWatchMetrics,
+        cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
+        let client = self.create_client(&cx.proxy).await?;
+        let healthcheck = self.clone().healthcheck(client.clone()).boxed();
+        let sink = CloudWatchMetricsSvc::new(self, client, validated);
+        Ok((sink, healthcheck))
     }
 }
 
@@ -172,12 +213,13 @@ impl CloudWatchMetricsSinkConfig {
         };
 
         create_client::<CloudwatchMetricsClientBuilder>(
+            &CloudwatchMetricsClientBuilder {},
             &self.auth,
             region,
             self.region.endpoint(),
             proxy,
-            &self.tls,
-            &None,
+            self.tls.as_ref(),
+            None,
         )
         .await
     }
@@ -200,6 +242,7 @@ struct CloudWatchMetricsRetryLogic;
 
 impl RetryLogic for CloudWatchMetricsRetryLogic {
     type Error = SdkError<PutMetricDataError>;
+    type Request = PartitionInnerBuffer<Vec<Metric>, String>;
     type Response = ();
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
@@ -218,24 +261,30 @@ fn tags_to_dimensions(tags: &MetricTags) -> Vec<Dimension> {
 #[derive(Clone)]
 pub struct CloudWatchMetricsSvc {
     client: CloudwatchClient,
+    storage_resolution: IndexMap<String, i32>,
 }
 
 impl CloudWatchMetricsSvc {
+    #[must_use]
     pub fn new(
-        config: CloudWatchMetricsSinkConfig,
+        config: &CloudWatchMetricsSinkConfig,
         client: CloudwatchClient,
-    ) -> crate::Result<VectorSink> {
+        validated: &ValidatedCloudWatchMetrics,
+    ) -> VectorSink {
         let default_namespace = config.default_namespace.clone();
-        let batch = config.batch.into_batch_settings()?;
+        let batch = &validated.batch;
         let request_settings = config.request.into_settings();
 
-        let service = CloudWatchMetricsSvc { client };
+        let service = CloudWatchMetricsSvc {
+            client,
+            storage_resolution: validated.storage_resolution.clone(),
+        };
         let buffer = PartitionBuffer::new(MetricsBuffer::new(batch.size));
         let mut normalizer = MetricNormalizer::<AwsCloudwatchMetricNormalize>::default();
 
         let sink = request_settings
             .partition_sink(CloudWatchMetricsRetryLogic, service, buffer, batch.timeout)
-            .sink_map_err(|error| error!(message = "Fatal CloudwatchMetrics sink error.", %error))
+            .sink_map_err(|error| error!(message = "Fatal CloudwatchMetrics sink error.", %error, internal_log_rate_limit = false))
             .with_flat_map(move |event: Event| {
                 stream::iter({
                     let byte_size = event.allocated_bytes();
@@ -243,7 +292,6 @@ impl CloudWatchMetricsSvc {
                     normalizer.normalize(event.into_metric()).map(|mut metric| {
                         let namespace = metric
                             .take_namespace()
-                            .take()
                             .unwrap_or_else(|| default_namespace.clone());
                         Ok(EncodedEvent::new(
                             PartitionInnerBuffer::new(metric, namespace),
@@ -255,10 +303,11 @@ impl CloudWatchMetricsSvc {
             });
 
         #[allow(deprecated)]
-        Ok(VectorSink::from_event_sink(sink))
+        VectorSink::from_event_sink(sink)
     }
 
     fn encode_events(&mut self, events: Vec<Metric>) -> Vec<MetricDatum> {
+        let resolutions = &self.storage_resolution;
         events
             .into_iter()
             .filter_map(|event| {
@@ -267,14 +316,16 @@ impl CloudWatchMetricsSvc {
                     .timestamp()
                     .map(|x| AwsDateTime::from_millis(x.timestamp_millis()));
                 let dimensions = event.tags().map(tags_to_dimensions);
+                let resolution = resolutions.get(&metric_name).copied();
                 // AwsCloudwatchMetricNormalize converts these to the right MetricKind
                 match event.value() {
-                    MetricValue::Counter { value } => Some(
+                    MetricValue::Counter { value } | MetricValue::Gauge { value } => Some(
                         MetricDatum::builder()
                             .metric_name(metric_name)
                             .value(*value)
                             .set_timestamp(timestamp)
                             .set_dimensions(dimensions)
+                            .set_storage_resolution(resolution)
                             .build(),
                     ),
                     MetricValue::Distribution {
@@ -284,27 +335,29 @@ impl CloudWatchMetricsSvc {
                         MetricDatum::builder()
                             .metric_name(metric_name)
                             .set_values(Some(samples.iter().map(|s| s.value).collect()))
-                            .set_counts(Some(samples.iter().map(|s| s.rate as f64).collect()))
+                            .set_counts(Some(samples.iter().map(|s| f64::from(s.rate)).collect()))
                             .set_timestamp(timestamp)
                             .set_dimensions(dimensions)
+                            .set_storage_resolution(resolution)
                             .build(),
                     ),
-                    MetricValue::Set { values } => Some(
-                        MetricDatum::builder()
-                            .metric_name(metric_name)
-                            .value(values.len() as f64)
-                            .set_timestamp(timestamp)
-                            .set_dimensions(dimensions)
-                            .build(),
-                    ),
-                    MetricValue::Gauge { value } => Some(
-                        MetricDatum::builder()
-                            .metric_name(metric_name)
-                            .value(*value)
-                            .set_timestamp(timestamp)
-                            .set_dimensions(dimensions)
-                            .build(),
-                    ),
+                    MetricValue::Set { values } => {
+                        // https://github.com/vectordotdev/vector/issues/23659
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            reason = "CloudWatch encodes counts as f64"
+                        )]
+                        let count = values.len() as f64;
+                        Some(
+                            MetricDatum::builder()
+                                .metric_name(metric_name)
+                                .value(count)
+                                .set_timestamp(timestamp)
+                                .set_dimensions(dimensions)
+                                .set_storage_resolution(resolution)
+                                .build(),
+                        )
+                    }
                     _ => None,
                 }
             })
@@ -342,4 +395,17 @@ impl Service<PartitionInnerBuffer<Vec<Metric>, String>> for CloudWatchMetricsSvc
             Ok(())
         })
     }
+}
+
+fn validate_storage_resolutions(
+    storage_resolutions: IndexMap<String, i32>,
+) -> crate::Result<IndexMap<String, i32>> {
+    for (metric_name, storage_resolution) in &storage_resolutions {
+        if !matches!(storage_resolution, 1 | 60) {
+            return Err(
+                format!("Storage resolution for {metric_name} should be '1' or '60'").into(),
+            );
+        }
+    }
+    Ok(storage_resolutions)
 }

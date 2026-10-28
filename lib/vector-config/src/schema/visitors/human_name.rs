@@ -2,7 +2,7 @@ use serde_json::Value;
 use vector_config_common::{
     constants,
     human_friendly::generate_human_friendly_string,
-    schema::{visit::Visitor, *},
+    schema::{Map, Schema, SchemaObject, SchemaSettings, visit, visit::Visitor},
 };
 
 /// A visitor that generates a human-friendly name for enum variants and fields as metadata.
@@ -28,6 +28,7 @@ use vector_config_common::{
 pub struct GenerateHumanFriendlyNameVisitor;
 
 impl GenerateHumanFriendlyNameVisitor {
+    #[must_use]
     pub fn from_settings(_: &SchemaSettings) -> Self {
         Self
     }
@@ -59,18 +60,18 @@ impl Visitor for GenerateHumanFriendlyNameVisitor {
         // property's schema if it doesn't already have a human-friendly name defined.
         if let Some(properties) = schema.object.as_mut().map(|object| &mut object.properties) {
             for (property_name, property_schema) in properties.iter_mut() {
-                if let Some(property_schema) = property_schema.as_object_mut() {
-                    if !has_schema_metadata_attr_str(
+                if let Some(property_schema) = property_schema.as_object_mut()
+                    && !has_schema_metadata_attr_str(
                         property_schema,
                         constants::DOCS_META_HUMAN_NAME,
-                    ) {
-                        let human_name = generate_human_friendly_string(property_name);
-                        set_schema_metadata_attr_str(
-                            property_schema,
-                            constants::DOCS_META_HUMAN_NAME,
-                            human_name,
-                        );
-                    }
+                    )
+                {
+                    let human_name = generate_human_friendly_string(property_name);
+                    set_schema_metadata_attr_str(
+                        property_schema,
+                        constants::DOCS_META_HUMAN_NAME,
+                        human_name,
+                    );
                 }
             }
         }
@@ -106,9 +107,8 @@ mod tests {
     use serde_json::json;
     use vector_config_common::schema::visit::Visitor;
 
-    use crate::schema::visitors::test::{as_schema, assert_schemas_eq};
-
     use super::GenerateHumanFriendlyNameVisitor;
+    use crate::schema::visitors::test::{as_schema, assert_schemas_eq};
 
     #[test]
     fn logical_name() {

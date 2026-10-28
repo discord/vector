@@ -1,26 +1,23 @@
-use std::collections::HashMap;
-
 use bytes::{Buf, Bytes};
 use http::{Response, StatusCode, Uri};
-use hyper::{body, Body};
+use http_body::Body as _;
+use hyper::Body;
 use serde::Deserialize;
-use snafu::ResultExt;
-use vector_lib::config::proxy::ProxyConfig;
-use vector_lib::config::LogNamespace;
+use vector_lib::config::{LogNamespace, proxy::ProxyConfig};
 
 use super::{
-    request_builder::ElasticsearchRequestBuilder, ElasticsearchApiVersion, ElasticsearchEncoder,
-    InvalidHostSnafu, Request, VersionType,
+    ElasticsearchApiVersion, ElasticsearchEncoder, Request, VersionType,
+    request_builder::ElasticsearchRequestBuilder,
 };
 use crate::{
-    http::{HttpClient, MaybeAuth},
+    http::{HttpClient, MaybeAuth, ParameterValue, QueryParameterValue, QueryParameters},
     sinks::{
-        elasticsearch::{
-            ElasticsearchAuthConfig, ElasticsearchCommonMode, ElasticsearchConfig, ParseError,
-        },
-        util::auth::Auth,
-        util::{http::RequestConfig, UriSerde},
         HealthcheckError,
+        elasticsearch::{
+            ElasticsearchAuthConfig, ElasticsearchCommonMode, ElasticsearchConfig,
+            OpenSearchServiceType, ParseError,
+        },
+        util::{HttpEndpoint, UriSerde, auth::Auth, http::RequestConfig},
     },
     tls::TlsSettings,
     transforms::metric_to_log::MetricToLog,
@@ -31,61 +28,44 @@ pub struct ElasticsearchCommon {
     pub base_url: String,
     pub bulk_uri: Uri,
     pub auth: Option<Auth>,
+    pub service_type: OpenSearchServiceType,
     pub mode: ElasticsearchCommonMode,
     pub request_builder: ElasticsearchRequestBuilder,
     pub tls_settings: TlsSettings,
     pub request: RequestConfig,
-    pub query_params: HashMap<String, String>,
+    pub query_params: QueryParameters,
     pub metric_to_log: MetricToLog,
 }
 
 impl ElasticsearchCommon {
+    /// Builds the shared sink settings for an endpoint.
+    ///
+    /// # Errors
+    /// Returns an error for invalid endpoints, authentication, TLS settings, template
+    /// confinement, or incompatible versioning and serverless configuration.
+    ///
+    /// # Panics
+    /// Panics if the constructed bulk endpoint cannot be parsed as an HTTP URI.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::too_many_lines, reason = "Keep endpoint setup together.")]
     pub async fn parse_config(
         config: &ElasticsearchConfig,
-        endpoint: &str,
+        endpoint: &HttpEndpoint,
         proxy_config: &ProxyConfig,
         version: &mut Option<usize>,
     ) -> crate::Result<Self> {
-        // Test the configured host, but ignore the result
-        let uri = format!("{}/_test", endpoint);
-        let uri = uri
-            .parse::<Uri>()
-            .with_context(|_| InvalidHostSnafu { host: endpoint })?;
-        if uri.host().is_none() {
-            return Err(ParseError::HostMustIncludeHostname {
-                host: endpoint.to_string(),
-            }
-            .into());
-        }
+        let uri = UriSerde::try_from(endpoint.as_uri().clone())?;
 
-        let uri = endpoint.parse::<UriSerde>()?;
-        let auth = match &config.auth {
-            Some(ElasticsearchAuthConfig::Basic { user, password }) => {
-                let auth = Some(crate::http::Auth::Basic {
-                    user: user.clone(),
-                    password: password.clone(),
-                });
-                // basic auth must be some for now
-                let auth = auth.choose_one(&uri.auth)?.unwrap();
-                Some(Auth::Basic(auth))
+        // get auth from config or uri
+        let auth = Self::extract_auth(config, proxy_config, &uri).await?;
+
+        if config.opensearch_service_type == OpenSearchServiceType::Serverless {
+            match &config.auth {
+                #[cfg(feature = "aws-core")]
+                Some(ElasticsearchAuthConfig::Aws(_)) => (),
+                _ => return Err(ParseError::OpenSearchServerlessRequiresAwsAuth.into()),
             }
-            #[cfg(feature = "aws-core")]
-            Some(ElasticsearchAuthConfig::Aws(aws)) => {
-                let region = config
-                    .aws
-                    .as_ref()
-                    .map(|config| config.region())
-                    .ok_or(ParseError::RegionRequired)?
-                    .ok_or(ParseError::RegionRequired)?;
-                Some(Auth::Aws {
-                    credentials_provider: aws
-                        .credentials_provider(region.clone(), proxy_config, &config.tls)
-                        .await?,
-                    region,
-                })
-            }
-            None => None,
-        };
+        }
 
         let base_url = uri.uri.to_string().trim_end_matches('/').to_owned();
 
@@ -113,25 +93,43 @@ impl ElasticsearchCommon {
         let mut query_params = config.query.clone().unwrap_or_default();
         query_params.insert(
             "timeout".into(),
-            format!("{}s", tower_request.timeout.as_secs()),
+            QueryParameterValue::SingleParam(ParameterValue::String(format!(
+                "{}s",
+                tower_request.timeout.as_secs()
+            ))),
         );
 
-        if let Some(pipeline) = &config.pipeline {
-            if !pipeline.is_empty() {
-                query_params.insert("pipeline".into(), pipeline.into());
-            }
+        if let Some(pipeline) = &config.pipeline
+            && !pipeline.is_empty()
+        {
+            query_params.insert(
+                "pipeline".into(),
+                QueryParameterValue::SingleParam(ParameterValue::String(pipeline.into())),
+            );
         }
 
-        let bulk_url = {
+        let bulk_endpoint = {
             let mut query = url::form_urlencoded::Serializer::new(String::new());
-            for (p, v) in &query_params {
-                query.append_pair(&p[..], &v[..]);
+            // Iterate through the HashMap
+            for (param_name, param_value) in &query_params {
+                match param_value {
+                    QueryParameterValue::SingleParam(param) => {
+                        // For single parameter, just append one pair
+                        query.append_pair(param_name, param.value());
+                    }
+                    QueryParameterValue::MultiParams(params) => {
+                        // For multiple parameters, append the same key multiple times
+                        for value in params {
+                            query.append_pair(param_name, value.value());
+                        }
+                    }
+                }
             }
-            format!("{}/_bulk?{}", base_url, query.finish())
+            format!("{base_url}/_bulk?{}", query.finish())
         };
-        let bulk_uri = bulk_url.parse::<Uri>().unwrap();
+        let bulk_uri = bulk_endpoint.parse::<Uri>().unwrap();
 
-        let tls_settings = TlsSettings::from_options(&config.tls)?;
+        let tls_settings = TlsSettings::from_options(config.tls.as_ref())?;
         let config = config.clone();
         let request = config.request;
 
@@ -143,7 +141,16 @@ impl ElasticsearchCommon {
             metric_config.metric_tag_values,
         );
 
-        let version = if let Some(version) = *version {
+        let service_type = config.opensearch_service_type;
+
+        let version = if service_type == OpenSearchServiceType::Serverless {
+            if config.api_version != ElasticsearchApiVersion::Auto {
+                return Err(ParseError::ServerlessElasticsearchApiVersionMustBeAuto.into());
+            }
+            // Amazon OpenSearch Serverless does not support the cluster-version API; hardcode
+            // well-known API version
+            8
+        } else if let Some(version) = *version {
             version
         } else {
             let ver = match config.api_version {
@@ -151,7 +158,16 @@ impl ElasticsearchCommon {
                 ElasticsearchApiVersion::V7 => 7,
                 ElasticsearchApiVersion::V8 => 8,
                 ElasticsearchApiVersion::Auto => {
-                    match get_version(&base_url, &auth, &request, &tls_settings, proxy_config).await
+                    match get_version(
+                        &base_url,
+                        auth.as_ref(),
+                        #[cfg(feature = "aws-core")]
+                        &service_type,
+                        &request,
+                        &tls_settings,
+                        proxy_config,
+                    )
+                    .await
                     {
                         Ok(version) => {
                             debug!(message = "Auto-detected Elasticsearch API version.", %version);
@@ -186,7 +202,9 @@ impl ElasticsearchCommon {
 
         let doc_type = config.doc_type.clone();
         let suppress_type_name = if config.suppress_type_name {
-            warn!(message = "DEPRECATION, use of deprecated option `suppress_type_name`. Please use `api_version` option instead.");
+            warn!(
+                message = "DEPRECATION, use of deprecated option `suppress_type_name`. Please use `api_version` option instead."
+            );
             config.suppress_type_name
         } else {
             version >= 7
@@ -201,26 +219,80 @@ impl ElasticsearchCommon {
         };
 
         Ok(Self {
-            auth,
             base_url,
             bulk_uri,
+            auth,
+            service_type,
             mode,
             request_builder,
-            query_params,
-            request,
             tls_settings,
+            request,
+            query_params,
             metric_to_log,
         })
     }
 
-    /// Parses endpoints into a vector of ElasticsearchCommons. The resulting vector is guaranteed to not be empty.
+    // extract the authentication from config or endpoint
+    async fn extract_auth(
+        config: &ElasticsearchConfig,
+        #[cfg_attr(not(feature = "aws-core"), allow(unused_variables))] proxy_config: &ProxyConfig,
+        uri: &UriSerde,
+    ) -> crate::Result<Option<Auth>> {
+        let auth = match &config.auth {
+            Some(ElasticsearchAuthConfig::Basic { user, password }) => {
+                let auth = Some(crate::http::Auth::Basic {
+                    user: user.clone(),
+                    password: password.clone(),
+                });
+                // get whichever auth is provided between config and uri, prevent duplicate auth.
+                let auth = auth.choose_one(&uri.auth)?.unwrap();
+                Some(Auth::Basic(auth))
+            }
+            #[cfg(feature = "aws-core")]
+            Some(ElasticsearchAuthConfig::Aws(aws)) => {
+                let region = config
+                    .aws
+                    .as_ref()
+                    .map(crate::aws::region::RegionOrEndpoint::region)
+                    .ok_or(ParseError::RegionRequired)?
+                    .ok_or(ParseError::RegionRequired)?;
+                Some(Auth::Aws {
+                    credentials_provider: aws
+                        .credentials_provider(region.clone(), proxy_config, config.tls.as_ref())
+                        .await?,
+                    region,
+                })
+            }
+            None => {
+                // Use the authentication from the URL if it exists
+                uri.auth.as_ref().and_then(|auth| match auth {
+                    crate::http::Auth::Basic { user, password } => {
+                        Some(Auth::Basic(crate::http::Auth::Basic {
+                            user: user.clone(),
+                            password: password.clone(),
+                        }))
+                    }
+                    _ => None,
+                })
+            }
+        };
+        Ok(auth)
+    }
+
+    /// Parses endpoints into a vector of `ElasticsearchCommons`. The resulting vector is guaranteed to not be empty.
+    ///
+    /// # Errors
+    /// Returns an error if no endpoint is configured, both endpoint options are used,
+    /// or any endpoint fails [`Self::parse_config`].
     pub async fn parse_many(
         config: &ElasticsearchConfig,
         proxy_config: &ProxyConfig,
     ) -> crate::Result<Vec<Self>> {
         let mut version = None;
         if let Some(endpoint) = config.endpoint.as_ref() {
-            warn!(message = "DEPRECATION, use of deprecated option `endpoint`. Please use `endpoints` option instead.");
+            warn!(
+                message = "DEPRECATION, use of deprecated option `endpoint`. Please use `endpoints` option instead."
+            );
             if config.endpoints.is_empty() {
                 Ok(vec![
                     Self::parse_config(config, endpoint, proxy_config, &mut version).await?,
@@ -232,7 +304,7 @@ impl ElasticsearchCommon {
             Err(ParseError::EndpointRequired.into())
         } else {
             let mut commons = Vec::new();
-            for endpoint in config.endpoints.iter() {
+            for endpoint in &config.endpoints {
                 commons
                     .push(Self::parse_config(config, endpoint, proxy_config, &mut version).await?);
             }
@@ -240,7 +312,13 @@ impl ElasticsearchCommon {
         }
     }
 
-    /// Parses a single endpoint, else panics.
+    /// Parses a single endpoint.
+    ///
+    /// # Errors
+    /// Returns any error from [`Self::parse_many`].
+    ///
+    /// # Panics
+    /// Panics if the configuration contains more than one endpoint.
     #[cfg(test)]
     pub async fn parse_single(config: &ElasticsearchConfig) -> crate::Result<Self> {
         let mut commons =
@@ -249,35 +327,66 @@ impl ElasticsearchCommon {
         Ok(commons.remove(0))
     }
 
+    /// Checks cluster health, unless the endpoint is serverless.
+    ///
+    /// # Errors
+    /// Returns an error if the health request cannot be built, signed, or sent,
+    /// or the endpoint returns a status other than 200 OK.
     pub async fn healthcheck(self, client: HttpClient) -> crate::Result<()> {
-        match get(
-            &self.base_url,
-            &self.auth,
-            &self.request,
-            client,
-            "/_cluster/health",
-        )
-        .await?
-        .status()
-        {
-            StatusCode::OK => Ok(()),
-            status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
+        if self.service_type == OpenSearchServiceType::Serverless {
+            warn!(
+                message = "Amazon OpenSearch Serverless does not support healthchecks. Skipping healthcheck..."
+            );
+            Ok(())
+        } else {
+            match get(
+                &self.base_url,
+                self.auth.as_ref(),
+                #[cfg(feature = "aws-core")]
+                &self.service_type,
+                &self.request,
+                client,
+                "/_cluster/health",
+            )
+            .await?
+            .status()
+            {
+                StatusCode::OK => Ok(()),
+                status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
+            }
         }
     }
 }
 
+/// Signs an Elasticsearch or OpenSearch request with AWS credentials.
+///
+/// # Errors
+/// Returns an error if credentials cannot be loaded, headers are not UTF-8,
+/// or the AWS request signature cannot be constructed.
 #[cfg(feature = "aws-core")]
 pub async fn sign_request(
+    service_type: &OpenSearchServiceType,
     request: &mut http::Request<Bytes>,
     credentials_provider: &aws_credential_types::provider::SharedCredentialsProvider,
-    region: &Option<aws_types::region::Region>,
+    region: Option<&aws_types::region::Region>,
 ) -> crate::Result<()> {
-    crate::aws::sign_request("es", request, credentials_provider, region).await
+    // Amazon OpenSearch Serverless requires the x-amz-content-sha256 header when calculating
+    // the AWS v4 signature:
+    // https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-clients.html#serverless-signing
+    crate::aws::sign_request(
+        service_type.as_str(),
+        request,
+        credentials_provider,
+        region,
+        *service_type == OpenSearchServiceType::Serverless,
+    )
+    .await
 }
 
 async fn get_version(
     base_url: &str,
-    auth: &Option<Auth>,
+    auth: Option<&Auth>,
+    #[cfg(feature = "aws-core")] service_type: &OpenSearchServiceType,
     request: &RequestConfig,
     tls_settings: &TlsSettings,
     proxy_config: &ProxyConfig,
@@ -292,22 +401,30 @@ async fn get_version(
     }
 
     let client = HttpClient::new(tls_settings.clone(), proxy_config)?;
-    let response = get(base_url, auth, request, client, "/")
-        .await
-        .map_err(|error| format!("Failed to get Elasticsearch API version: {}", error))?;
+    let response = get(
+        base_url,
+        auth,
+        #[cfg(feature = "aws-core")]
+        service_type,
+        request,
+        client,
+        "/",
+    )
+    .await
+    .map_err(|error| format!("Failed to get Elasticsearch API version: {error}"))?;
 
     let (_, body) = response.into_parts();
-    let mut body = body::aggregate(body).await?;
+    let mut body = body.collect().await?.aggregate();
     let body = body.copy_to_bytes(body.remaining());
     let ResponsePayload { version } = serde_json::from_slice(&body)?;
-    if let Some(version) = version {
-        if let Some(number) = version.number {
-            let v: Vec<&str> = number.split('.').collect();
-            if !v.is_empty() {
-                if let Ok(major_version) = v[0].parse::<usize>() {
-                    return Ok(major_version);
-                }
-            }
+    if let Some(version) = version
+        && let Some(number) = version.number
+    {
+        let v: Vec<&str> = number.split('.').collect();
+        if !v.is_empty()
+            && let Ok(major_version) = v[0].parse::<usize>()
+        {
+            return Ok(major_version);
         }
     }
     Err("Unexpected response from Elasticsearch endpoint `/`. Consider setting `api_version` option.".into())
@@ -315,15 +432,16 @@ async fn get_version(
 
 async fn get(
     base_url: &str,
-    auth: &Option<Auth>,
+    auth: Option<&Auth>,
+    #[cfg(feature = "aws-core")] service_type: &OpenSearchServiceType,
     request: &RequestConfig,
     client: HttpClient,
     path: &str,
 ) -> crate::Result<Response<Body>> {
-    let mut builder = Request::get(format!("{}{}", base_url, path));
+    let mut builder = Request::get(format!("{base_url}{path}"));
 
     for (header, value) in &request.headers {
-        builder = builder.header(&header[..], &value[..]);
+        builder = builder.header(header.as_str(), value.as_str());
     }
     let mut request = builder.body(Bytes::new())?;
 
@@ -338,7 +456,7 @@ async fn get(
                 region,
             } => {
                 let region = region.clone();
-                sign_request(&mut request, provider, &Some(region)).await?;
+                sign_request(service_type, &mut request, provider, Some(&region)).await?;
             }
         }
     }

@@ -22,6 +22,10 @@ where
 /// Wait for a set of `resources` within a `namespace` to reach a `wait_for`
 /// condition.
 /// Use `extra` to pass additional arguments to `kubectl`.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot be spawned or waited on, or exits unsuccessfully.
 pub async fn namespace<Cmd, NS, R, Cond, Ex>(
     kubectl_command: Cmd,
     namespace: NS,
@@ -44,6 +48,10 @@ where
 /// Wait for a set of `resources` at any namespace to reach a `wait_for`
 /// condition.
 /// Use `extra` to pass additional arguments to `kubectl`.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot be spawned or waited on, or exits unsuccessfully.
 pub async fn all_namespaces<Cmd, R, Cond, Ex>(
     kubectl_command: Cmd,
     resources: impl IntoIterator<Item = R>,
@@ -86,7 +94,7 @@ where
     command.arg("--for");
     match wait_for {
         WaitFor::Delete => command.arg("delete"),
-        WaitFor::Condition(cond) => command.arg(format!("condition={}", cond)),
+        WaitFor::Condition(cond) => command.arg(format!("condition={cond}")),
     };
 
     command.args(extra);

@@ -3,33 +3,31 @@ use std::io;
 use async_stream::stream;
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{channel::mpsc, executor, SinkExt, StreamExt};
-use tokio_util::{codec::FramedRead, io::StreamReader};
-use vector_lib::codecs::{
-    decoding::{DeserializerConfig, FramingConfig},
-    StreamDecodingError,
-};
-use vector_lib::configurable::NamedComponent;
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol,
-};
-use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path, OwnedValuePath};
+use futures::{SinkExt, StreamExt, channel::mpsc, executor};
+use tokio_util::io::StreamReader;
 use vector_lib::{
-    config::{LegacyKey, LogNamespace},
-    event::Event,
     EstimatedJsonEncodedSizeOf,
+    codecs::{
+        DecoderFramedRead, StreamDecodingError,
+        decoding::{DeserializerConfig, FramingConfig},
+    },
+    config::{LegacyKey, LogNamespace},
+    configurable::NamedComponent,
+    event::Event,
+    internal_event::{ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol},
+    lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
 };
 use vrl::value::Kind;
 
 use crate::{
+    SourceSender,
     codecs::{Decoder, DecodingConfig},
-    config::{log_schema, SourceOutput},
+    config::{SourceOutput, log_schema},
     internal_events::{EventsReceived, FileDescriptorReadError, StreamClosedError},
     shutdown::ShutdownSignal,
-    SourceSender,
 };
 
-#[cfg(all(unix, feature = "sources-file-descriptor"))]
+#[cfg(all(unix, feature = "sources-file_descriptor"))]
 pub mod file_descriptor;
 #[cfg(feature = "sources-stdin")]
 pub mod stdin;
@@ -40,6 +38,10 @@ pub trait FileDescriptorConfig: NamedComponent {
     fn decoding(&self) -> DeserializerConfig;
     fn description(&self) -> String;
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured decoder cannot be built.
     fn source<R>(
         &self,
         reader: R,
@@ -72,11 +74,11 @@ pub trait FileDescriptorConfig: NamedComponent {
         // until another newline is entered. See
         // https://github.com/tokio-rs/tokio/blob/a73428252b08bf1436f12e76287acbc4600ca0e5/tokio/src/io/stdin.rs#L33-L42
         std::thread::spawn(move || {
-            info!("Capturing {}.", description);
+            info!("Capturing {description}.");
             read_from_fd(reader, sender);
         });
 
-        Ok(Box::pin(process_stream(
+        Ok(crate::sources::source_with_error(process_stream(
             receiver,
             decoder,
             out,
@@ -124,7 +126,7 @@ async fn process_stream(
     source_type: &'static str,
     hostname: Option<String>,
     log_namespace: LogNamespace,
-) -> Result<(), ()> {
+) -> vector_lib::source_sender::SendResult {
     let bytes_received = register!(BytesReceived::from(Protocol::NONE));
     let events_received = register!(EventsReceived);
     let stream = receiver.inspect(|result| {
@@ -133,7 +135,7 @@ async fn process_stream(
         }
     });
     let stream = StreamReader::new(stream);
-    let mut stream = FramedRead::new(stream, decoder).take_until(shutdown);
+    let mut stream = DecoderFramedRead::new(stream, decoder).take_until(shutdown);
     let mut stream = stream! {
         while let Some(result) = stream.next().await {
             match result {
@@ -176,7 +178,7 @@ async fn process_stream(
                     }
                 }
                 Err(error) => {
-                    // Error is logged by `crate::codecs::Decoder`, no
+                    // Error is logged by `vector_lib::codecs::Decoder`, no
                     // further handling is needed here.
                     if !error.can_continue() {
                         break;
@@ -192,19 +194,19 @@ async fn process_stream(
             debug!("Finished sending.");
             Ok(())
         }
-        Err(_) => {
+        Err(error) => {
             let (count, _) = stream.size_hint();
             emit!(StreamClosedError { count });
-            Err(())
+            Err(error)
         }
     }
 }
 
 /// Builds the `vector_lib::config::Outputs` for stdin and
-/// file_descriptor sources.
+/// `file_descriptor` sources.
 fn outputs(
     log_namespace: LogNamespace,
-    host_key: &Option<OptionalValuePath>,
+    host_key: Option<&OptionalValuePath>,
     decoding: &DeserializerConfig,
     source_name: &'static str,
 ) -> Vec<SourceOutput> {
@@ -213,7 +215,7 @@ fn outputs(
         .with_source_metadata(
             source_name,
             host_key
-                .clone()
+                .cloned()
                 .map_or(log_schema().host_key().cloned(), |key| key.path)
                 .map(LegacyKey::Overwrite),
             &owned_value_path!("host"),

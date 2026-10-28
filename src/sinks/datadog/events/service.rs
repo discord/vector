@@ -8,10 +8,10 @@ use futures::{
 use http::Request;
 use hyper::Body;
 use tower::{Service, ServiceExt};
-use vector_lib::stream::DriverResponse;
 use vector_lib::{
     request_metadata::{GroupedCountByteSize, MetaDescriptive},
     sensitive_string::SensitiveString,
+    stream::DriverResponse,
 };
 
 use crate::{
@@ -72,7 +72,7 @@ impl DatadogEventsService {
                 .header("DD-API-KEY", api_key)
                 .header("Content-Length", req.body.len())
                 .body(req.body)
-                .map_err(|x| x.into());
+                .map_err(std::convert::Into::into);
             future::ready(request)
         });
 

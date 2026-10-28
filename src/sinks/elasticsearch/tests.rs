@@ -1,23 +1,32 @@
-use std::convert::TryFrom;
+use std::{convert::TryFrom, iter::zip};
 
+use vector_common::sensitive_string::SensitiveString;
 use vector_lib::lookup::PathPrefix;
+use vrl::event_path;
 
 use crate::{
     codecs::Transformer,
+    config::ProxyConfig,
     event::{LogEvent, Metric, MetricKind, MetricValue, ObjectMap, Value},
     sinks::{
         elasticsearch::{
-            sink::process_log, BulkAction, BulkConfig, DataStreamConfig, ElasticsearchApiVersion,
-            ElasticsearchCommon, ElasticsearchConfig, ElasticsearchMode, VersionType,
+            BulkAction, BulkConfig, DataStreamConfig, ElasticsearchApiVersion,
+            ElasticsearchAuthConfig, ElasticsearchCommon, ElasticsearchConfig, ElasticsearchMode,
+            VersionType, sink::process_log,
         },
-        util::encoding::Encoder,
+        util::{HttpEndpoint, auth::Auth, encoding::Encoder},
     },
-    template::Template,
+    template::{ConfinementConfig, Template, UnconfinedTemplate},
 };
 
 // helper to unwrap template strings for tests only
 fn parse_template(input: &str) -> Template {
     Template::try_from(input).unwrap()
+}
+
+// `bulk.action` / `bulk.version` are unconfined templates.
+fn parse_unconfined(input: &str) -> UnconfinedTemplate {
+    UnconfinedTemplate::try_from(input).unwrap()
 }
 
 #[tokio::test]
@@ -28,12 +37,13 @@ async fn sets_create_action_when_configured() {
 
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("{{ action }}te"),
+            action: parse_unconfined("{{ action }}te"),
             index: parse_template("vector"),
+            template_fallback_index: None,
             version: None,
             version_type: VersionType::Internal,
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
     };
@@ -46,7 +56,7 @@ async fn sets_create_action_when_configured() {
             .single()
             .expect("invalid timestamp"),
     );
-    log.insert("action", "crea");
+    log.insert(event_path!("action"), "crea");
 
     let mut encoded = vec![];
     let (encoded_size, _json_size) = es
@@ -61,7 +71,7 @@ async fn sets_create_action_when_configured() {
     let expected = r#"{"create":{"_index":"vector","_type":"_doc"}}
 {"action":"crea","message":"hello there","timestamp":"2020-12-01T01:02:03Z"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
@@ -69,13 +79,14 @@ async fn sets_create_action_when_configured() {
 async fn encoding_with_external_versioning_without_version_set_does_not_include_version() {
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("create"),
+            action: parse_unconfined("create"),
+            template_fallback_index: None,
             index: parse_template("vector"),
             version: None,
             version_type: VersionType::External,
         },
         id_key: Some("my_id".into()),
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
     };
@@ -85,18 +96,20 @@ async fn encoding_with_external_versioning_without_version_set_does_not_include_
 
 #[tokio::test]
 async fn encoding_with_external_versioning_with_version_set_includes_version() {
-    use crate::config::log_schema;
     use chrono::{TimeZone, Utc};
+
+    use crate::config::log_schema;
 
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("create"),
+            action: parse_unconfined("create"),
             index: parse_template("vector"),
-            version: Some(parse_template("{{ my_field }}")),
+            template_fallback_index: None,
+            version: Some(parse_unconfined("{{ my_field }}")),
             version_type: VersionType::External,
         },
         id_key: Some("my_id".into()),
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
     };
@@ -111,8 +124,8 @@ async fn encoding_with_external_versioning_with_version_set_includes_version() {
             .single()
             .expect("invalid timestamp"),
     );
-    log.insert("my_field", "1337");
-    log.insert("my_id", "42");
+    log.insert(event_path!("my_field"), "1337");
+    log.insert(event_path!("my_id"), "42");
 
     let mut encoded = vec![];
     let (encoded_size, _json_size) = es
@@ -124,27 +137,29 @@ async fn encoding_with_external_versioning_with_version_set_includes_version() {
         )
         .unwrap();
 
-    let expected = r#"{"create":{"_index":"vector","_type":"_doc","_id":"42","version_type":"external","version":1337}}
+    let expected = r#"{"create":{"_id":"42","_index":"vector","_type":"_doc","version":1337,"version_type":"external"}}
 {"message":"hello there","my_field":"1337","timestamp":"2020-12-01T01:02:03Z"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
 #[tokio::test]
 async fn encoding_with_external_gte_versioning_with_version_set_includes_version() {
-    use crate::config::log_schema;
     use chrono::{TimeZone, Utc};
+
+    use crate::config::log_schema;
 
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("create"),
+            action: parse_unconfined("create"),
             index: parse_template("vector"),
-            version: Some(parse_template("{{ my_field }}")),
+            template_fallback_index: None,
+            version: Some(parse_unconfined("{{ my_field }}")),
             version_type: VersionType::ExternalGte,
         },
         id_key: Some("my_id".into()),
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
     };
@@ -159,8 +174,8 @@ async fn encoding_with_external_gte_versioning_with_version_set_includes_version
             .single()
             .expect("invalid timestamp"),
     );
-    log.insert("my_field", "1337");
-    log.insert("my_id", "42");
+    log.insert(event_path!("my_field"), "1337");
+    log.insert(event_path!("my_id"), "42");
 
     let mut encoded = vec![];
     let (encoded_size, _json_size) = es
@@ -172,10 +187,10 @@ async fn encoding_with_external_gte_versioning_with_version_set_includes_version
         )
         .unwrap();
 
-    let expected = r#"{"create":{"_index":"vector","_type":"_doc","_id":"42","version_type":"external_gte","version":1337}}
+    let expected = r#"{"create":{"_id":"42","_index":"vector","_type":"_doc","version":1337,"version_type":"external_gte"}}
 {"message":"hello there","my_field":"1337","timestamp":"2020-12-01T01:02:03Z"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
@@ -201,6 +216,21 @@ fn data_stream_body(
     ds
 }
 
+fn assert_expected_is_encoded(expected: &str, encoded: &[u8]) {
+    let encoded = std::str::from_utf8(encoded).unwrap();
+
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let encoded_lines: Vec<&str> = encoded.lines().collect();
+
+    assert_eq!(expected_lines.len(), encoded_lines.len());
+
+    let to_value = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
+
+    zip(expected_lines, encoded_lines).for_each(|(expected, encoded)| {
+        assert_eq!(to_value(expected), to_value(encoded));
+    });
+}
+
 #[tokio::test]
 async fn encode_datastream_mode() {
     use chrono::{TimeZone, Utc};
@@ -212,7 +242,7 @@ async fn encode_datastream_mode() {
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         mode: ElasticsearchMode::DataStream,
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
@@ -227,7 +257,7 @@ async fn encode_datastream_mode() {
             .expect("invalid timestamp"),
     );
     log.insert(
-        "data_stream",
+        event_path!("data_stream"),
         data_stream_body(
             Some("synthetics".to_string()),
             Some("testing".to_string()),
@@ -248,7 +278,7 @@ async fn encode_datastream_mode() {
     let expected = r#"{"create":{"_index":"synthetics-testing-default","_type":"_doc"}}
 {"@timestamp":"2020-12-01T01:02:03Z","data_stream":{"dataset":"testing","namespace":"default","type":"synthetics"},"message":"hello there"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
@@ -263,7 +293,7 @@ async fn encode_datastream_mode_no_routing() {
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         mode: ElasticsearchMode::DataStream,
         data_stream: Some(DataStreamConfig {
             auto_routing: false,
@@ -277,7 +307,7 @@ async fn encode_datastream_mode_no_routing() {
 
     let mut log = LogEvent::from("hello there");
     log.insert(
-        "data_stream",
+        event_path!("data_stream"),
         data_stream_body(
             Some("synthetics".to_string()),
             Some("testing".to_string()),
@@ -303,7 +333,7 @@ async fn encode_datastream_mode_no_routing() {
     let expected = r#"{"create":{"_index":"logs-generic-something","_type":"_doc"}}
 {"@timestamp":"2020-12-01T01:02:03Z","data_stream":{"dataset":"testing","namespace":"something","type":"synthetics"},"message":"hello there"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
@@ -311,11 +341,11 @@ async fn encode_datastream_mode_no_routing() {
 async fn handle_metrics() {
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("create"),
+            action: parse_unconfined("create"),
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
     };
@@ -342,41 +372,43 @@ async fn handle_metrics() {
     assert_eq!(encoded_lines.len(), 3); // there's an empty line at the end
     assert_eq!(
         encoded_lines.first().unwrap(),
-        r#"{"create":{"_index":"vector","_type":"_doc"}}"#
+        r#"{"create":{"_type":"_doc","_index":"vector"}}"#
     );
-    assert!(encoded_lines
-        .get(1)
-        .unwrap()
-        .starts_with(r#"{"gauge":{"value":42.0},"kind":"absolute","name":"cpu","timestamp""#));
+    assert!(
+        encoded_lines
+            .get(1)
+            .unwrap()
+            .starts_with(r#"{"gauge":{"value":42.0},"kind":"absolute","name":"cpu","timestamp""#)
+    );
 }
 
 #[tokio::test]
 async fn decode_bulk_action_error() {
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("{{ action }}"),
+            action: parse_unconfined("{{ action }}"),
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V7,
         ..Default::default()
     };
     let es = ElasticsearchCommon::parse_single(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello world");
-    log.insert("foo", "bar");
-    log.insert("idx", "purple");
+    log.insert(event_path!("foo"), "bar");
+    log.insert(event_path!("idx"), "purple");
     let action = es.mode.bulk_action(&log);
     assert!(action.is_none());
 }
 
-/// validates that the configuration parsing for ElasticsearchCommon succeeds when BulkConfig is
+/// validates that the configuration parsing for `ElasticsearchCommon` succeeds when `BulkConfig` is
 /// not explicitly set in the configuration (using defaults).
 #[tokio::test]
 async fn default_bulk_settings() {
     let config = ElasticsearchConfig {
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V7,
         ..Default::default()
     };
@@ -387,11 +419,11 @@ async fn default_bulk_settings() {
 async fn decode_bulk_action() {
     let config = ElasticsearchConfig {
         bulk: BulkConfig {
-            action: parse_template("create"),
+            action: parse_unconfined("create"),
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V7,
         ..Default::default()
     };
@@ -413,7 +445,7 @@ async fn encode_datastream_mode_no_sync() {
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         mode: ElasticsearchMode::DataStream,
         data_stream: Some(DataStreamConfig {
             namespace: Template::try_from("something").unwrap(),
@@ -428,7 +460,7 @@ async fn encode_datastream_mode_no_sync() {
 
     let mut log = LogEvent::from("hello there");
     log.insert(
-        "data_stream",
+        event_path!("data_stream"),
         data_stream_body(
             Some("synthetics".to_string()),
             Some("testing".to_string()),
@@ -455,7 +487,7 @@ async fn encode_datastream_mode_no_sync() {
     let expected = r#"{"create":{"_index":"synthetics-testing-something","_type":"_doc"}}
 {"@timestamp":"2020-12-01T01:02:03Z","data_stream":{"dataset":"testing","type":"synthetics"},"message":"hello there"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
@@ -468,15 +500,18 @@ async fn allows_using_except_fields() {
         },
         encoding: Transformer::new(None, Some(vec!["idx".into(), "timestamp".into()]), None)
             .unwrap(),
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
+        // The `{{ idx }}` index has no literal prefix to confine to; opt out so the test can
+        // exercise field encoding rather than confinement.
+        confinement: ConfinementConfig::unconfined(),
         ..Default::default()
     };
     let es = ElasticsearchCommon::parse_single(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
-    log.insert("foo", "bar");
-    log.insert("idx", "purple");
+    log.insert(event_path!("foo"), "bar");
+    log.insert(event_path!("idx"), "purple");
 
     let mut encoded = vec![];
     let (encoded_size, _json_size) = es
@@ -491,7 +526,7 @@ async fn allows_using_except_fields() {
     let expected = r#"{"index":{"_index":"purple","_type":"_doc"}}
 {"foo":"bar","message":"hello there"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
@@ -503,15 +538,18 @@ async fn allows_using_only_fields() {
             ..Default::default()
         },
         encoding: Transformer::new(Some(vec!["foo".into()]), None, None).unwrap(),
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         api_version: ElasticsearchApiVersion::V6,
+        // The `{{ idx }}` index has no literal prefix to confine to; opt out so the test can
+        // exercise field encoding rather than confinement.
+        confinement: ConfinementConfig::unconfined(),
         ..Default::default()
     };
     let es = ElasticsearchCommon::parse_single(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
-    log.insert("foo", "bar");
-    log.insert("idx", "purple");
+    log.insert(event_path!("foo"), "bar");
+    log.insert(event_path!("idx"), "purple");
 
     let mut encoded = vec![];
     let (encoded_size, _json_size) = es
@@ -526,11 +564,16 @@ async fn allows_using_only_fields() {
     let expected = r#"{"index":{"_index":"purple","_type":"_doc"}}
 {"foo":"bar"}
 "#;
-    assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
+    assert_expected_is_encoded(expected, &encoded);
     assert_eq!(encoded.len(), encoded_size);
 }
 
 #[tokio::test]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the routing test cases together."
+)]
 async fn datastream_index_name() {
     #[derive(Clone, Debug)]
     struct TestCase {
@@ -545,7 +588,7 @@ async fn datastream_index_name() {
             index: parse_template("vector"),
             ..Default::default()
         },
-        endpoints: vec![String::from("https://example.com")],
+        endpoints: vec![HttpEndpoint::parse("https://example.com").unwrap()],
         mode: ElasticsearchMode::DataStream,
         api_version: ElasticsearchApiVersion::V6,
         ..Default::default()
@@ -561,7 +604,7 @@ async fn datastream_index_name() {
         },
         TestCase {
             dtype: Some("type".to_string()),
-            dataset: Some("".to_string()),
+            dataset: Some(String::new()),
             namespace: Some("namespace".to_string()),
             want: "type-namespace".to_string(),
         },
@@ -573,8 +616,8 @@ async fn datastream_index_name() {
         },
         TestCase {
             dtype: Some("type".to_string()),
-            dataset: Some("".to_string()),
-            namespace: Some("".to_string()),
+            dataset: Some(String::new()),
+            namespace: Some(String::new()),
             want: "type".to_string(),
         },
         TestCase {
@@ -584,10 +627,10 @@ async fn datastream_index_name() {
             want: "type-generic-default".to_string(),
         },
         TestCase {
-            dtype: Some("".to_string()),
-            dataset: Some("".to_string()),
-            namespace: Some("".to_string()),
-            want: "".to_string(),
+            dtype: Some(String::new()),
+            dataset: Some(String::new()),
+            namespace: Some(String::new()),
+            want: String::new(),
         },
         TestCase {
             dtype: None,
@@ -596,7 +639,7 @@ async fn datastream_index_name() {
             want: "logs-generic-default".to_string(),
         },
         TestCase {
-            dtype: Some("".to_string()),
+            dtype: Some(String::new()),
             dataset: Some("dataset".to_string()),
             namespace: Some("namespace".to_string()),
             want: "dataset-namespace".to_string(),
@@ -608,8 +651,8 @@ async fn datastream_index_name() {
             want: "logs-dataset-namespace".to_string(),
         },
         TestCase {
-            dtype: Some("".to_string()),
-            dataset: Some("".to_string()),
+            dtype: Some(String::new()),
+            dataset: Some(String::new()),
             namespace: Some("namespace".to_string()),
             want: "namespace".to_string(),
         },
@@ -620,9 +663,9 @@ async fn datastream_index_name() {
             want: "logs-generic-namespace".to_string(),
         },
         TestCase {
-            dtype: Some("".to_string()),
+            dtype: Some(String::new()),
             dataset: Some("dataset".to_string()),
-            namespace: Some("".to_string()),
+            namespace: Some(String::new()),
             want: "dataset".to_string(),
         },
         TestCase {
@@ -636,7 +679,7 @@ async fn datastream_index_name() {
     for test_case in test_cases {
         let mut log = LogEvent::from("hello there");
         log.insert(
-            "data_stream",
+            event_path!("data_stream"),
             data_stream_body(
                 test_case.dtype.clone(),
                 test_case.dataset.clone(),
@@ -647,4 +690,95 @@ async fn datastream_index_name() {
         let processed_event = process_log(log, &es.mode, None, &config.encoding).unwrap();
         assert_eq!(processed_event.index, test_case.want, "{test_case:?}");
     }
+}
+
+#[tokio::test]
+async fn test_parse_config_with_uri_auth() {
+    let config = ElasticsearchConfig {
+        endpoints: vec![HttpEndpoint::parse("http://user:pass@localhost:9200").unwrap()],
+        ..Default::default()
+    };
+    let proxy = ProxyConfig::default();
+    let mut version = None;
+    let endpoint = HttpEndpoint::parse("http://user:pass@localhost:9200").unwrap();
+
+    let result = ElasticsearchCommon::parse_config(&config, &endpoint, &proxy, &mut version).await;
+    assert!(result.is_ok());
+    let common = result.unwrap();
+
+    assert!(
+        common.auth.is_some(),
+        "Expected auth to be the one provided in the uri, got None"
+    );
+
+    let expected_auth = crate::http::Auth::Basic {
+        user: "user".to_string(),
+        password: SensitiveString::from("pass".to_string()),
+    };
+
+    let got_auth_inner = match common.auth.as_ref().unwrap() {
+        Auth::Basic(auth) => auth,
+        #[cfg(feature = "aws-core")]
+        Auth::Aws { .. } => panic!("Expected auth to be Basic"),
+    };
+
+    assert_eq!(
+        *got_auth_inner, expected_auth,
+        "Expected auth to be Basic with user 'user' and password 'pass'"
+    );
+}
+
+#[tokio::test]
+async fn test_parse_config_with_config_auth() {
+    let config = ElasticsearchConfig {
+        auth: Some(ElasticsearchAuthConfig::Basic {
+            user: "config_user".to_string(),
+            password: SensitiveString::from("config_pass".to_string()),
+        }),
+        endpoints: vec![HttpEndpoint::parse("http://localhost:9200").unwrap()],
+        ..Default::default()
+    };
+    let proxy = ProxyConfig::default();
+    let mut version = None;
+    let endpoint = HttpEndpoint::parse("http://localhost:9200").unwrap();
+
+    let result = ElasticsearchCommon::parse_config(&config, &endpoint, &proxy, &mut version).await;
+    assert!(result.is_ok());
+    let common = result.unwrap();
+
+    let expected_auth = crate::http::Auth::Basic {
+        user: "config_user".to_string(),
+        password: SensitiveString::from("config_pass".to_string()),
+    };
+
+    let got_auth_inner = match common.auth.as_ref().unwrap() {
+        Auth::Basic(auth) => auth,
+        #[cfg(feature = "aws-core")]
+        Auth::Aws { .. } => panic!("Expected auth to be Basic"),
+    };
+
+    assert_eq!(
+        *got_auth_inner, expected_auth,
+        "Expected auth to be Basic with user 'user' and password 'pass'"
+    );
+}
+
+#[tokio::test]
+async fn test_parse_config_with_conflicting_auth() {
+    let config = ElasticsearchConfig {
+        auth: Some(ElasticsearchAuthConfig::Basic {
+            user: "config_user".to_string(),
+            password: SensitiveString::from("config_pass".to_string()),
+        }),
+        endpoints: vec![HttpEndpoint::parse("http://uri_user:uri_pass@localhost:9200").unwrap()],
+        ..Default::default()
+    };
+    let proxy = ProxyConfig::default();
+    let mut version = None;
+    let endpoint = HttpEndpoint::parse("http://uri_user:uri_pass@localhost:9200").unwrap();
+
+    let result = ElasticsearchCommon::parse_config(&config, &endpoint, &proxy, &mut version).await;
+
+    // Should fail due to auth being specified in both places
+    assert!(result.is_err());
 }

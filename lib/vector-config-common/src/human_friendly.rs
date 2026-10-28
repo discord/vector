@@ -1,14 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
 use convert_case::{Boundary, Case, Converter};
-use once_cell::sync::Lazy;
 
 /// Well-known replacements.
 ///
 /// Replacements are instances of strings with unique capitalization that cannot be achieved
 /// programmatically, as well as the potential insertion of additional characters, such as the
 /// replacement of "pubsub" with "Pub/Sub".
-static WELL_KNOWN_REPLACEMENTS: Lazy<HashMap<String, &'static str>> = Lazy::new(|| {
+static WELL_KNOWN_REPLACEMENTS: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
     let pairs = vec![
         ("eventstoredb", "EventStoreDB"),
         ("mongodb", "MongoDB"),
@@ -23,7 +25,6 @@ static WELL_KNOWN_REPLACEMENTS: Lazy<HashMap<String, &'static str>> = Lazy::new(
         ("influxdb", "InfluxDB"),
         ("webhdfs", "WebHDFS"),
         ("cloudwatch", "CloudWatch"),
-        ("logdna", "LogDNA"),
         ("geoip", "GeoIP"),
         ("ssekms", "SSE-KMS"),
         ("aes256", "AES-256"),
@@ -43,7 +44,7 @@ static WELL_KNOWN_REPLACEMENTS: Lazy<HashMap<String, &'static str>> = Lazy::new(
 /// Acronyms are distinct from replacements because they should be entirely capitalized (i.e. "aws"
 /// or "aWs" or "Aws" should always be replaced with "AWS") whereas replacements may insert
 /// additional characters or capitalize specific characters within the original string.
-static WELL_KNOWN_ACRONYMS: Lazy<HashSet<String>> = Lazy::new(|| {
+static WELL_KNOWN_ACRONYMS: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let acronyms = &[
         "api", "amqp", "aws", "ec2", "ecs", "gcp", "hec", "http", "https", "nats", "nginx", "s3",
         "sqs", "tls", "ssl", "otel", "gelf", "csv", "json", "rfc3339", "lz4", "us", "eu", "bsd",
@@ -57,12 +58,12 @@ static WELL_KNOWN_ACRONYMS: Lazy<HashSet<String>> = Lazy::new(|| {
 /// Generates a human-friendly version of the given string.
 ///
 /// Many instances exist where type names, or string constants, represent a condensed form of an
-/// otherwise human-friendly/recognize string, such as "aws_s3" (for AWS S3) or "InfluxdbMetrics"
-/// (for InfluxDB Metrics) and so on.
+/// otherwise human-friendly/recognize string, such as "`aws_s3`" (for AWS S3) or "`InfluxdbMetrics`"
+/// (for `InfluxDB` Metrics) and so on.
 ///
 /// This function takes a given input and restores it back to the human-friendly version by
 /// splitting it on the relevant word boundaries, adjusting the input to title case, and applying
-/// well-known replacements to ensure that brand-specific casing (such as "CloudWatch" instead of
+/// well-known replacements to ensure that brand-specific casing (such as "`CloudWatch`" instead of
 /// "Cloudwatch", or handling acronyms like AWS, GCP, and so on) makes it into the final version.
 pub fn generate_human_friendly_string(input: &str) -> String {
     // Create our case converter, which specifically ignores letter/digit boundaries, which is

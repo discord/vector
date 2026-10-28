@@ -1,16 +1,22 @@
-use crate::sinks::{
-    greptimedb::metrics::{batch::GreptimeDBBatchSizer, request_builder::metric_to_insert_request},
-    prelude::*,
-};
-use greptimedb_ingester::{api::v1::*, Error as GreptimeError};
 use std::num::NonZeroUsize;
+
+use greptimedb_ingester::Error as GreptimeError;
+use greptimedb_ingester::api::v1::RowInsertRequests;
 use vector_lib::event::Metric;
 
-/// GreptimeDBGrpcRequest is a wrapper around the RowInsertRequests
+use crate::sinks::{
+    greptimedb::metrics::{
+        batch::GreptimeDBBatchSizer,
+        request_builder::{RequestBuilderOptions, metric_to_insert_request},
+    },
+    prelude::*,
+};
+
+/// `GreptimeDBGrpcRequest` is a wrapper around the `RowInsertRequests`
 /// that is used to send metrics to GreptimeDB.
 /// It also contains the finalizers and metadata that are used to
 #[derive(Clone)]
-pub(super) struct GreptimeDBGrpcRequest {
+pub struct GreptimeDBGrpcRequest {
     pub(super) items: RowInsertRequests,
     pub(super) finalizers: EventFinalizers,
     pub(super) metadata: RequestMetadata,
@@ -18,20 +24,19 @@ pub(super) struct GreptimeDBGrpcRequest {
 
 impl GreptimeDBGrpcRequest {
     // convert metrics event to GreptimeDBGrpcRequest
-    pub(super) fn from_metrics(metrics: Vec<Metric>) -> Self {
+    pub(super) fn from_metrics(metrics: Vec<Metric>, options: &RequestBuilderOptions) -> Self {
         let mut items = Vec::with_capacity(metrics.len());
         let mut finalizers = EventFinalizers::default();
         let mut request_metadata_builder = RequestMetadataBuilder::default();
 
-        let sizer = GreptimeDBBatchSizer;
         let mut estimated_request_size = 0;
-        for mut metric in metrics.into_iter() {
+        for mut metric in metrics {
             finalizers.merge(metric.take_finalizers());
-            estimated_request_size += sizer.estimated_size_of(&metric);
+            estimated_request_size += GreptimeDBBatchSizer::estimated_size_of(&metric);
 
-            request_metadata_builder.track_event(metric.clone());
+            request_metadata_builder.track_event(&metric);
 
-            items.push(metric_to_insert_request(metric));
+            items.push(metric_to_insert_request(&metric, options));
         }
 
         let request_size =
@@ -61,7 +66,7 @@ impl MetaDescriptive for GreptimeDBGrpcRequest {
     }
 }
 
-/// GreptimeDBGrpcBatchOutput is the output of the [`GreptimeDBGrpcService`]
+/// `GreptimeDBGrpcBatchOutput` is the output of the [`GreptimeDBGrpcService`]
 #[derive(Debug)]
 pub struct GreptimeDBGrpcBatchOutput {
     pub _item_count: u32,
@@ -82,13 +87,14 @@ impl DriverResponse for GreptimeDBGrpcBatchOutput {
     }
 }
 
-/// GreptimeDBGrpcRetryLogic is the retry logic for the [`GreptimeDBGrpcSink`]
+/// `GreptimeDBGrpcRetryLogic` is the retry logic for the [`GreptimeDBGrpcSink`]
 #[derive(Clone, Default)]
 pub struct GreptimeDBGrpcRetryLogic;
 
 impl RetryLogic for GreptimeDBGrpcRetryLogic {
-    type Response = GreptimeDBGrpcBatchOutput;
     type Error = GreptimeError;
+    type Request = GreptimeDBGrpcRequest;
+    type Response = GreptimeDBGrpcBatchOutput;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
         error.is_retriable()

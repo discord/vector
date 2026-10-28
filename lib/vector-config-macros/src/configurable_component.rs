@@ -1,14 +1,13 @@
-use darling::{ast::NestedMeta, Error, FromMeta};
+use darling::{Error, FromMeta, ast::NestedMeta};
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, quote_spanned};
 use syn::{
-    parse_macro_input, parse_quote, parse_quote_spanned, punctuated::Punctuated, spanned::Spanned,
-    token::Comma, DeriveInput, Lit, LitStr, Meta, MetaList, Path,
+    DeriveInput, Lit, LitStr, Meta, MetaList, Path, parse_macro_input, parse_quote,
+    parse_quote_spanned, punctuated::Punctuated, spanned::Spanned, token::Comma,
 };
 use vector_config_common::{
-    configurable_package_name_hack, constants::ComponentType,
-    human_friendly::generate_human_friendly_string,
+    constants::ComponentType, human_friendly::generate_human_friendly_string,
 };
 
 use crate::attrs;
@@ -68,7 +67,7 @@ impl TypedComponent {
 
     /// Gets the component name, if one was specified.
     fn get_component_name(&self) -> Option<String> {
-        self.component_name.as_ref().map(|s| s.value())
+        self.component_name.as_ref().map(syn::LitStr::value)
     }
 
     /// Creates the component description registration code based on the original derive input.
@@ -79,25 +78,30 @@ impl TypedComponent {
         &self,
         input: &DeriveInput,
     ) -> Option<proc_macro2::TokenStream> {
-        let vector_config = configurable_package_name_hack();
         self.component_name.as_ref().map(|component_name| {
             let config_ty = &input.ident;
             let desc_ty: syn::Type = match self.component_type {
+                ComponentType::Api => {
+                    parse_quote! { ::vector_config::component::ApiDescription }
+                }
                 ComponentType::EnrichmentTable => {
-                    parse_quote! { #vector_config::component::EnrichmentTableDescription }
+                    parse_quote! { ::vector_config::component::EnrichmentTableDescription }
+                }
+                ComponentType::GlobalOption => {
+                    parse_quote! { ::vector_config::component::GlobalOptionDescription }
                 }
                 ComponentType::Provider => {
-                    parse_quote! { #vector_config::component::ProviderDescription }
+                    parse_quote! { ::vector_config::component::ProviderDescription }
                 }
                 ComponentType::Secrets => {
-                    parse_quote! { #vector_config::component::SecretsDescription }
+                    parse_quote! { ::vector_config::component::SecretsDescription }
                 }
-                ComponentType::Sink => parse_quote! { #vector_config::component::SinkDescription },
+                ComponentType::Sink => parse_quote! { ::vector_config::component::SinkDescription },
                 ComponentType::Source => {
-                    parse_quote! { #vector_config::component::SourceDescription }
+                    parse_quote! { ::vector_config::component::SourceDescription }
                 }
                 ComponentType::Transform => {
-                    parse_quote! { #vector_config::component::TransformDescription }
+                    parse_quote! { ::vector_config::component::TransformDescription }
                 }
             };
 
@@ -109,11 +113,10 @@ impl TypedComponent {
             let logical_name = logical_name.strip_suffix("Config").unwrap_or(&logical_name);
 
             // TODO: Make this an `expect` once all component types have been converted.
-            let description = self
-                .description
-                .as_ref()
-                .map(LitStr::value)
-                .unwrap_or_else(|| "This component is missing a description.".into());
+            let description = self.description.as_ref().map_or_else(
+                || "This component is missing a description.".into(),
+                LitStr::value,
+            );
 
             quote! {
                 ::inventory::submit! {
@@ -131,14 +134,13 @@ impl TypedComponent {
     /// Creates the component name registration code.
     fn get_component_name_registration(&self) -> proc_macro2::TokenStream {
         let helper_attr = get_named_component_helper_ident(self.component_type);
-        let vector_config = configurable_package_name_hack();
         match self.component_name.as_ref() {
             None => quote_spanned! {self.span=>
-                #[derive(#vector_config::NamedComponent)]
+                #[derive(::vector_config::NamedComponent)]
                 #[#helper_attr]
             },
             Some(component_name) => quote_spanned! {self.span=>
-                #[derive(#vector_config::NamedComponent)]
+                #[derive(::vector_config::NamedComponent)]
                 #[#helper_attr(#component_name)]
             },
         }
@@ -235,6 +237,9 @@ impl FromMeta for Options {
                 }
 
                 NestedMeta::Lit(lit) => errors.push(Error::unexpected_lit_type(lit)),
+                NestedMeta::NameValueInvalidExpr(invalid) => {
+                    errors.push(invalid.error.clone().with_span(nm));
+                }
             }
         }
 
@@ -309,9 +314,8 @@ pub fn configurable_component_impl(args: TokenStream, item: TokenStream) -> Toke
 
     // Generate and apply all of the necessary derives.
     let mut derives = Punctuated::<Path, Comma>::new();
-    let vector_config = configurable_package_name_hack();
     derives.push(parse_quote_spanned! {input.ident.span()=>
-        #vector_config::Configurable
+        ::vector_config::Configurable
     });
 
     if !options.skip_derive_ser() {
@@ -327,7 +331,7 @@ pub fn configurable_component_impl(args: TokenStream, item: TokenStream) -> Toke
     }
 
     // Final assembly.
-    let derived = quote! {
+    let expanded = quote! {
         #[derive(#derives)]
         #component_type
         #maybe_component_name
@@ -335,7 +339,7 @@ pub fn configurable_component_impl(args: TokenStream, item: TokenStream) -> Toke
         #maybe_component_desc
     };
 
-    derived.into()
+    expanded.into()
 }
 
 /// Gets the ident of the component type-specific helper attribute for the `NamedComponent` derive.
@@ -351,7 +355,9 @@ pub fn configurable_component_impl(args: TokenStream, item: TokenStream) -> Toke
 /// derive for `NamedComponent`.
 fn get_named_component_helper_ident(component_type: ComponentType) -> Ident {
     let attr = match component_type {
+        ComponentType::Api => attrs::API_COMPONENT,
         ComponentType::EnrichmentTable => attrs::ENRICHMENT_TABLE_COMPONENT,
+        ComponentType::GlobalOption => attrs::GLOBAL_OPTION_COMPONENT,
         ComponentType::Provider => attrs::PROVIDER_COMPONENT,
         ComponentType::Secrets => attrs::SECRETS_COMPONENT,
         ComponentType::Sink => attrs::SINK_COMPONENT,

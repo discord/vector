@@ -1,36 +1,39 @@
-use super::default_host_key;
+use std::net::{Ipv4Addr, SocketAddr};
+
 use bytes::BytesMut;
 use chrono::Utc;
 use futures::StreamExt;
 use listenfd::ListenFd;
-use tokio_util::codec::FramedRead;
-use vector_lib::codecs::{
-    decoding::{DeserializerConfig, FramingConfig},
-    StreamDecodingError,
-};
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol};
-use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path};
 use vector_lib::{
-    config::{LegacyKey, LogNamespace},
     EstimatedJsonEncodedSizeOf,
+    codecs::{
+        DecoderFramedRead, StreamDecodingError,
+        decoding::{DeserializerConfig, FramingConfig},
+    },
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
+    lookup::{lookup_v2::OptionalValuePath, owned_value_path, path},
 };
 
+use super::default_host_key;
 use crate::{
+    SourceSender,
     codecs::Decoder,
     event::Event,
     internal_events::{
-        SocketBindError, SocketEventsReceived, SocketMode, SocketReceiveError, StreamClosedError,
+        SocketBindError, SocketEventsReceived, SocketMode, SocketMulticastGroupJoinError,
+        SocketReceiveError, StreamClosedError,
     },
     net,
-    serde::{default_decoding, default_framing_message_based},
+    serde::default_decoding,
     shutdown::ShutdownSignal,
+    sources::SourceError,
     sources::{
-        socket::SocketConfig,
-        util::net::{try_bind_udp_socket, SocketListenAddr},
         Source,
+        socket::SocketConfig,
+        util::net::{SocketListenAddr, try_bind_udp_socket},
     },
-    SourceSender,
 };
 
 /// UDP configuration for the `socket` source.
@@ -38,8 +41,38 @@ use crate::{
 #[serde(deny_unknown_fields)]
 #[derive(Clone, Debug)]
 pub struct UdpConfig {
-    #[configurable(derived)]
     address: SocketListenAddr,
+
+    /// List of IPv4 multicast groups to join on socket's binding process.
+    ///
+    /// In order to read multicast packets, this source's listening address should be set to `0.0.0.0`.
+    /// If any other address is used (such as `127.0.0.1` or an specific interface address), the
+    /// listening interface will filter out all multicast packets received,
+    /// as their target IP would be the one of the multicast group
+    /// and it will not match the socket's bound IP.
+    ///
+    /// Note that this setting will only work if the source's address
+    /// is an IPv4 address (IPv6 and systemd file descriptor as source's address are not supported
+    /// with multicast groups).
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "['224.0.0.2', '224.0.0.4']"))]
+    pub(super) multicast_groups: Vec<Ipv4Addr>,
+
+    /// The IPv4 interface address used when joining multicast groups.
+    ///
+    /// Specifies which local network interface to use for receiving multicast traffic.
+    /// When not set, defaults to the socket's binding address.
+    ///
+    /// Set this explicitly when the host has multiple interfaces and you need to control
+    /// which one receives multicast traffic. For example, `127.0.0.1` restricts multicast
+    /// reception to the loopback interface.
+    ///
+    /// On macOS, specifying `0.0.0.0` only joins on the default network interface (typically
+    /// the primary Ethernet or Wi-Fi interface), unlike Linux, which joins on all interfaces.
+    /// If multicast traffic is expected on a specific interface (including loopback), set this
+    /// field explicitly.
+    #[serde(default)]
+    pub(super) multicast_interface: Option<Ipv4Addr>,
 
     /// The maximum buffer size of incoming messages.
     ///
@@ -73,13 +106,10 @@ pub struct UdpConfig {
     #[configurable(metadata(docs::type_unit = "bytes"))]
     receive_buffer_bytes: Option<usize>,
 
-    #[configurable(derived)]
-    #[serde(default = "default_framing_message_based")]
-    pub(super) framing: FramingConfig,
+    pub(super) framing: Option<FramingConfig>,
 
-    #[configurable(derived)]
     #[serde(default = "default_decoding")]
-    decoding: DeserializerConfig,
+    pub(super) decoding: DeserializerConfig,
 
     /// The namespace to use for logs. This overrides the global setting.
     #[serde(default)]
@@ -91,7 +121,7 @@ fn default_port_key() -> OptionalValuePath {
     OptionalValuePath::from(owned_value_path!("port"))
 }
 
-fn default_max_length() -> usize {
+const fn default_max_length() -> usize {
     crate::serde::default_max_length()
 }
 
@@ -100,12 +130,13 @@ impl UdpConfig {
         self.host_key.clone().unwrap_or(default_host_key())
     }
 
+    #[must_use]
     pub const fn port_key(&self) -> &OptionalValuePath {
         &self.port_key
     }
 
-    pub(super) const fn framing(&self) -> &FramingConfig {
-        &self.framing
+    pub(super) const fn framing(&self) -> Option<&FramingConfig> {
+        self.framing.as_ref()
     }
 
     pub(super) const fn decoding(&self) -> &DeserializerConfig {
@@ -116,25 +147,32 @@ impl UdpConfig {
         self.address
     }
 
+    #[must_use]
     pub fn from_address(address: SocketListenAddr) -> Self {
         Self {
             address,
+            multicast_groups: Vec::new(),
+            multicast_interface: None,
             max_length: default_max_length(),
             host_key: None,
             port_key: default_port_key(),
             receive_buffer_bytes: None,
-            framing: default_framing_message_based(),
+            framing: None,
             decoding: default_decoding(),
             log_namespace: None,
         }
     }
 
-    pub fn set_log_namespace(&mut self, val: Option<bool>) -> &mut Self {
+    pub const fn set_log_namespace(&mut self, val: Option<bool>) -> &mut Self {
         self.log_namespace = val;
         self
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
 pub(super) fn udp(
     config: UdpConfig,
     decoder: Decoder,
@@ -149,14 +187,45 @@ pub(super) fn udp(
             .map_err(|error| {
                 emit!(SocketBindError {
                     mode: SocketMode::Udp,
-                    error,
-                })
+                    error: &error,
+                });
+                SourceError::from(error)
             })?;
 
-        if let Some(receive_buffer_bytes) = config.receive_buffer_bytes {
-            if let Err(error) = net::set_receive_buffer_size(&socket, receive_buffer_bytes) {
-                warn!(message = "Failed configuring receive buffer size on UDP socket.", %error);
+        if !config.multicast_groups.is_empty() {
+            socket.set_multicast_loop_v4(true).unwrap();
+            let listen_addr = match config.address() {
+                SocketListenAddr::SocketAddr(SocketAddr::V4(addr)) => addr,
+                SocketListenAddr::SocketAddr(SocketAddr::V6(_)) => {
+                    // We could support Ipv6 multicast with the
+                    // https://doc.rust-lang.org/std/net/struct.UdpSocket.html#method.join_multicast_v6 method
+                    // and specifying the interface index as `0`, in order to bind all interfaces.
+                    unimplemented!("IPv6 multicast is not supported")
+                }
+                SocketListenAddr::SystemdFd(_) => {
+                    unimplemented!("Multicast for systemd fd sockets is not supported")
+                }
+            };
+            for group_addr in config.multicast_groups {
+                let interface = config.multicast_interface.unwrap_or(*listen_addr.ip());
+                socket
+                    .join_multicast_v4(group_addr, interface)
+                    .map_err(|error| {
+                        emit!(SocketMulticastGroupJoinError {
+                            error: &error,
+                            group_addr,
+                            interface,
+                        });
+                        SourceError::from(error)
+                    })?;
+                info!(message = "Joined multicast group.", group = %group_addr);
             }
+        }
+
+        if let Some(receive_buffer_bytes) = config.receive_buffer_bytes
+            && let Err(error) = net::set_receive_buffer_size(&socket, receive_buffer_bytes)
+        {
+            warn!(message = "Failed configuring receive buffer size on UDP socket.", %error);
         }
 
         let mut max_length = config.max_length;
@@ -168,7 +237,6 @@ pub(super) fn udp(
         let bytes_received = register!(BytesReceived::from(Protocol::UDP));
 
         info!(message = "Listening.", address = %config.address);
-
         // We add 1 to the max_length in order to determine if the received data has been truncated.
         let mut buf = BytesMut::with_capacity(max_length + 1);
         loop {
@@ -184,26 +252,25 @@ pub(super) fn udp(
                                     // 10040 is the Windows error that the Udp message has exceeded max_length
                                     warn!(
                                         message = "Discarding frame larger than max_length.",
-                                        max_length = max_length,
-                                        internal_log_rate_limit = true
+                                        max_length = max_length
                                     );
                                     continue;
                                 }
                             }
 
-                            return Err(emit!(SocketReceiveError {
+                            emit!(SocketReceiveError {
                                 mode: SocketMode::Udp,
-                                error
-                            }));
+                                error: &error
+                            });
+                            return Err(SourceError::from(error));
                        }
                     };
 
                     bytes_received.emit(ByteSize(byte_size));
-
                     let payload = buf.split_to(byte_size);
                     let truncated = byte_size == max_length + 1;
-
-                    let mut stream = FramedRead::new(payload.as_ref(), decoder.clone()).peekable();
+                    let mut stream =
+                        DecoderFramedRead::new(payload.as_ref(), decoder.clone()).peekable();
 
                     while let Some(result) = stream.next().await {
                         let last = Pin::new(&mut stream).peek().await.is_none();
@@ -214,8 +281,7 @@ pub(super) fn udp(
                                     _ = events.pop();
                                     warn!(
                                         message = "Discarding frame larger than max_length.",
-                                        max_length = max_length,
-                                        internal_log_rate_limit = true
+                                        max_length = max_length
                                     );
                                 }
 
@@ -233,7 +299,7 @@ pub(super) fn udp(
                                 let now = Utc::now();
 
                                 for event in &mut events {
-                                    if let Event::Log(ref mut log) = event {
+                                    if let Event::Log(log) = event {
                                         log_namespace.insert_standard_vector_source_metadata(
                                             log,
                                             SocketConfig::NAME,
@@ -277,7 +343,7 @@ pub(super) fn udp(
                                 }
                             }
                             Err(error) => {
-                                // Error is logged by `crate::codecs::Decoder`, no
+                                // Error is logged by `vector_lib::codecs::Decoder`, no
                                 // further handling is needed here.
                                 if !error.can_continue() {
                                     break;

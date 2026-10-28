@@ -1,318 +1,274 @@
 # Regression Detection Suite
 #
 # This workflow runs under the following conditions:
-#    - in the merge queue if any source files were modified, added or deleted.
-#    - on demand by a PR review matching either of:
-#      - '/ci-run-regression'
-#      - '/ci-run-all'
-#      (the comment issuer must be a member of the Vector GH team)
+#   - Once per week, based on a schedule
+#   - On demand, triggered from https://github.com/vectordotdev/vector/actions/workflows/regression.yml
+#   - On demand, via the `/ci-run-regression` (or `/ci-run-all`) PR review comment,
+#     which invokes this workflow via `workflow_call` from `ci-review-trigger.yml`.
 #
-# This workflow runs our regression detection experiments, which are relative
-# evaluations of the base SHA and head SHA, whose determination depends on how
-# the workflow is invoked.
+# The workflow accepts two optional inputs:
+#   - The baseline ref:
+#     - If not specified, the SHA from 7 days ago on origin/master is used.
+#   - The comparison ref:
+#     - If not specified, the current HEAD of origin/master is used.
 #
-# The goal is to give quick-ish feedback on all-up Vector for a variety of configs
-# as to whether throughput performance has gone down, gotten more variable in the
-# pushed SHA.
+# Both inputs accept any git ref that `git rev-parse` can resolve: a full commit
+# SHA, a short SHA, a branch name (e.g. `origin/master`), or a tag.
 #
-# Regression detection is always done relative to the pushed SHA, meaning any
-# changes you introduce to the experiment will be picked up both for the base
-# SHA variant and your current SHA.
+# This workflow runs regression detection experiments, performing relative
+# evaluations of the baseline SHA and comparison SHA. The exact SHAs are determined
+# by how the workflow is triggered.
 #
-# Docker image tags are SHA-SHA. The first SHA is the one that triggered this
-# workflow, the second is the one of the Vector being tested.
-# For comparison images the two SHAs are identical.
+# The goal is to provide quick feedback on Vector's performance across a variety
+# of configurations, checking if throughput performance has degraded or become
+# more variable in the comparison SHA relative to the baseline SHA.
+#
+# Docker image tags are based on the resolved SHAs.
 
 name: Regression Detection Suite
 
 on:
-  merge_group:
-    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      baseline-sha:
+        description: "Baseline git ref (full/short SHA, branch such as `origin/master`, or tag). Defaults to the SHA from 7 days ago."
+        required: false
+      comparison-sha:
+        description: "Comparison git ref (full/short SHA, branch such as `origin/master`, or tag). Defaults to the current HEAD of origin/master."
+        required: false
   workflow_call:
-  # Don't want to run this on each PR commit, but because GH doesn't allow specifying different required checks
-  # for pull request and merge queue, we need to "run" it in pull request, but in the jobs we will just auto pass.
-  pull_request:
+    inputs:
+      baseline-sha:
+        description: "Baseline git ref (full/short SHA, branch such as `origin/master`, or tag). Defaults to the SHA from 7 days ago."
+        required: false
+        type: string
+      comparison-sha:
+        description: "Comparison git ref (full/short SHA, branch such as `origin/master`, or tag). Defaults to the current HEAD of origin/master."
+        required: false
+        type: string
+  schedule:
+    - cron: "0 7 * * 1" # Runs at 7 AM UTC on Mondays
 
-concurrency:
-  # In flight runs will be canceled only by re-trigger through the merge queue or if additional PR commits are pushed.
-  # The comment.html_url should always be unique.
-  group: ${{ github.workflow }}-${{ github.event.comment.html_url || github.ref }}
-  cancel-in-progress: true
+# Workflow-level permissions - read access to repository contents
+permissions:
+  contents: read # Required to checkout code
 
 env:
   SINGLE_MACHINE_PERFORMANCE_API: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_API }}
   SMP_WARMUP_SECONDS: 70 # default is 45 seconds
+  SMP_REPLICAS: 100 # default is 10
 
 jobs:
-
-  # Only run this workflow if files changed in areas that could possibly introduce a regression
-  should-run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    if: github.event_name != 'pull_request'
+  resolve-inputs:
+    if: ${{ github.repository == 'vectordotdev/vector' }}
+    runs-on: ubuntu-24.04
     outputs:
-      source_changed: ${{ steps.filter.outputs.SOURCE_CHANGED }}
-      comment_valid: ${{ steps.comment.outputs.isTeamMember }}
-    steps:
-    - uses: actions/checkout@v3
-
-    - name: Collect file changes
-      id: changes
-      if: github.event_name == 'merge_group'
-      uses: dorny/paths-filter@v3
-      with:
-        base: ${{ github.event.merge_group.base_ref }}
-        ref: ${{ github.event.merge_group.head_ref }}
-        list-files: shell
-        filters: |
-          all_changed:
-            - added|deleted|modified: "**"
-          ignore:
-            - "./.github/**"
-            - "./.gitignore"
-            - "distribution/**"
-            - "rust-doc/**"
-            - "docs/**"
-            - "rfcs/**"
-            - "testing/**"
-            - "tilt/**"
-            - "website/**"
-            - "*.md"
-            - "Tiltfile"
-            - "netlify.toml"
-            - "NOTICE"
-            - "LICENSE-3rdparty.csv"
-            - "LICENSE"
-            - "lib/codecs/tests/data/**"
-
-    # This step allows us to conservatively run the tests if we added a new
-    # file or directory for source code, but forgot to add it to this workflow.
-    # Instead, we may unnecessarily run the test on new file or dir additions that
-    # wouldn't likely introduce regressions.
-    - name: Determine if should not run due to irrelevant file changes
-      id: filter
-      if: github.event_name == 'merge_group'
-      env:
-        ALL: ${{ steps.changes.outputs.all_changed_files }}
-        IGNORE: ${{ steps.changes.outputs.ignore_files }}
-      run: |
-        echo "ALL='${{ env.ALL }}'"
-        echo "IGNORE='${{ env.IGNORE }}'"
-        export SOURCE_CHANGED=$(comm -2 -3 <(printf "%s\n" "${{ env.ALL }}") <(printf "%s\n" "${{ env.IGNORE }}"))
-        echo "SOURCE_CHANGED='${SOURCE_CHANGED}'"
-
-        if [ "${SOURCE_CHANGED}" == "" ]; then
-          export SOURCE_CHANGED="false"
-        else
-          export SOURCE_CHANGED="true"
-        fi
-
-        echo "SOURCE_CHANGED='${SOURCE_CHANGED}'"
-        echo "SOURCE_CHANGED=${SOURCE_CHANGED}" >> $GITHUB_OUTPUT
-
-  compute-metadata:
-    name: Compute metadata
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
-    needs: should-run
-    if: github.event_name != 'merge_group' || needs.should-run.outputs.source_changed == 'true'
-    outputs:
-      pr-number: ${{ steps.pr-metadata-merge-queue.outputs.PR_NUMBER || steps.pr-metadata-comment.outputs.PR_NUMBER }}
-      baseline-sha: ${{ steps.pr-metadata-merge-queue.outputs.BASELINE_SHA || steps.pr-metadata-comment.outputs.BASELINE_SHA }}
-      baseline-tag: ${{ steps.pr-metadata-merge-queue.outputs.BASELINE_TAG || steps.pr-metadata-comment.outputs.BASELINE_TAG }}
-      comparison-sha: ${{ steps.pr-metadata-merge-queue.outputs.COMPARISON_SHA || steps.pr-metadata-comment.outputs.COMPARISON_SHA }}
-      comparison-tag: ${{ steps.pr-metadata-merge-queue.outputs.COMPARISON_TAG || steps.pr-metadata-comment.outputs.COMPARISON_TAG }}
-
+      baseline-sha: ${{ steps.set_and_validate_shas.outputs.BASELINE_SHA }}
+      comparison-sha: ${{ steps.set_and_validate_shas.outputs.COMPARISON_SHA }}
+      baseline-tag: ${{ steps.set_and_validate_shas.outputs.BASELINE_TAG }}
+      comparison-tag: ${{ steps.set_and_validate_shas.outputs.COMPARISON_TAG }}
       smp-version: ${{ steps.experimental-meta.outputs.SMP_CRATE_VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # need to pull repository history to find merge bases
 
-      # If triggered by review comment, the event payload doesn't directly contain the head and base sha from the PR.
-      # But, we can retrieve this info from some commands.
-      - name: Get PR metadata (pull_request_review)
-        id: pr-metadata-comment
-        if: github.event_name == 'pull_request_review'
+      - name: Set and Validate SHAs
+        id: set_and_validate_shas
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASELINE_INPUT: ${{ inputs.baseline-sha }}
+          COMPARISON_INPUT: ${{ inputs.comparison-sha }}
         run: |
-          export PR_NUMBER=${{ github.event.pull_request.number }}
-
-          echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_OUTPUT
-
-          gh pr checkout ${{ github.event.pull_request.number }}
-
-          export BASELINE_SHA=$(git merge-base origin/master HEAD)
-          echo "BASELINE_SHA=${BASELINE_SHA}" >> $GITHUB_OUTPUT
-
-          export COMPARISON_SHA=$(git rev-parse HEAD)
-          echo "COMPARISON_SHA=${COMPARISON_SHA}" >> $GITHUB_OUTPUT
-
-          export BASELINE_TAG="${PR_NUMBER}-${COMPARISON_SHA}-${BASELINE_SHA}"
-          echo "BASELINE_TAG=${BASELINE_TAG}" >> $GITHUB_OUTPUT
-
-          export COMPARISON_TAG="${PR_NUMBER}-${COMPARISON_SHA}-${COMPARISON_SHA}"
-          echo "COMPARISON_TAG=${COMPARISON_TAG}" >> $GITHUB_OUTPUT
-
-          echo "pr number is: ${PR_NUMBER}"
-
-          echo "baseline sha is: ${BASELINE_SHA}"
-          echo "baseline tag is: ${BASELINE_TAG}"
-
-          echo "comparison sha is: ${COMPARISON_SHA}"
-          echo "comparison tag is: ${COMPARISON_TAG}"
-
-          if [ "${BASELINE_SHA}" = "" ] ; then
-            echo "BASELINE_SHA not found, exiting."
-            exit 1
+          # Resolve baseline ref to a full commit SHA
+          if [ -z "${BASELINE_INPUT}" ]; then
+            BASELINE_SHA=$(git rev-list -n 1 --before="7 days ago" origin/master)
+            echo "Using baseline SHA from 7 days ago: ${BASELINE_SHA}"
+          else
+            if ! BASELINE_SHA=$(git rev-parse --verify "${BASELINE_INPUT}^{commit}" 2>/dev/null); then
+              echo "Invalid baseline ref: '${BASELINE_INPUT}'. Expected a full/short SHA, branch (e.g. origin/master), or tag."
+              exit 1
+            fi
+            echo "Resolved baseline input '${BASELINE_INPUT}' to SHA: ${BASELINE_SHA}"
           fi
 
-          if [ "${COMPARISON_SHA}" = "" ] ; then
-            echo "COMPARISON_SHA not found, exiting."
-            exit 1
+          # Resolve comparison ref to a full commit SHA
+          if [ -z "${COMPARISON_INPUT}" ]; then
+            COMPARISON_SHA=$(git rev-parse origin/master)
+            echo "Using current HEAD of origin/master as comparison SHA: ${COMPARISON_SHA}"
+          else
+            if ! COMPARISON_SHA=$(git rev-parse --verify "${COMPARISON_INPUT}^{commit}" 2>/dev/null); then
+              echo "Invalid comparison ref: '${COMPARISON_INPUT}'. Expected a full/short SHA, branch (e.g. origin/master), or tag."
+              exit 1
+            fi
+            echo "Resolved comparison input '${COMPARISON_INPUT}' to SHA: ${COMPARISON_SHA}"
           fi
 
-          if [ "${PR_NUMBER}" = "" ] ; then
-            echo "PR_NUMBER not found, exiting."
-            exit 1
-          fi
+          # Set tags and export them
+          BASELINE_TAG="workflow_dispatch-${COMPARISON_SHA}-${BASELINE_SHA}"
+          COMPARISON_TAG="workflow_dispatch-${COMPARISON_SHA}-${COMPARISON_SHA}"
 
-      # If triggered by merge queue, the PR number is not available in the payload. While we restrict the number of PRs in the
-      # queue to 1, we can get the PR number by parsing the merge queue temp branch's ref.
-      - name: Get PR metadata (merge queue)
-        id: pr-metadata-merge-queue
-        if: github.event_name != 'pull_request_review'
-        run: |
-          export PR_NUMBER=$(echo "${{ github.ref }}" | sed -n 's|^refs/heads/gh-readonly-queue/master/pr-\([0-9]*\)-.*$|\1|p')
-          echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_OUTPUT
+          {
+            echo "BASELINE_SHA=${BASELINE_SHA}"
+            echo "COMPARISON_SHA=${COMPARISON_SHA}"
 
-          export BASELINE_SHA=${{ github.event.merge_group.base_sha }}
-          echo "BASELINE_SHA=${BASELINE_SHA}" >> $GITHUB_OUTPUT
-
-          export COMPARISON_SHA=${{ github.event.merge_group.head_sha }}
-          echo "COMPARISON_SHA=${COMPARISON_SHA}" >> $GITHUB_OUTPUT
-
-          export BASELINE_TAG="${PR_NUMBER}-${COMPARISON_SHA}-${BASELINE_SHA}"
-          echo "BASELINE_TAG=${BASELINE_TAG}" >> $GITHUB_OUTPUT
-
-          export COMPARISON_TAG="${PR_NUMBER}-${COMPARISON_SHA}-${COMPARISON_SHA}"
-          echo "COMPARISON_TAG=${COMPARISON_TAG}" >> $GITHUB_OUTPUT
-
-          echo "pr number is: ${PR_NUMBER}"
-
-          echo "baseline sha is: ${BASELINE_SHA}"
-          echo "baseline tag is: ${BASELINE_TAG}"
-
-          echo "comparison sha is: ${COMPARISON_SHA}"
-          echo "comparison tag is: ${COMPARISON_TAG}"
-
-          if [ "${BASELINE_SHA}" = "" ] ; then
-            echo "BASELINE_SHA not found, exiting."
-            exit 1
-          fi
-
-          if [ "${COMPARISON_SHA}" = "" ] ; then
-            echo "COMPARISON_SHA not found, exiting."
-            exit 1
-          fi
-
-          if [ "${PR_NUMBER}" = "" ] ; then
-            echo "PR_NUMBER not found, exiting."
-            exit 1
-          fi
+            echo "BASELINE_TAG=${BASELINE_TAG}"
+            echo "COMPARISON_TAG=${COMPARISON_TAG}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set SMP version
         id: experimental-meta
         run: |
-          export SMP_CRATE_VERSION="0.15.1"
+          export SMP_CRATE_VERSION="0.28.0"
           echo "smp crate version: ${SMP_CRATE_VERSION}"
-          echo "SMP_CRATE_VERSION=${SMP_CRATE_VERSION}" >> $GITHUB_OUTPUT
+          echo "SMP_CRATE_VERSION=${SMP_CRATE_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: (PR review) Set latest commit status as pending
-        if: ${{ github.event_name == 'pull_request_review' }}
-        uses: myrotvorets/set-commit-status-action@v2.0.1
+  # Only run this workflow if files changed in areas that could possibly introduce a regression.
+  check-source-changed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: resolve-inputs
+    outputs:
+      source_changed: ${{ steps.filter.outputs.SOURCE_CHANGED }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Collect file changes
+        id: changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
-          sha: ${{ github.event.review.commit_id }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          context: Regression Detection Suite
-          status: pending
+          base: ${{ needs.resolve-inputs.outputs.baseline-sha }}
+          ref: ${{ needs.resolve-inputs.outputs.comparison-sha }}
+          list-files: shell
+          filters: |
+            all_changed:
+              - added|deleted|modified: "**"
+            ignore:
+              - "./.github/**/!(regression.yml)"
+              - "./.gitignore"
+              - "distribution/**"
+              - "docs/**"
+              - "rfcs/**"
+              - "testing/**"
+              - "tilt/**"
+              - "website/**"
+              - "*.md"
+              - "Tiltfile"
+              - "NOTICE"
+              - "LICENSE-3rdparty.csv"
+              - "LICENSE"
+              - "lib/codecs/tests/data/**"
+
+      # This step allows us to conservatively run the tests if we added a new
+      # file or directory for source code, but forgot to add it to this workflow.
+      # Instead, we may unnecessarily run the test on new file or dir additions that
+      # wouldn't likely introduce regressions.
+      - name: Determine if should not run due to irrelevant file changes
+        id: filter
+        env:
+          ALL: ${{ steps.changes.outputs.all_changed_files }}
+          IGNORE: ${{ steps.changes.outputs.ignore_files }}
+        run: |
+          echo "ALL='${{ env.ALL }}'"
+          echo "IGNORE='${{ env.IGNORE }}'"
+          SOURCE_CHANGED=$(comm -2 -3 <(printf "%s\n" "${{ env.ALL }}") <(printf "%s\n" "${{ env.IGNORE }}"))
+          echo "SOURCE_CHANGED='${SOURCE_CHANGED}'"
+
+          if [ "${SOURCE_CHANGED}" == "" ]; then
+            export SOURCE_CHANGED="false"
+          else
+            export SOURCE_CHANGED="true"
+          fi
+
+          echo "SOURCE_CHANGED='${SOURCE_CHANGED}'"
+          echo "SOURCE_CHANGED=${SOURCE_CHANGED}" >> "$GITHUB_OUTPUT"
+
+  should-run-gate:
+    runs-on: ubuntu-24.04
+    needs: check-source-changed
+    if: ${{ needs.check-source-changed.outputs.source_changed }}
+    steps:
+      - name: Gate check passed
+        run: echo "Source code changes detected, proceeding with regression tests"
+
   ##
   ## BUILD
   ##
 
   build-baseline:
     name: Build baseline Vector container
-    runs-on: ubuntu-20.04-4core
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
     steps:
-      - uses: colpal/actions-clean@v1
+      - uses: colpal/actions-clean@36e6ca1abd35efe61cb60f912bd7837f67887c8a # v1.1.1
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.compute-metadata.outputs.baseline-sha }}
+          ref: ${{ needs.resolve-inputs.outputs.baseline-sha }}
           path: baseline-vector
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3.6.1
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build 'vector' target image
-        uses: docker/build-push-action@v6.7.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: baseline-vector/
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          file: regression/Dockerfile
+          file: baseline-vector/regression/Dockerfile
           builder: ${{ steps.buildx.outputs.name }}
           outputs: type=docker,dest=${{ runner.temp }}/baseline-image.tar
           tags: |
-            vector:${{ needs.compute-metadata.outputs.baseline-tag }}
+            vector:${{ needs.resolve-inputs.outputs.baseline-tag }}
 
       - name: Upload image as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: baseline-image
           path: "${{ runner.temp }}/baseline-image.tar"
 
   build-comparison:
     name: Build comparison Vector container
-    runs-on: ubuntu-20.04-4core
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
     steps:
-      - uses: colpal/actions-clean@v1
+      - uses: colpal/actions-clean@36e6ca1abd35efe61cb60f912bd7837f67887c8a # v1.1.1
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.compute-metadata.outputs.comparison-sha }}
+          ref: ${{ needs.resolve-inputs.outputs.comparison-sha }}
           path: comparison-vector
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3.6.1
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build 'vector' target image
-        uses: docker/build-push-action@v6.7.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: comparison-vector/
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          file: regression/Dockerfile
+          file: comparison-vector/regression/Dockerfile
           builder: ${{ steps.buildx.outputs.name }}
           outputs: type=docker,dest=${{ runner.temp }}/comparison-image.tar
           tags: |
-            vector:${{ needs.compute-metadata.outputs.comparison-tag }}
+            vector:${{ needs.resolve-inputs.outputs.comparison-tag }}
 
       - name: Upload image as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: comparison-image
           path: "${{ runner.temp }}/comparison-image.tar"
@@ -322,18 +278,22 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
+    # Job level permissions for downloading SMP binary
+    permissions:
+      id-token: write # Required for GitHub OIDC token exchange
     steps:
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::850406765696:role/smp-regression-oidc
           aws-region: us-west-2
+          role-duration-seconds: 14400 # 4 hours
 
       - name: Download SMP binary
         run: |
-          aws s3 cp s3://smp-cli-releases/v${{ needs.compute-metadata.outputs.smp-version }}/x86_64-unknown-linux-gnu/smp ${{ runner.temp }}/bin/smp
+          aws s3 cp s3://smp-cli-releases/v${{ needs.resolve-inputs.outputs.smp-version }}/x86_64-unknown-linux-musl/smp ${{ runner.temp }}/bin/smp
 
   ##
   ## SUBMIT
@@ -344,12 +304,16 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
       - confirm-valid-credentials
       - build-baseline
+    # Job level permissions for uploading baseline image to SMP ECR
+    permissions:
+      id-token: write # Required for GitHub OIDC token exchange
     steps:
-      - name: 'Download baseline image'
-        uses: actions/download-artifact@v3
+      - name: "Download baseline image"
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: baseline-image
 
@@ -358,37 +322,41 @@ jobs:
           docker load --input baseline-image.tar
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::850406765696:role/smp-regression-oidc
           aws-region: us-west-2
+          role-duration-seconds: 14400 # 4 hours
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Docker Login to ECR
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ steps.login-ecr.outputs.registry }}
 
       - name: Tag & push baseline image
         run: |
-          docker tag vector:${{ needs.compute-metadata.outputs.baseline-tag }} ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.compute-metadata.outputs.baseline-tag }}
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.compute-metadata.outputs.baseline-tag }}
+          docker tag vector:${{ needs.resolve-inputs.outputs.baseline-tag }} ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.resolve-inputs.outputs.baseline-tag }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.resolve-inputs.outputs.baseline-tag }}
 
   upload-comparison-image-to-ecr:
     name: Upload comparison images to ECR
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
       - confirm-valid-credentials
       - build-comparison
+    # Job level permissions for uploading comparison image to SMP ECR
+    permissions:
+      id-token: write # Required for GitHub OIDC token exchange
     steps:
-      - name: 'Download comparison image'
-        uses: actions/download-artifact@v3
+      - name: "Download comparison image"
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: comparison-image
 
@@ -397,66 +365,57 @@ jobs:
           docker load --input comparison-image.tar
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::850406765696:role/smp-regression-oidc
           aws-region: us-west-2
+          role-duration-seconds: 14400 # 4 hours
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Docker Login to ECR
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ steps.login-ecr.outputs.registry }}
 
       - name: Tag & push comparison image
         run: |
-          docker tag vector:${{ needs.compute-metadata.outputs.comparison-tag }} ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.compute-metadata.outputs.comparison-tag }}
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.compute-metadata.outputs.comparison-tag }}
+          docker tag vector:${{ needs.resolve-inputs.outputs.comparison-tag }} ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.resolve-inputs.outputs.comparison-tag }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.resolve-inputs.outputs.comparison-tag }}
 
   submit-job:
     name: Submit regression job
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
       - upload-baseline-image-to-ecr
       - upload-comparison-image-to-ecr
+    permissions:
+      contents: read # Required to checkout code
+      id-token: write # Required for GitHub OIDC token exchange
     steps:
-      - name: Check status, in-progress
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='pending' \
-            -f description='Experiments submitted to the Regression Detection cluster.' \
-            -f context='Regression Detection Suite / submission' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.compute-metadata.outputs.comparison-sha }}
+          ref: ${{ needs.resolve-inputs.outputs.comparison-sha }}
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::850406765696:role/smp-regression-oidc
           aws-region: us-west-2
+          role-duration-seconds: 14400 # 4 hours
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Download SMP binary
         run: |
-          aws s3 cp s3://smp-cli-releases/v${{ needs.compute-metadata.outputs.smp-version }}/x86_64-unknown-linux-gnu/smp ${{ runner.temp }}/bin/smp
+          aws s3 cp s3://smp-cli-releases/v${{ needs.resolve-inputs.outputs.smp-version }}/x86_64-unknown-linux-musl/smp ${{ runner.temp }}/bin/smp
 
       - name: Submit job
         env:
@@ -465,15 +424,16 @@ jobs:
           chmod +x ${{ runner.temp }}/bin/smp
 
           ${{ runner.temp }}/bin/smp --team-id ${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }} job submit \
-            --baseline-image ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.compute-metadata.outputs.baseline-tag }} \
-            --comparison-image ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.compute-metadata.outputs.comparison-tag }} \
-            --baseline-sha ${{ needs.compute-metadata.outputs.baseline-sha }} \
-            --comparison-sha ${{ needs.compute-metadata.outputs.comparison-sha }} \
+            --baseline-image ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.resolve-inputs.outputs.baseline-tag }} \
+            --comparison-image ${{ steps.login-ecr.outputs.registry }}/${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }}-vector:${{ needs.resolve-inputs.outputs.comparison-tag }} \
+            --baseline-sha ${{ needs.resolve-inputs.outputs.baseline-sha }} \
+            --comparison-sha ${{ needs.resolve-inputs.outputs.comparison-sha }} \
             --target-config-dir ${{ github.workspace }}/regression/ \
             --warmup-seconds ${{ env.SMP_WARMUP_SECONDS }} \
-            --submission-metadata ${{ runner.temp }}/submission-metadata
+            --submission-metadata ${{ runner.temp }}/submission-metadata \
+            --replicas ${{ env.SMP_REPLICAS }}
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vector-submission-metadata
           path: ${{ runner.temp }}/submission-metadata
@@ -488,7 +448,7 @@ jobs:
           ${{ runner.temp }}/bin/smp --team-id ${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }} job status \
             --wait \
             --wait-delay-seconds 60 \
-            --wait-timeout-minutes 90 \
+            --wait-timeout-minutes 120 \
             --submission-metadata ${{ runner.temp }}/submission-metadata
 
       - name: Handle cancellation if necessary
@@ -500,47 +460,6 @@ jobs:
           ${{ runner.temp }}/bin/smp --team-id ${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }} job cancel \
             --submission-metadata ${{ runner.temp }}/submission-metadata
 
-      - name: Check status, cancelled
-        if: ${{ cancelled() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='failure' \
-            -f description='Experiments submitted to the Regression Detection cluster cancelled.' \
-            -f context='Regression Detection Suite / submission' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - name: Check status, success
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='success' \
-            -f description='Experiments submitted to the Regression Detection cluster successfully.' \
-            -f context='Regression Detection Suite / submission' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - name: Check status, failure
-        if: ${{ failure() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='success' \
-            -f description='Experiments submitted to the Regression Detection Suite failed.' \
-            -f context='Regression Detection Suite / submission' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
   ##
   ## ANALYZE
   ##
@@ -551,28 +470,33 @@ jobs:
     timeout-minutes: 5
     needs:
       - submit-job
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
+    # Job level permissions for downloading SMP results
+    permissions:
+      contents: read # Required to checkout code
+      id-token: write # Required for GitHub OIDC token exchange
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::850406765696:role/smp-regression-oidc
           aws-region: us-west-2
+          role-duration-seconds: 14400 # 4 hours
 
       - name: Download SMP binary
         run: |
-          aws s3 cp s3://smp-cli-releases/v${{ needs.compute-metadata.outputs.smp-version }}/x86_64-unknown-linux-gnu/smp ${{ runner.temp }}/bin/smp
+          aws s3 cp s3://smp-cli-releases/v${{ needs.resolve-inputs.outputs.smp-version }}/x86_64-unknown-linux-musl/smp ${{ runner.temp }}/bin/smp
 
       - name: Download submission metadata
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: vector-submission-metadata
           path: ${{ runner.temp }}/
 
-      - name: Determine if PR introduced a regression
+      - name: Determine SMP job result
         env:
           RUST_LOG: info
         run: |
@@ -581,85 +505,35 @@ jobs:
           ${{ runner.temp }}/bin/smp --team-id ${{ secrets.SINGLE_MACHINE_PERFORMANCE_TEAM_ID }} job result \
             --submission-metadata ${{ runner.temp }}/submission-metadata
 
-      - name: Check status, cancelled
-        if: ${{ cancelled() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='failure' \
-            -f description='Analyze experimental results from Regression Detection Suite cancelled.' \
-            -f context='Regression Detection Suite / detect-regression' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - name: Check status, success
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='success' \
-            -f description='Analyze experimental results from Regression Detection Suite succeeded.' \
-            -f context='Regression Detection Suite / detect-regression' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - name: Check status, failure
-        if: ${{ failure() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='failure' \
-            -f description='Analyze experimental results from Regression Detection Suite failed.' \
-            -f context='Regression Detection Suite / detect-regression' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
   analyze-experiment:
     name: Download regression analysis & upload report
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs:
+      - should-run-gate
       - submit-job
-      - compute-metadata
+      - resolve-inputs
+    permissions:
+      contents: read # Required to checkout code
+      id-token: write # Required for GitHub OIDC token exchange
     steps:
-      - name: Check status, in-progress
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='pending' \
-            -f description='Analyze experimental results from Regression Detection Suite.' \
-            -f context='Regression Detection Suite / analyze-experiment' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.compute-metadata.outputs.comparison-sha }}
+          ref: ${{ needs.resolve-inputs.outputs.comparison-sha }}
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_BOT_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::850406765696:role/smp-regression-oidc
           aws-region: us-west-2
+          role-duration-seconds: 14400 # 4 hours
 
       - name: Download SMP binary
         run: |
-          aws s3 cp s3://smp-cli-releases/v${{ needs.compute-metadata.outputs.smp-version }}/x86_64-unknown-linux-gnu/smp ${{ runner.temp }}/bin/smp
+          aws s3 cp s3://smp-cli-releases/v${{ needs.resolve-inputs.outputs.smp-version }}/x86_64-unknown-linux-musl/smp ${{ runner.temp }}/bin/smp
 
       - name: Download submission metadata
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: vector-submission-metadata
           path: ${{ runner.temp }}/
@@ -676,73 +550,24 @@ jobs:
 
       - name: Read regression report
         id: read-analysis
-        uses: juliangruber/read-file-action@v1
+        uses: juliangruber/read-file-action@271ff311a4947af354c6abcd696a306553b9ec18 # v1.1.8
         with:
           path: ${{ runner.temp }}/outputs/report.md
 
-      - name: Post report to PR
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          issue-number: ${{ needs.compute-metadata.outputs.pr-number }}
-          edit-mode: append
-          body: ${{ steps.read-analysis.outputs.content }}
-
       - name: Upload regression report to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: capture-artifacts
           path: ${{ runner.temp }}/outputs/*
 
-      - name: Check status, cancelled
-        if: ${{ cancelled() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='failure' \
-            -f description='Analyze experimental results from Regression Detection Suite cancelled.' \
-            -f context='Regression Detection Suite / analyze-experiment' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - name: Check status, success
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='success' \
-            -f description='Analyze experimental results from Regression Detection Suite succeeded.' \
-            -f context='Regression Detection Suite / analyze-experiment' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - name: Check status, failure
-        if: ${{ failure() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/statuses/${{ needs.compute-metadata.outputs.comparison-sha }} \
-            -f state='failure' \
-            -f description='Analyze experimental results from Regression Detection Suite failed.' \
-            -f context='Regression Detection Suite / analyze-experiment' \
-            -f target_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-  # This job always runs- if an pull_request_review triggered it, we need to update the check status in the PR,
-  # and if a pull_request triggered it, we need to flag the check status as a success.
   regression-detection-suite:
-    name: Regression Detection Suite
-    runs-on: ubuntu-latest
+    name: Set final result
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
-    if: always()
+    if: always() && github.repository == 'vectordotdev/vector'
     needs:
-      - compute-metadata
+      - should-run-gate
+      - resolve-inputs
       - build-baseline
       - build-comparison
       - confirm-valid-credentials
@@ -751,39 +576,28 @@ jobs:
       - submit-job
       - detect-regression
       - analyze-experiment
-    env:
-      FAILED: ${{ contains(needs.*.result, 'failure') }}
     steps:
-      - name: (PR review) Submit PR result as failed
-        if: github.event_name == 'pull_request_review' && env.FAILED == 'true'
-        uses: myrotvorets/set-commit-status-action@v2.0.1
+      - name: Download capture-artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          sha: ${{ github.event.review.commit_id }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          context: Regression Detection Suite
-          status: 'failure'
+          name: capture-artifacts
 
-      - name: (PR review) Submit PR result as success
-        if: github.event_name == 'pull_request_review' && env.FAILED != 'true'
-        uses: myrotvorets/set-commit-status-action@v2.0.1
-        with:
-          sha: ${{ github.event.review.commit_id }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          context: Regression Detection Suite
-          status: 'success'
-
-      - name: (PR) Indicate why skipped
-        if: github.event_name == 'pull_request'
+      - name: Display Markdown Summary
+        continue-on-error: true
         run: |
-           echo "### Workflow skipped" >> $GITHUB_STEP_SUMMARY
-           echo "This workflow doesn't run on PR's automatically." >> $GITHUB_STEP_SUMMARY
-           echo "To trigger a run, leave a comment with \`/ci-run-regression\`" >> $GITHUB_STEP_SUMMARY
+          REPORT_MD=report.md
+          if [ -f ${REPORT_MD} ]; then
+            cat ${REPORT_MD} >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Did not find ${REPORT_MD} file."
+          fi
 
-      - name: exit
+      - name: Check all jobs status
         run: |
-          echo "failed=${{ env.FAILED }}"
-          if [[ "$FAILED" == "true" ]] ; then
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more jobs failed or were cancelled"
             exit 1
           else
-            exit 0
+            echo "All jobs completed successfully"
           fi

@@ -1,13 +1,13 @@
 use std::{convert::Infallible, time::Duration};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use criterion::{criterion_group, Criterion, SamplingMode, Throughput};
-use futures::{future, stream, SinkExt, StreamExt};
+use criterion::{Criterion, SamplingMode, Throughput, criterion_group};
+use futures::{SinkExt, StreamExt, future, stream};
 use vector::{
     sinks::util::{
-        batch::{Batch, BatchConfig, BatchError, BatchSettings, BatchSize, PushResult},
         BatchSink, Buffer, Compression, EncodedEvent, Merged, Partition, PartitionBatchSink,
         SinkBatchSettings,
+        batch::{Batch, BatchConfig, BatchError, BatchSettings, BatchSize, PushResult},
     },
     test_util::{random_lines, runtime},
 };
@@ -37,8 +37,8 @@ fn benchmark_batch(c: &mut Criterion) {
         })
         .collect();
 
-    for (compression, batch_size) in cases.iter() {
-        group.bench_function(format!("partitioned/{}_{}", compression, batch_size), |b| {
+    for (compression, batch_size) in &cases {
+        group.bench_function(format!("partitioned/{compression}_{batch_size}"), |b| {
             b.iter_batched(
                 || {
                     let rt = runtime();
@@ -51,7 +51,7 @@ fn benchmark_batch(c: &mut Criterion) {
                         PartitionedBuffer::new(batch.size, *compression),
                         Duration::from_secs(1),
                     )
-                    .sink_map_err(|error| panic!("{}", error));
+                    .sink_map_err(|error| panic!("{error}"));
 
                     (
                         rt,
@@ -65,38 +65,35 @@ fn benchmark_batch(c: &mut Criterion) {
                 },
                 |(rt, input, batch_sink)| rt.block_on(input.forward(batch_sink)).unwrap(),
                 criterion::BatchSize::LargeInput,
-            )
+            );
         });
 
-        group.bench_function(
-            format!("unpartitioned/{}_{}", compression, batch_size),
-            |b| {
-                b.iter_batched(
-                    || {
-                        let rt = runtime();
-                        let mut batch = BatchSettings::default();
-                        batch.size.bytes = *batch_size;
-                        batch.size.events = num_events;
+        group.bench_function(format!("unpartitioned/{compression}_{batch_size}"), |b| {
+            b.iter_batched(
+                || {
+                    let rt = runtime();
+                    let mut batch = BatchSettings::default();
+                    batch.size.bytes = *batch_size;
+                    batch.size.events = num_events;
 
-                        let batch_sink = BatchSink::new(
-                            tower::service_fn(|_| future::ok::<_, Infallible>(())),
-                            Buffer::new(batch.size, *compression),
-                            Duration::from_secs(1),
-                        )
-                        .sink_map_err(|error| panic!("{}", error));
+                    let batch_sink = BatchSink::new(
+                        tower::service_fn(|_| future::ok::<_, Infallible>(())),
+                        Buffer::new(batch.size, *compression),
+                        Duration::from_secs(1),
+                    )
+                    .sink_map_err(|error| panic!("{error}"));
 
-                        (
-                            rt,
-                            stream::iter(input.clone())
-                                .map(|item| Ok(EncodedEvent::new(item, 0, JsonSize::zero()))),
-                            batch_sink,
-                        )
-                    },
-                    |(rt, input, batch_sink)| rt.block_on(input.forward(batch_sink)).unwrap(),
-                    criterion::BatchSize::LargeInput,
-                )
-            },
-        );
+                    (
+                        rt,
+                        stream::iter(input.clone())
+                            .map(|item| Ok(EncodedEvent::new(item, 0, JsonSize::zero()))),
+                        batch_sink,
+                    )
+                },
+                |(rt, input, batch_sink)| rt.block_on(input.forward(batch_sink)).unwrap(),
+                criterion::BatchSize::LargeInput,
+            );
+        });
     }
 }
 

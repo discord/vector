@@ -1,26 +1,23 @@
-use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use snafu::{ResultExt, Snafu};
-use tokio_util::codec::FramedRead;
-use vector_lib::codecs::{
-    decoding::{DeserializerConfig, FramingConfig},
-    StreamDecodingError,
-};
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
-};
-use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path, OwnedValuePath};
 use vector_lib::{
-    config::{LegacyKey, LogNamespace},
     EstimatedJsonEncodedSizeOf,
+    codecs::{
+        Decoder, DecoderFramedRead, DecodingConfig, StreamDecodingError,
+        decoding::{DeserializerConfig, FramingConfig},
+    },
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    internal_event::{
+        ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
+    },
+    lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
 };
-use vrl::value::Kind;
+use vrl::value::{Kind, Value};
 
 use crate::{
-    codecs::{Decoder, DecodingConfig},
-    config::{log_schema, GenerateConfig, SourceConfig, SourceContext, SourceOutput},
+    config::{GenerateConfig, SourceConfig, SourceContext, SourceOutput, log_schema},
     event::Event,
     internal_events::{EventsReceived, StreamClosedError},
     serde::{default_decoding, default_framing_message_based},
@@ -37,12 +34,11 @@ enum BuildError {
 
 /// Data type to use for reading messages from Redis.
 #[configurable_component]
-#[derive(Copy, Clone, Debug, Derivative)]
-#[derivative(Default)]
+#[derive(Copy, Clone, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DataTypeConfig {
     /// The `list` data type.
-    #[derivative(Default)]
+    #[default]
     List,
 
     /// The `channel` data type.
@@ -53,21 +49,19 @@ pub enum DataTypeConfig {
 
 /// Options for the Redis `list` data type.
 #[configurable_component]
-#[derive(Copy, Clone, Debug, Default, Derivative, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "lowercase")]
 pub struct ListOption {
-    #[configurable(derived)]
     method: Method,
 }
 
 /// Method for getting events from the `list` data type.
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative, Eq, PartialEq)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
     /// Pop messages from the head of the list.
-    #[derivative(Default)]
+    #[default]
     Lpop,
 
     /// Pop messages from the tail of the list.
@@ -83,9 +77,7 @@ impl From<&redis::ConnectionInfo> for ConnectionInfo {
     fn from(redis_conn_info: &redis::ConnectionInfo) -> Self {
         let (protocol, endpoint) = match &redis_conn_info.addr {
             redis::ConnectionAddr::Tcp(host, port)
-            | redis::ConnectionAddr::TcpTls { host, port, .. } => {
-                ("tcp", format!("{}:{}", host, port))
-            }
+            | redis::ConnectionAddr::TcpTls { host, port, .. } => ("tcp", format!("{host}:{port}")),
             redis::ConnectionAddr::Unix(path) => ("uds", path.to_string_lossy().to_string()),
         };
 
@@ -102,7 +94,6 @@ pub struct RedisSourceConfig {
     #[serde(default)]
     data_type: DataTypeConfig,
 
-    #[configurable(derived)]
     list: Option<ListOption>,
 
     /// The Redis URL to connect to.
@@ -123,12 +114,10 @@ pub struct RedisSourceConfig {
     #[configurable(metadata(docs::examples = "redis_key"))]
     redis_key: Option<OptionalValuePath>,
 
-    #[configurable(derived)]
     #[serde(default = "default_framing_message_based")]
     #[derivative(Default(value = "default_framing_message_based()"))]
     framing: FramingConfig,
 
-    #[configurable(derived)]
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     decoding: DeserializerConfig,
@@ -140,16 +129,17 @@ pub struct RedisSourceConfig {
 }
 
 impl GenerateConfig for RedisSourceConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc::indoc! {
             r#"
-            url = "redis://127.0.0.1:6379/0"
-            key = "vector"
-            data_type = "list"
-            list.method = "lpop"
-            redis_key = "redis_key"
+            url: "redis://127.0.0.1:6379/0"
+            key: vector
+            data_type: list
+            list:
+              method: lpop
+            redis_key: redis_key
             "#,
-        )
+        })
         .unwrap()
     }
 }
@@ -245,7 +235,7 @@ impl InputHandler {
 
         self.bytes_received.emit(ByteSize(line.len()));
 
-        let mut stream = FramedRead::new(line.as_ref(), self.decoder.clone());
+        let mut stream = DecoderFramedRead::new(line.as_ref(), self.decoder.clone());
         while let Some(next) = stream.next().await {
             match next {
                 Ok((events, _byte_size)) => {
@@ -259,7 +249,7 @@ impl InputHandler {
                                 log,
                                 log_schema().source_type_key(),
                                 path!("source_type"),
-                                Bytes::from(RedisSourceConfig::NAME),
+                                Value::from_static_str(RedisSourceConfig::NAME),
                             );
                             self.log_namespace.insert_vector_metadata(
                                 log,
@@ -275,7 +265,7 @@ impl InputHandler {
                                 path!("key"),
                                 self.key.as_str(),
                             );
-                        };
+                        }
 
                         event
                     });
@@ -286,7 +276,7 @@ impl InputHandler {
                     }
                 }
                 Err(error) => {
-                    // Error is logged by `crate::codecs::Decoder`, no further
+                    // Error is logged by `vector_lib::codecs::Decoder`, no further
                     // handling is needed here.
                     if !error.can_continue() {
                         break;
@@ -311,20 +301,20 @@ mod test {
 #[cfg(all(test, feature = "redis-integration-tests"))]
 mod integration_test {
     use redis::AsyncCommands;
+    use vrl::value;
 
     use super::*;
     use crate::{
+        SourceSender,
         config::log_schema,
         test_util::{
             collect_n,
-            components::{run_and_assert_source_compliance_n, SOURCE_TAGS},
+            components::{SOURCE_TAGS, run_and_assert_source_compliance_n},
             random_string,
         },
-        SourceSender,
     };
-    use vrl::value;
 
-    const REDIS_SERVER: &str = "redis://redis:6379/0";
+    const REDIS_SERVER: &str = "redis://redis-primary:6379/0";
 
     #[tokio::test]
     async fn redis_source_list_rpop() {
@@ -333,7 +323,7 @@ mod integration_test {
         let mut conn = client.get_connection_manager().await.unwrap();
 
         let key = format!("test-key-{}", random_string(10));
-        debug!("Test key name: {}.", key);
+        debug!("Test key name: {key}.");
 
         let _: i32 = conn.rpush(&key, "1").await.unwrap();
         let _: i32 = conn.rpush(&key, "2").await.unwrap();
@@ -376,7 +366,7 @@ mod integration_test {
         let mut conn = client.get_connection_manager().await.unwrap();
 
         let key = format!("test-key-{}", random_string(10));
-        debug!("Test key name: {}.", key);
+        debug!("Test key name: {key}.");
 
         let _: i32 = conn.rpush(&key, "1").await.unwrap();
 
@@ -415,7 +405,7 @@ mod integration_test {
         let mut conn = client.get_connection_manager().await.unwrap();
 
         let key = format!("test-key-{}", random_string(10));
-        debug!("Test key name: {}.", key);
+        debug!("Test key name: {key}.");
 
         let _: i32 = conn.rpush(&key, "1").await.unwrap();
         let _: i32 = conn.rpush(&key, "2").await.unwrap();
@@ -487,7 +477,7 @@ mod integration_test {
         let client = redis::Client::open(REDIS_SERVER).unwrap();
 
         let mut async_conn = client
-            .get_async_connection()
+            .get_multiplexed_async_connection()
             .await
             .expect("Failed to get redis async connection.");
 

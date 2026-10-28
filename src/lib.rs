@@ -21,18 +21,24 @@
 
 //! The main library to support building Vector.
 
+#[cfg(all(unix, feature = "sinks-socket"))]
 #[macro_use]
-extern crate tracing;
+extern crate cfg_if;
 #[macro_use]
 extern crate derivative;
 #[macro_use]
+extern crate tracing;
+#[macro_use]
 extern crate vector_lib;
 
-#[cfg(all(feature = "tikv-jemallocator", not(feature = "allocation-tracing")))]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(all(target_os = "linux", feature = "antithesis-scenario-disk"))]
+extern crate antithesis_instrumentation as _;
 
-#[cfg(all(feature = "tikv-jemallocator", feature = "allocation-tracing"))]
+pub use indoc::indoc;
+// re-export codecs for convenience
+pub use vector_lib::codecs;
+
+#[cfg(all(unix, feature = "tikv-jemallocator"))]
 #[global_allocator]
 static ALLOC: self::internal_telemetry::allocations::Allocator<tikv_jemallocator::Jemalloc> =
     self::internal_telemetry::allocations::get_grouped_tracing_allocator(
@@ -67,10 +73,10 @@ pub mod app;
 pub mod async_read;
 #[cfg(feature = "aws-config")]
 pub mod aws;
-#[allow(unreachable_pub)]
-pub mod codecs;
 pub mod common;
+pub mod completion;
 mod convert_config;
+pub mod cpu_time;
 pub mod encoding_transcode;
 pub mod enrichment_tables;
 pub mod extra_context;
@@ -87,7 +93,7 @@ pub mod kubernetes;
 pub mod line_agg;
 pub mod list;
 #[cfg(any(feature = "sources-nats", feature = "sinks-nats"))]
-pub(crate) mod nats;
+pub mod nats;
 pub mod net;
 #[allow(unreachable_pub)]
 pub(crate) mod proto;
@@ -97,21 +103,17 @@ pub mod serde;
 #[cfg(windows)]
 pub mod service;
 pub mod signal;
-#[cfg(all(any(feature = "sinks-socket", feature = "sinks-statsd"), unix))]
 pub(crate) mod sink_ext;
 #[allow(unreachable_pub)]
 pub mod sinks;
-pub mod source_sender;
 #[allow(unreachable_pub)]
 pub mod sources;
-pub mod stats;
 #[cfg(feature = "api-client")]
 #[allow(unreachable_pub)]
 pub mod tap;
 pub mod template;
 pub mod test_util;
-#[cfg(feature = "api-client")]
-#[allow(unreachable_pub)]
+#[cfg(feature = "top")]
 pub mod top;
 #[allow(unreachable_pub)]
 pub mod topology;
@@ -125,16 +127,18 @@ pub mod validate;
 #[cfg(windows)]
 pub mod vector_windows;
 
-pub use source_sender::SourceSender;
-pub use vector_lib::{event, metrics, schema, tcp, tls};
-pub use vector_lib::{shutdown, Error, Result};
+pub use vector_lib::{
+    Error, Result, event, metrics, schema, shutdown, source_sender::SourceSender, tcp, tls,
+};
 
 static APP_NAME_SLUG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static USE_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// The name used to identify this Vector application.
 ///
-/// This can be set at compile-time through the VECTOR_APP_NAME env variable.
+/// This can be set at compile-time through the `VECTOR_APP_NAME` env variable.
 /// Defaults to "Vector".
+#[must_use]
 pub fn get_app_name() -> &'static str {
     option_env!("VECTOR_APP_NAME").unwrap_or("Vector")
 }
@@ -148,8 +152,36 @@ pub fn get_slugified_app_name() -> String {
         .clone()
 }
 
+/// Sets the global color preference for diagnostics and CLI output.
+/// This should be called once during application startup.
+pub fn set_global_color(enabled: bool) {
+    if let Err(e) = USE_COLOR.set(enabled) {
+        error!(message = "Failed to set global color.", %e);
+    }
+}
+
+/// Returns true if color output is globally enabled.
+/// Defaults to false if not set.
+pub fn use_color() -> bool {
+    *USE_COLOR.get_or_init(|| false)
+}
+
+/// Formats VRL diagnostics honoring the global color setting.
+pub fn format_vrl_diagnostics(
+    source: &str,
+    diagnostics: impl Into<vrl::diagnostic::DiagnosticList>,
+) -> String {
+    let formatter = vrl::diagnostic::Formatter::new(source, diagnostics);
+    if use_color() {
+        formatter.colored().to_string()
+    } else {
+        formatter.to_string()
+    }
+}
+
 /// The current version of Vector in simplified format.
 /// `<version-number>-nightly`.
+#[must_use]
 pub fn vector_version() -> impl std::fmt::Display {
     #[cfg(feature = "nightly")]
     let pkg_version = format!("{}-nightly", built_info::PKG_VERSION);
@@ -171,11 +203,12 @@ pub fn vector_version() -> impl std::fmt::Display {
 }
 
 /// Returns a string containing full version information of the current build.
+#[must_use]
 pub fn get_version() -> String {
     let pkg_version = vector_version();
     let build_desc = built_info::VECTOR_BUILD_DESC;
     let build_string = match build_desc {
-        Some(desc) => format!("{} {}", built_info::TARGET, desc),
+        Some(desc) => format!("{} {desc}", built_info::TARGET),
         None => built_info::TARGET.into(),
     };
 
@@ -183,12 +216,12 @@ pub fn get_version() -> String {
     // or full debug symbols. See the Cargo Book profiling section for value meaning:
     // https://doc.rust-lang.org/cargo/reference/profiles.html#debug
     let build_string = match built_info::DEBUG {
-        "1" => format!("{} debug=line", build_string),
-        "2" | "true" => format!("{} debug=full", build_string),
+        "1" => format!("{build_string} debug=line"),
+        "2" | "true" => format!("{build_string} debug=full"),
         _ => build_string,
     };
 
-    format!("{} ({})", pkg_version, build_string)
+    format!("{pkg_version} ({build_string})")
 }
 
 /// Includes information about the current build.
@@ -198,9 +231,19 @@ pub mod built_info {
 }
 
 /// Returns the host name of the current system.
+/// The hostname can be overridden by setting the `VECTOR_HOSTNAME` environment variable.
+///
+/// # Errors
+/// Returns an error if the operating system hostname query fails.
 pub fn get_hostname() -> std::io::Result<String> {
-    Ok(hostname::get()?.to_string_lossy().into())
+    Ok(if let Ok(hostname) = std::env::var("VECTOR_HOSTNAME") {
+        hostname
+    } else {
+        hostname::get()?.to_string_lossy().into_owned()
+    })
 }
+
+pub(crate) use vector_lib::spawn_in_current_span;
 
 /// Spawn a task with the given name. The name is only used if
 /// built with [`tokio_unstable`][tokio_unstable].
@@ -230,7 +273,7 @@ pub fn num_threads() -> usize {
         Ok(count) => count,
         Err(error) => {
             warn!(message = "Failed to determine available parallelism for thread count, defaulting to 1.", %error);
-            std::num::NonZeroUsize::new(1).unwrap()
+            std::num::NonZeroUsize::MIN
         }
     };
     usize::from(count)

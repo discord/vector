@@ -1,18 +1,15 @@
 use std::{path::Path, time::Duration};
 
 use indexmap::IndexMap;
-use vector_lib::config::GlobalOptions;
-use vector_lib::configurable::configurable_component;
-
-use crate::{enrichment_tables::EnrichmentTables, providers::Providers, secrets::SecretBackends};
+use vector_lib::{config::GlobalOptions, configurable::configurable_component};
 
 #[cfg(feature = "api")]
 use super::api;
 use super::{
-    compiler, schema, BoxedSink, BoxedSource, BoxedTransform, ComponentKey, Config,
-    EnrichmentTableOuter, HealthcheckOptions, SinkOuter, SourceOuter, TestDefinition,
-    TransformOuter,
+    BoxedSink, BoxedSource, BoxedTransform, ComponentKey, Config, EnrichmentTableOuter,
+    HealthcheckOptions, SinkOuter, SourceOuter, TestDefinition, TransformOuter, compiler, schema,
 };
+use crate::{enrichment_tables::EnrichmentTables, providers::Providers, secrets::SecretBackends};
 
 /// A complete Vector configuration.
 #[configurable_component]
@@ -23,36 +20,37 @@ pub struct ConfigBuilder {
     pub global: GlobalOptions,
 
     #[cfg(feature = "api")]
-    #[configurable(derived)]
     #[serde(default)]
     pub api: api::Options,
 
-    #[configurable(derived)]
-    #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     pub schema: schema::Options,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub healthchecks: HealthcheckOptions,
 
     /// All configured enrichment tables.
+    #[configurable(metadata(docs::additional_props_description = "An enrichment table."))]
     #[serde(default)]
-    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter>,
+    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter<String>>,
 
     /// All configured sources.
+    #[configurable(metadata(docs::additional_props_description = "A source."))]
     #[serde(default)]
     pub sources: IndexMap<ComponentKey, SourceOuter>,
 
     /// All configured sinks.
+    #[configurable(metadata(docs::additional_props_description = "A sink."))]
     #[serde(default)]
     pub sinks: IndexMap<ComponentKey, SinkOuter<String>>,
 
     /// All configured transforms.
+    #[configurable(metadata(docs::additional_props_description = "A transform."))]
     #[serde(default)]
     pub transforms: IndexMap<ComponentKey, TransformOuter<String>>,
 
     /// All configured unit tests.
+    #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     pub tests: Vec<TestDefinition<String>>,
 
@@ -60,6 +58,7 @@ pub struct ConfigBuilder {
     ///
     /// Configuration providers allow sourcing configuration information from a source other than
     /// the typical configuration files that must be passed to Vector.
+    #[configurable(metadata(docs::hidden))]
     pub provider: Option<Providers>,
 
     /// All configured secrets backends.
@@ -106,6 +105,11 @@ impl From<Config> for ConfigBuilder {
             .map(|(key, sink)| (key, sink.map_inputs(ToString::to_string)))
             .collect();
 
+        let enrichment_tables = enrichment_tables
+            .into_iter()
+            .map(|(key, table)| (key, table.map_inputs(ToString::to_string)))
+            .collect();
+
         let tests = tests.into_iter().map(TestDefinition::stringify).collect();
 
         ConfigBuilder {
@@ -128,16 +132,20 @@ impl From<Config> for ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn build(self) -> Result<Config, Vec<String>> {
         let (config, warnings) = self.build_with_warnings()?;
 
         for warning in warnings {
-            warn!("{}", warning);
+            warn!("{warning}");
         }
 
         Ok(config)
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn build_with_warnings(self) -> Result<(Config, Vec<String>), Vec<String>> {
         compiler::compile(self)
     }
@@ -145,11 +153,16 @@ impl ConfigBuilder {
     pub fn add_enrichment_table<K: Into<String>, E: Into<EnrichmentTables>>(
         &mut self,
         key: K,
+        inputs: &[&str],
         enrichment_table: E,
     ) {
+        let inputs = inputs
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>();
         self.enrichment_tables.insert(
             ComponentKey::from(key.into()),
-            EnrichmentTableOuter::new(enrichment_table),
+            EnrichmentTableOuter::new(inputs, enrichment_table),
         );
     }
 
@@ -166,7 +179,7 @@ impl ConfigBuilder {
     ) {
         let inputs = inputs
             .iter()
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>();
         let sink = SinkOuter::new(inputs, sink);
         self.add_sink_outer(key, sink);
@@ -186,7 +199,7 @@ impl ConfigBuilder {
     ) {
         let inputs = inputs
             .iter()
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>();
         let transform = TransformOuter::new(inputs, transform);
 
@@ -198,6 +211,8 @@ impl ConfigBuilder {
         self.global.data_dir = Some(path.to_owned());
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn append(&mut self, with: Self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -221,22 +236,22 @@ impl ConfigBuilder {
 
         with.enrichment_tables.keys().for_each(|k| {
             if self.enrichment_tables.contains_key(k) {
-                errors.push(format!("duplicate enrichment_table name found: {}", k));
+                errors.push(format!("duplicate enrichment_table name found: {k}"));
             }
         });
         with.sources.keys().for_each(|k| {
             if self.sources.contains_key(k) {
-                errors.push(format!("duplicate source id found: {}", k));
+                errors.push(format!("duplicate source id found: {k}"));
             }
         });
         with.sinks.keys().for_each(|k| {
             if self.sinks.contains_key(k) {
-                errors.push(format!("duplicate sink id found: {}", k));
+                errors.push(format!("duplicate sink id found: {k}"));
             }
         });
         with.transforms.keys().for_each(|k| {
             if self.transforms.contains_key(k) {
-                errors.push(format!("duplicate transform id found: {}", k));
+                errors.push(format!("duplicate transform id found: {k}"));
             }
         });
         with.tests.iter().for_each(|wt| {
@@ -246,7 +261,7 @@ impl ConfigBuilder {
         });
         with.secret.keys().for_each(|k| {
             if self.secret.contains_key(k) {
-                errors.push(format!("duplicate secret id found: {}", k));
+                errors.push(format!("duplicate secret id found: {k}"));
             }
         });
         if !errors.is_empty() {
@@ -264,11 +279,17 @@ impl ConfigBuilder {
     }
 
     #[cfg(test)]
+    #[must_use]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_panics_doc, reason = "Panic documentation deferred")]
     pub fn from_toml(input: &str) -> Self {
         crate::config::format::deserialize(input, crate::config::format::Format::Toml).unwrap()
     }
 
     #[cfg(test)]
+    #[must_use]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_panics_doc, reason = "Panic documentation deferred")]
     pub fn from_json(input: &str) -> Self {
         crate::config::format::deserialize(input, crate::config::format::Format::Json).unwrap()
     }

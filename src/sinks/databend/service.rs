@@ -1,19 +1,23 @@
-use std::collections::BTreeMap;
-use std::io::Cursor;
-use std::task::{Context, Poll};
+use std::{
+    collections::BTreeMap,
+    io::Cursor,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
 use chrono::Utc;
-use databend_client::error::Error as DatabendError;
-use databend_client::APIClient as DatabendAPIClient;
+use databend_client::{APIClient as DatabendAPIClient, Error as DatabendError};
 use futures::future::BoxFuture;
-use rand::{thread_rng, Rng};
+use rand::{RngExt, rng};
 use rand_distr::Alphanumeric;
 use snafu::Snafu;
 use tower::Service;
-use vector_lib::finalization::{EventFinalizers, EventStatus, Finalizable};
-use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
-use vector_lib::stream::DriverResponse;
+use vector_lib::{
+    finalization::{EventFinalizers, EventStatus, Finalizable},
+    request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+    stream::DriverResponse,
+};
 
 use crate::{internal_events::EndpointBytesSent, sinks::util::retries::RetryLogic};
 
@@ -22,20 +26,18 @@ pub struct DatabendRetryLogic;
 
 impl RetryLogic for DatabendRetryLogic {
     type Error = DatabendError;
+    type Request = DatabendRequest;
     type Response = DatabendResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
         match error {
-            DatabendError::InvalidResponse(qe) => match qe.code {
-                429 => true,
-                // general server error
-                500 => true,
-                // storage doesn't support presign operation
-                3902 => false,
-                // fail to parse stage attachment
-                1046 => false,
-                _ => false,
-            },
+            DatabendError::Response { status, .. } => {
+                // Retry rate limiting and general server errors. Other responses,
+                // including unsupported presigning (3902) and invalid stage
+                // attachments (1046), are not retriable.
+                matches!(status.as_u16(), 429 | 500)
+            }
+            DatabendError::WithContext(boxed_error, ..) => self.is_retriable_error(boxed_error),
             DatabendError::IO(_) => true,
             _ => false,
         }
@@ -44,7 +46,7 @@ impl RetryLogic for DatabendRetryLogic {
 
 #[derive(Clone)]
 pub struct DatabendService {
-    client: DatabendAPIClient,
+    client: Arc<DatabendAPIClient>,
     table: String,
     file_format_options: BTreeMap<&'static str, &'static str>,
     copy_options: BTreeMap<&'static str, &'static str>,
@@ -94,7 +96,7 @@ impl DriverResponse for DatabendResponse {
 
 impl DatabendService {
     pub(super) fn new(
-        client: DatabendAPIClient,
+        client: Arc<DatabendAPIClient>,
         table: String,
         file_format_options: BTreeMap<&'static str, &'static str>,
         copy_options: BTreeMap<&'static str, &'static str>,
@@ -110,23 +112,22 @@ impl DatabendService {
         })
     }
 
-    async fn new_stage_location(&self) -> String {
+    fn new_stage_location(&self) -> String {
         let now = Utc::now().timestamp();
         let database = self
             .client
             .current_database()
-            .await
             .unwrap_or("default".to_string());
-        let suffix = thread_rng()
+        let suffix = rng()
             .sample_iter(&Alphanumeric)
             .take(8)
             .map(char::from)
             .collect::<String>();
-        format!("@~/vector/{}/{}/{}-{}", database, self.table, now, suffix,)
+        format!("@~/vector/{database}/{}/{now}-{suffix}", self.table)
     }
 
     pub(crate) async fn insert_with_stage(&self, data: Bytes) -> Result<(), DatabendError> {
-        let stage = self.new_stage_location().await;
+        let stage = self.new_stage_location();
         let size = data.len() as u64;
         let reader = Box::new(Cursor::new(data));
         self.client.upload_to_stage(&stage, reader, size).await?;
@@ -158,8 +159,8 @@ impl Service<DatabendRequest> for DatabendService {
 
         let future = async move {
             let metadata = request.get_metadata().clone();
-            let protocol = service.client.scheme.as_str();
-            let host_port = format!("{}:{}", service.client.host, service.client.port);
+            let protocol = service.client.scheme();
+            let host_port = format!("{}:{}", service.client.host(), service.client.port());
             let endpoint = host_port.as_str();
             let byte_size = request.data.len();
             service.insert_with_stage(request.data).await?;

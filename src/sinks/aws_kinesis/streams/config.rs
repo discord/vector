@@ -1,24 +1,27 @@
-use aws_sdk_kinesis::operation::describe_stream::DescribeStreamError;
-use aws_sdk_kinesis::operation::put_records::PutRecordsError;
+use aws_sdk_kinesis::operation::{
+    describe_stream::DescribeStreamError, put_records::PutRecordsError,
+};
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
 
-use crate::sinks::util::retries::RetryAction;
-use crate::{
-    aws::{create_client, is_retriable_error, ClientBuilder},
-    config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext},
-    sinks::{
-        util::{retries::RetryLogic, BatchConfig, SinkBatchSettings},
-        Healthcheck, VectorSink,
-    },
-};
-
 use super::{
-    build_sink,
+    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig, build_sink,
     record::{KinesisStreamClient, KinesisStreamRecord},
-    KinesisClient, KinesisError, KinesisRecord, KinesisResponse, KinesisSinkBaseConfig,
+    sink::BatchKinesisRequest,
+};
+use crate::{
+    aws::{ClientBuilder, create_client, is_retriable_error},
+    config::{AcknowledgementsConfig, Input, ProxyConfig, SinkConfig, SinkContext, ValidatedSink},
+    sinks::{
+        Healthcheck, VectorSink,
+        prelude::*,
+        util::{
+            BatchConfig, SinkBatchSettings,
+            retries::{RetryAction, RetryLogic},
+        },
+    },
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -37,7 +40,7 @@ pub struct KinesisClientBuilder;
 impl ClientBuilder for KinesisClientBuilder {
     type Client = KinesisClient;
 
-    fn build(config: &aws_types::SdkConfig) -> Self::Client {
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
         KinesisClient::new(config)
     }
 }
@@ -64,7 +67,6 @@ pub struct KinesisStreamsSinkConfig {
     #[serde(flatten)]
     pub base: KinesisSinkBaseConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<KinesisDefaultBatchSettings>,
 }
@@ -97,14 +99,19 @@ impl KinesisStreamsSinkConfig {
         }
     }
 
+    /// Creates the AWS client.
+    ///
+    /// # Errors
+    /// Returns an error if region resolution, authentication, or HTTP client configuration fails.
     pub async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<KinesisClient> {
         create_client::<KinesisClientBuilder>(
+            &KinesisClientBuilder {},
             &self.base.auth,
             self.base.region.region(),
             self.base.region.endpoint(),
             proxy,
-            &self.base.tls,
-            &None,
+            self.base.tls.as_ref(),
+            None,
         )
         .await
     }
@@ -113,16 +120,43 @@ impl KinesisStreamsSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "aws_kinesis_streams")]
 impl SinkConfig for KinesisStreamsSinkConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let client = self.create_client(&cx.proxy).await?;
-        let healthcheck = self.clone().healthcheck(client.clone()).boxed();
+    fn input(&self) -> Input {
+        self.base.input()
+    }
 
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        self.base.acknowledgements()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidatedKinesisStreams {
+    batch_settings: BatcherSettings,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for KinesisStreamsSinkConfig {
+    type Validated = ValidatedKinesisStreams;
+
+    fn validate(&self) -> crate::Result<ValidatedKinesisStreams> {
         let batch_settings = self
             .batch
             .validate()?
             .limit_max_bytes(MAX_PAYLOAD_SIZE)?
             .limit_max_events(MAX_PAYLOAD_EVENTS)?
             .into_batcher_settings()?;
+        self.base.encoding.validate()?;
+
+        Ok(ValidatedKinesisStreams { batch_settings })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedKinesisStreams,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let client = self.create_client(&cx.proxy).await?;
+        let healthcheck = self.clone().healthcheck(client.clone()).boxed();
 
         let sink = build_sink::<
             KinesisStreamClient,
@@ -133,7 +167,7 @@ impl SinkConfig for KinesisStreamsSinkConfig {
         >(
             &self.base,
             self.base.partition_key_field.clone(),
-            batch_settings,
+            validated.batch_settings,
             KinesisStreamClient { client },
             KinesisRetryLogic {
                 retry_partial: self.base.request_retry_partial,
@@ -142,23 +176,16 @@ impl SinkConfig for KinesisStreamsSinkConfig {
 
         Ok((sink, healthcheck))
     }
-
-    fn input(&self) -> Input {
-        self.base.input()
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        self.base.acknowledgements()
-    }
 }
 
 impl GenerateConfig for KinesisStreamsSinkConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(
-            r#"partition_key_field = "foo"
-            stream_name = "my-stream"
-            encoding.codec = "json""#,
-        )
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc::indoc! {
+            r"partition_key_field: foo
+            stream_name: my-stream
+            encoding:
+              codec: json",
+        })
         .unwrap()
     }
 }
@@ -169,6 +196,7 @@ struct KinesisRetryLogic {
 
 impl RetryLogic for KinesisRetryLogic {
     type Error = SdkError<KinesisError, HttpResponse>;
+    type Request = BatchKinesisRequest<KinesisStreamRecord>;
     type Response = KinesisResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
@@ -189,10 +217,24 @@ impl RetryLogic for KinesisRetryLogic {
         is_retriable_error(error)
     }
 
-    fn should_retry_response(&self, response: &Self::Response) -> RetryAction {
-        if response.failure_count > 0 && self.retry_partial {
-            let msg = format!("partial error count {}", response.failure_count);
-            RetryAction::Retry(msg.into())
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
+        if response.failure_count > 0 && self.retry_partial && !response.failed_records.is_empty() {
+            let failed_records = response.failed_records.clone();
+            RetryAction::RetryPartial(Box::new(move |original_request| {
+                let failed_events: Vec<_> = failed_records
+                    .iter()
+                    .filter_map(|r| original_request.events.get(r.index).cloned())
+                    .collect();
+
+                let metadata = RequestMetadata::from_batch(
+                    failed_events.iter().map(|req| req.get_metadata().clone()),
+                );
+
+                BatchKinesisRequest {
+                    events: failed_events,
+                    metadata,
+                }
+            }))
         } else {
             RetryAction::Successful
         }
@@ -201,10 +243,37 @@ impl RetryLogic for KinesisRetryLogic {
 
 #[cfg(test)]
 mod tests {
-    use super::KinesisStreamsSinkConfig;
+    use super::*;
+    use crate::{aws::AwsAuthentication, sinks::util::TowerRequestConfig};
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<KinesisStreamsSinkConfig>();
+    }
+
+    #[test]
+    fn validate_produces_batch_settings() {
+        let config = KinesisStreamsSinkConfig {
+            batch: BatchConfig::<KinesisDefaultBatchSettings>::default(),
+            base: KinesisSinkBaseConfig {
+                stream_name: String::from("test"),
+                region: crate::aws::RegionOrEndpoint::with_both(
+                    "us-east-1",
+                    "http://localhost:4566",
+                ),
+                encoding: vector_lib::codecs::JsonSerializerConfig::default().into(),
+                compression: Compression::None,
+                request: TowerRequestConfig::default(),
+                tls: None,
+                auth: AwsAuthentication::default(),
+                request_retry_partial: false,
+                acknowledgements: AcknowledgementsConfig::default(),
+                partition_key_field: None,
+            },
+        };
+
+        let validated = config.validate().expect("validation should succeed");
+        assert_eq!(validated.batch_settings.item_limit, MAX_PAYLOAD_EVENTS);
+        assert_eq!(validated.batch_settings.size_limit, MAX_PAYLOAD_SIZE);
     }
 }

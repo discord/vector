@@ -6,8 +6,7 @@ use std::{
 
 use tracing::Span;
 
-use super::stack::GroupStack;
-use super::tracing::WithAllocationGroup;
+use super::{stack::GroupStack, tracing::WithAllocationGroup};
 
 thread_local! {
     /// The currently executing allocation token.
@@ -28,6 +27,7 @@ impl AllocationGroupId {
     pub const ROOT: Self = AllocationGroupId::from_raw(1);
 
     pub(super) const fn from_raw(raw_group_id: u8) -> Self {
+        // SAFETY: Allocation group IDs are nonzero.
         unsafe { Self(NonZeroU8::new_unchecked(raw_group_id)) }
     }
 
@@ -50,10 +50,10 @@ impl AllocationGroupId {
 
         let group_id = GROUP_ID.fetch_add(1, Ordering::Relaxed);
 
-        if group_id != u8::MAX {
-            Some(AllocationGroupId::from_raw(group_id))
-        } else {
+        if group_id == u8::MAX {
             None
+        } else {
+            Some(AllocationGroupId::from_raw(group_id))
         }
     }
 
@@ -64,10 +64,10 @@ impl AllocationGroupId {
     /// group.
     pub fn attach_to_span(self, span: &Span) {
         tracing::dispatcher::get_default(move |dispatch| {
-            if let Some(id) = span.id() {
-                if let Some(ctx) = dispatch.downcast_ref::<WithAllocationGroup>() {
-                    (ctx.with_allocation_group)(dispatch, &id, AllocationGroupToken::from(self));
-                }
+            if let Some(id) = span.id()
+                && let Some(ctx) = dispatch.downcast_ref::<WithAllocationGroup>()
+            {
+                (ctx.with_allocation_group)(dispatch, &id, AllocationGroupToken::from(self));
             }
         });
     }
@@ -83,6 +83,8 @@ impl AllocationGroupToken {
         _ = LOCAL_ALLOCATION_GROUP_STACK.try_with(|stack| stack.borrow_mut().push(self.id));
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::unused_self, reason = "Pair with enter")]
     pub fn exit(&self) {
         _ = LOCAL_ALLOCATION_GROUP_STACK.try_with(|stack| stack.borrow_mut().pop());
     }
@@ -100,6 +102,8 @@ impl From<AllocationGroupId> for AllocationGroupToken {
 /// to the suspended allocation group. If any other call to `try_with_suspended_allocation_group` happens while this
 /// method call is on the stack, `f` in those calls with itself not be called.
 #[inline(always)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::inline_always, reason = "Retain hot-path inlining")]
 pub(super) fn try_with_suspended_allocation_group<F>(f: F)
 where
     F: FnOnce(AllocationGroupId),
@@ -126,6 +130,8 @@ where
 /// `try_with_suspended_allocation_group` is primarily useful for "run this function if nobody else is tracing
 /// an (de)allocation right now".
 #[inline(always)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::inline_always, reason = "Retain hot-path inlining")]
 pub(super) fn with_suspended_allocation_group<F>(f: F)
 where
     F: FnOnce(),

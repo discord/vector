@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use tracing::debug;
-use vector_config_common::schema::{visit::Visitor, *};
-
-use crate::schema::visitors::merge::Mergeable;
+use vector_config_common::schema::{
+    Map, RootSchema, Schema, SchemaObject, SchemaSettings, get_cleaned_schema_reference, visit,
+    visit::Visitor,
+};
 
 use super::scoped_visit::{
-    visit_schema_object_scoped, SchemaReference, SchemaScopeStack, ScopedVisitor,
+    SchemaReference, SchemaScopeStack, ScopedVisitor, visit_schema_object_scoped,
 };
+use crate::schema::visitors::merge::Mergeable;
 
 /// A visitor that inlines schema references where the referenced schema is only referenced once.
 ///
@@ -28,6 +30,7 @@ pub struct InlineSingleUseReferencesVisitor {
 }
 
 impl InlineSingleUseReferencesVisitor {
+    #[must_use]
     pub fn from_settings(_: &SchemaSettings) -> Self {
         Self {
             eligible_to_inline: HashSet::new(),
@@ -41,7 +44,17 @@ impl Visitor for InlineSingleUseReferencesVisitor {
         // entire schema, by visiting the root schema in a recursive fashion, using a helper visitor.
         let mut occurrence_visitor = OccurrenceVisitor::default();
         occurrence_visitor.visit_root_schema(root);
-        let occurrence_map = occurrence_visitor.into_occurrences();
+        let occurrence_map = occurrence_visitor.occurrence_map;
+
+        // The root component maps identify their outer schemas. Keep those
+        // definitions available to docs consumers even when referenced once.
+        let component_bases: HashSet<&str> = ["sources", "transforms", "sinks"]
+            .into_iter()
+            .filter_map(|property| root.root_map_value_schema(property))
+            .filter_map(Schema::as_object)
+            .filter_map(|schema| schema.reference.as_deref())
+            .map(get_cleaned_schema_reference)
+            .collect();
 
         self.eligible_to_inline = occurrence_map
             .into_iter()
@@ -61,7 +74,8 @@ impl Visitor for InlineSingleUseReferencesVisitor {
                     .and_then(Schema::as_object)
                     .expect("schema definition must exist");
 
-                is_inlineable_schema(def_name.as_ref(), schema)
+                !component_bases.contains(def_name.as_ref())
+                    && is_inlineable_schema(def_name.as_ref(), schema)
             })
             .map(|s| s.as_ref().to_string())
             .collect::<HashSet<_>>();
@@ -95,7 +109,7 @@ impl Visitor for InlineSingleUseReferencesVisitor {
         // If this schema has a schema reference, see if it's in our inline eligibility map. If so,
         // we remove the referenced schema from the definitions, and then merge it into the current
         // schema, after removing the `$ref` field.
-        if let Some(schema_ref) = schema.reference.as_ref().cloned() {
+        if let Some(schema_ref) = schema.reference.clone() {
             let schema_ref = get_cleaned_schema_reference(&schema_ref);
             if self.eligible_to_inline.contains(schema_ref) {
                 let referenced_schema = definitions
@@ -123,34 +137,24 @@ fn is_inlineable_schema(definition_name: &str, schema: &SchemaObject) -> bool {
         "vector::sinks::Sinks",
     ];
 
-    // We want to avoid inlining all of the relevant top-level types used for defining components:
-    // the "outer" types (i.e. `SinkOuter<T>`), the enum/collection types (i.e. the big `Sources`
-    // enum), and the component configuration types themselves (i.e. `AmqpSinkConfig`).
+    // Outer types are protected through the root component maps above. Also keep
+    // enum/collection types (the big `Sources` enum) and individual component
+    // configuration types (such as `AmqpSinkConfig`).
     //
     // There's nothing _technically_ wrong with doing so, but it would break downstream consumers of
     // the schema that parse it in order to extract the individual components and other
     // component-specific metadata.
-    let is_component_base = get_schema_metadata_attr(schema, "docs::component_base_type").is_some();
     let is_component = get_schema_metadata_attr(schema, "docs::component_type").is_some();
 
     let is_allowed_schema = !DISALLOWED_SCHEMAS.contains(&definition_name);
 
-    !is_component_base && !is_component && is_allowed_schema
+    !is_component && is_allowed_schema
 }
 
 #[derive(Debug, Default)]
 struct OccurrenceVisitor {
     scope_stack: SchemaScopeStack,
-    occurrence_map: HashMap<SchemaReference, HashSet<SchemaReference>>,
-}
-
-impl OccurrenceVisitor {
-    fn into_occurrences(self) -> HashMap<SchemaReference, usize> {
-        self.occurrence_map
-            .into_iter()
-            .map(|(k, v)| (k, v.len()))
-            .collect()
-    }
+    occurrence_map: HashMap<SchemaReference, usize>,
 }
 
 impl Visitor for OccurrenceVisitor {
@@ -162,23 +166,11 @@ impl Visitor for OccurrenceVisitor {
         visit_schema_object_scoped(self, definitions, schema);
 
         if let Some(current_schema_ref) = schema.reference.as_ref() {
-            // Track the named "parent" schema for the schema we're currently visiting so that if we
-            // visit this schema again, we don't double count any schema references that it has. The
-            // "parent" schema is simply the closest ancestor schema that was itself a schema
-            // reference, or "Root", which represents the oldest schema ancestor in the document.
-            //
-            // This lets us couple with scenarios where schema A references schema B, and is the
-            // only actual direct schema reference to schema B, but due to multiple schemas
-            // referencing schema A, would otherwise lead to both A and B being visited multiple
-            // times.
-            let current_parent_schema_ref = self.get_current_schema_scope().clone();
             let current_schema_ref = get_cleaned_schema_reference(current_schema_ref);
-
-            let occurrences = self
+            *self
                 .occurrence_map
                 .entry(current_schema_ref.into())
-                .or_default();
-            occurrences.insert(current_parent_schema_ref);
+                .or_default() += 1;
         }
     }
 }
@@ -209,9 +201,8 @@ mod tests {
     use serde_json::json;
     use vector_config_common::schema::visit::Visitor;
 
-    use crate::schema::visitors::test::{as_schema, assert_schemas_eq};
-
     use super::InlineSingleUseReferencesVisitor;
+    use crate::schema::visitors::test::{as_schema, assert_schemas_eq};
 
     #[test]
     fn no_refs() {
@@ -228,6 +219,38 @@ mod tests {
         visitor.visit_root_schema(&mut actual_schema);
 
         assert_schemas_eq(expected_schema, actual_schema);
+    }
+
+    #[test]
+    fn retains_root_component_map_values_without_metadata() {
+        for property in ["sources", "sinks", "transforms"] {
+            let mut schema = as_schema(json!({
+                "allOf": [{"$ref": "#/definitions/config"}],
+                "definitions": {
+                    "config": {"properties": {property: {"$ref": "#/definitions/map"}}},
+                    "map": {"type": "object", "additionalProperties": {"$ref": "#/definitions/renamed_outer"}},
+                    "renamed_outer": {"type": "object", "properties": {
+                        "shared": {"$ref": "#/definitions/inline_me"}
+                    }},
+                    "inline_me": {"type": "string"}
+                }
+            }));
+            InlineSingleUseReferencesVisitor::default().visit_root_schema(&mut schema);
+            assert!(schema.definitions.contains_key("renamed_outer"));
+            assert!(!schema.definitions.contains_key("map"));
+            assert!(!schema.definitions.contains_key("inline_me"));
+            assert_eq!(schema.definitions.len(), 1);
+            assert_eq!(
+                schema
+                    .root_map_value_schema(property)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .reference
+                    .as_deref(),
+                Some("#/definitions/renamed_outer")
+            );
+        }
     }
 
     #[test]
@@ -257,17 +280,7 @@ mod tests {
         assert_schemas_eq(expected_schema, actual_schema);
     }
 
-    // TODO(tobz): These two tests are ignored because the inliner currently works off of schema
-    // reference scopes, so two object properties within the same schema don't count as two
-    // instances of a schema being referenced.
-    //
-    // We need to refactor schema scopes to be piecemeal extensible more in the way of how
-    // `jsonschema` does it rather than an actual stack.... the current approach is good enough for
-    // now, but not optimal in the way that it could be.
-    //
-    // These are here for when I improve the situation after getting this merged.
     #[test]
-    #[ignore]
     fn single_ref_multiple_usages() {
         let mut actual_schema = as_schema(json!({
             "definitions": {
@@ -294,7 +307,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn multiple_refs_mixed_usages() {
         let mut actual_schema = as_schema(json!({
             "definitions": {
@@ -343,6 +355,133 @@ mod tests {
                 }
             }
         }));
+
+        assert_schemas_eq(expected_schema, actual_schema);
+    }
+
+    #[test]
+    fn reference_in_multiple_arrays() {
+        let mut actual_schema = as_schema(json!({
+            "definitions": {
+                "item": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "string" }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "arr1": { "type": "array", "items": { "$ref": "#/definitions/item" } },
+                "arr2": { "type": "array", "items": { "$ref": "#/definitions/item" } }
+            }
+        }));
+
+        let expected_schema = actual_schema.clone();
+
+        let mut visitor = InlineSingleUseReferencesVisitor::default();
+        visitor.visit_root_schema(&mut actual_schema);
+
+        assert_schemas_eq(expected_schema, actual_schema);
+    }
+
+    #[test]
+    fn reference_in_oneof_anyof_allof() {
+        let mut actual_schema = as_schema(json!({
+            "definitions": {
+                "shared": {
+                    "type": "object",
+                    "properties": {
+                        "y": { "type": "string" }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "oneOf": [
+                        { "$ref": "#/definitions/shared" },
+                        { "$ref": "#/definitions/shared" }
+                    ],
+                    "anyOf": [
+                        { "$ref": "#/definitions/shared" },
+                        { "type": "null" }
+                    ],
+                    "allOf": [
+                        { "$ref": "#/definitions/shared" },
+                        { "type": "object" }
+                    ]
+                }
+            }
+        }));
+
+        let expected_schema = actual_schema.clone();
+
+        let mut visitor = InlineSingleUseReferencesVisitor::default();
+        visitor.visit_root_schema(&mut actual_schema);
+
+        assert_schemas_eq(expected_schema, actual_schema);
+    }
+
+    #[test]
+    fn reference_in_additional_properties() {
+        let mut actual_schema = as_schema(json!({
+            "definitions": {
+                "val": {
+                    "type": "object",
+                    "properties": {
+                        "z": { "type": "string" }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "obj1": {
+                    "type": "object",
+                    "additionalProperties": { "$ref": "#/definitions/val" }
+                },
+                "obj2": {
+                    "type": "object",
+                    "additionalProperties": { "$ref": "#/definitions/val" }
+                }
+            }
+        }));
+
+        let expected_schema = actual_schema.clone();
+
+        let mut visitor = InlineSingleUseReferencesVisitor::default();
+        visitor.visit_root_schema(&mut actual_schema);
+
+        assert_schemas_eq(expected_schema, actual_schema);
+    }
+
+    #[test]
+    fn reference_in_pattern_properties() {
+        let mut actual_schema = as_schema(json!({
+            "definitions": {
+                "pat": {
+                    "type": "object",
+                    "properties": {
+                        "w": { "type": "string" }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "obj": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^foo$": { "$ref": "#/definitions/pat" },
+                        "^bar$": { "$ref": "#/definitions/pat" }
+                    }
+                }
+            }
+        }));
+
+        let expected_schema = actual_schema.clone();
+
+        let mut visitor = InlineSingleUseReferencesVisitor::default();
+        visitor.visit_root_schema(&mut actual_schema);
 
         assert_schemas_eq(expected_schema, actual_schema);
     }

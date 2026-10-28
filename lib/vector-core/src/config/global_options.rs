@@ -2,12 +2,26 @@ use std::{fs::DirBuilder, path::PathBuf, time::Duration};
 
 use snafu::{ResultExt, Snafu};
 use vector_common::TimeZone;
-use vector_config::configurable_component;
+use vector_config::{configurable_component, impl_generate_config_from_default};
 
-use super::super::default_data_dir;
-use super::Telemetry;
-use super::{proxy::ProxyConfig, AcknowledgementsConfig, LogSchema};
-use crate::serde::bool_or_struct;
+use super::{
+    super::default_data_dir, AcknowledgementsConfig, LogSchema, Telemetry,
+    metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
+};
+
+#[expect(
+    clippy::ref_option,
+    reason = "we have to follow the serde calling convention"
+)]
+fn is_default_buffer_utilization_ewma_half_life_seconds(value: &Option<f64>) -> bool {
+    value.is_none_or(|seconds| {
+        seconds == vector_buffers::topology::channel::DEFAULT_EWMA_HALF_LIFE_SECONDS
+    })
+}
+
+/// Idle time, in seconds, after which internal metrics expire when neither `expire_metrics_secs`
+/// nor the deprecated `expire_metrics` is set.
+const DEFAULT_EXPIRE_METRICS_SECS: f64 = 300.0;
 
 #[derive(Debug, Snafu)]
 pub(crate) enum DataDirError {
@@ -30,6 +44,19 @@ pub(crate) enum DataDirError {
     },
 }
 
+/// Specifies the wildcard matching mode, relaxed allows configurations where wildcard doesn not match any existing inputs
+#[configurable_component]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WildcardMatching {
+    /// Strict matching (must match at least one existing input)
+    #[default]
+    Strict,
+
+    /// Relaxed matching (must match 0 or more inputs)
+    Relaxed,
+}
+
 /// Global configuration options.
 //
 // If this is modified, make sure those changes are reflected in the `ConfigBuilder::append`
@@ -46,11 +73,23 @@ pub struct GlobalOptions {
     #[serde(default = "crate::default_data_dir")]
     pub data_dir: Option<PathBuf>,
 
+    /// Set wildcard matching mode for inputs
+    ///
+    /// Setting this to "relaxed" allows configurations with wildcards that do not match any inputs
+    /// to be accepted without causing an error.
+    #[serde(skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::required = false))]
+    pub wildcard_matching: Option<WildcardMatching>,
+
     /// Default log schema for all events.
     ///
     /// This is used if a component does not have its own specific log schema. All events use a log
     /// schema, whether or not the default is used, to assign event fields on incoming events.
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(
+        docs::required = false,
+        docs::warnings = "These settings are ignored when `schema.log_namespace` is set to `true`."
+    ))]
     pub log_schema: LogSchema,
 
     /// Telemetry options.
@@ -58,6 +97,7 @@ pub struct GlobalOptions {
     /// Determines whether `source` and `service` tags should be emitted with the
     /// `component_sent_*` and `component_received_*` events.
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::required = false))]
     pub telemetry: Telemetry,
 
     /// The name of the time zone to apply to timestamp conversions that do not contain an explicit time zone.
@@ -65,12 +105,14 @@ pub struct GlobalOptions {
     /// The time zone name may be any name in the [TZ database][tzdb] or `local` to indicate system
     /// local time.
     ///
+    /// Note that in Vector/VRL all timestamps are represented in UTC.
+    ///
     /// [tzdb]: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub timezone: Option<TimeZone>,
 
-    #[configurable(derived)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::required = false))]
     pub proxy: ProxyConfig,
 
     /// Controls how acknowledgements are handled for all sinks by default.
@@ -78,37 +120,80 @@ pub struct GlobalOptions {
     /// See [End-to-end Acknowledgements][e2e_acks] for more information on how Vector handles event
     /// acknowledgement.
     ///
-    /// [e2e_acks]: https://vector.dev/docs/about/under-the-hood/architecture/end-to-end-acknowledgements/
+    /// [e2e_acks]: https://vector.dev/docs/architecture/end-to-end-acknowledgements/
     #[serde(
         default,
-        deserialize_with = "bool_or_struct",
+        deserialize_with = "crate::serde::bool_or_struct",
         skip_serializing_if = "crate::serde::is_default"
     )]
+    #[configurable(metadata(docs::required = false))]
     pub acknowledgements: AcknowledgementsConfig,
 
     /// The amount of time, in seconds, that internal metrics will persist after having not been
     /// updated before they expire and are removed.
     ///
-    /// Not set by default, which allows all internal metrics to grow unbounded over time. If you
-    /// have a configuration that emits many high-cardinality metrics, you may want to consider
-    /// setting this to a value that ensures that metrics live long enough to be emitted and
-    /// captured, but not so long that they continue to build up indefinitely, as this will consume
-    /// a small amount of memory for each metric.
+    /// Deprecated: use `expire_metrics_secs` instead
     #[configurable(deprecated)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::hidden))]
     pub expire_metrics: Option<Duration>,
 
     /// The amount of time, in seconds, that internal metrics will persist after having not been
     /// updated before they expire and are removed.
     ///
-    /// Not set by default, which allows all internal metrics to grow unbounded over time. If you
-    /// have a configuration that emits many high-cardinality metrics, you may want to consider
-    /// setting this to a value that ensures that metrics live long enough to be emitted and
-    /// captured, but not so long that they continue to build up indefinitely, as this will consume
-    /// a small amount of memory for each metric.
-    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    /// Set this to a value larger than your `internal_metrics` scrape interval (default 5 minutes)
+    /// so metrics live long enough to be emitted and captured.
+    #[serde(skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::required = false))]
     pub expire_metrics_secs: Option<f64>,
+
+    /// This allows configuring different expiration intervals for different metric sets.
+    /// By default this is empty and any metric not matched by one of these sets will use
+    /// the global default value, defined using `expire_metrics_secs`.
+    #[serde(skip_serializing_if = "crate::serde::is_default")]
+    pub expire_metrics_per_metric_set: Option<Vec<PerMetricSetExpiration>>,
+
+    /// The half-life, in seconds, for the exponential weighted moving average (EWMA) of source
+    /// and transform buffer utilization metrics.
+    ///
+    /// This controls how quickly the `*_buffer_utilization_mean` gauges respond to new
+    /// observations. Longer half-lives retain more of the previous value, leading to slower
+    /// adjustments.
+    ///
+    /// - Lower values (< 1): Metrics update quickly but may be volatile
+    /// - Default (5): Balanced between responsiveness and stability
+    /// - Higher values (> 5): Smooth, stable metrics that update slowly
+    ///
+    /// Adjust based on whether you need fast detection of buffer issues (lower)
+    /// or want to see sustained trends without noise (higher).
+    ///
+    /// Must be greater than 0.
+    #[serde(skip_serializing_if = "is_default_buffer_utilization_ewma_half_life_seconds")]
+    #[configurable(validation(range(min = 0.0)))]
+    pub buffer_utilization_ewma_half_life_seconds: Option<f64>,
+
+    /// The alpha value for the exponential weighted moving average (EWMA) of transform latency
+    /// metrics.
+    ///
+    /// This controls how quickly the `component_latency_mean_seconds` gauge responds to new
+    /// observations. Values closer to 1.0 retain more of the previous value, leading to slower
+    /// adjustments. The default value of 0.9 is equivalent to a "half life" of 6-7 measurements.
+    ///
+    /// Must be between 0 and 1 exclusively (0 < alpha < 1).
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(validation(range(min = 0.0, max = 1.0)))]
+    pub latency_ewma_alpha: Option<f64>,
+
+    /// The interval, in seconds, at which the internal metrics cache for VRL is refreshed.
+    /// This must be set to be able to access metrics in VRL functions.
+    ///
+    /// Higher values lead to stale metric values from `get_vector_metric`,
+    /// `find_vector_metrics`, and `aggregate_vector_metrics` functions.
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    pub metrics_storage_refresh_period: Option<f64>,
 }
+
+impl_generate_config_from_default!(GlobalOptions);
 
 impl GlobalOptions {
     /// Resolve the `data_dir` option in either the global or local config, and
@@ -129,9 +214,8 @@ impl GlobalOptions {
         if !data_dir.exists() {
             return Err(DataDirError::DoesNotExist { data_dir }.into());
         }
-        let readonly = std::fs::metadata(&data_dir)
-            .map(|meta| meta.permissions().readonly())
-            .unwrap_or(true);
+        let readonly =
+            std::fs::metadata(&data_dir).map_or(true, |meta| meta.permissions().readonly());
         if readonly {
             return Err(DataDirError::NotWritable { data_dir }.into());
         }
@@ -161,6 +245,20 @@ impl GlobalOptions {
         Ok(data_subdir)
     }
 
+    /// Returns the idle time, in seconds, after which internal metrics expire, or `None` when
+    /// they never expire.
+    ///
+    /// `expire_metrics_secs` takes precedence over the deprecated `expire_metrics`. Topology
+    /// startup rejects configs that set both.
+    pub fn effective_expire_metrics_secs(&self) -> Option<f64> {
+        let secs = match (self.expire_metrics_secs, self.expire_metrics) {
+            (Some(secs), _) => secs,
+            (None, Some(duration)) => duration.as_secs_f64(),
+            (None, None) => DEFAULT_EXPIRE_METRICS_SECS,
+        };
+        if secs < 0.0 { None } else { Some(secs) }
+    }
+
     /// Merge a second global configuration into self, and return the new merged data.
     ///
     /// # Errors
@@ -170,11 +268,18 @@ impl GlobalOptions {
     pub fn merge(&self, with: Self) -> Result<Self, Vec<String>> {
         let mut errors = Vec::new();
 
-        if conflicts(&self.proxy.http, &with.proxy.http) {
+        if conflicts(
+            self.wildcard_matching.as_ref(),
+            with.wildcard_matching.as_ref(),
+        ) {
+            errors.push("conflicting values for 'wildcard_matching' found".to_owned());
+        }
+
+        if conflicts(self.proxy.http.as_ref(), with.proxy.http.as_ref()) {
             errors.push("conflicting values for 'proxy.http' found".to_owned());
         }
 
-        if conflicts(&self.proxy.https, &with.proxy.https) {
+        if conflicts(self.proxy.https.as_ref(), with.proxy.https.as_ref()) {
             errors.push("conflicting values for 'proxy.https' found".to_owned());
         }
 
@@ -182,15 +287,26 @@ impl GlobalOptions {
             errors.push("conflicting values for 'proxy.no_proxy' found".to_owned());
         }
 
-        if conflicts(&self.timezone, &with.timezone) {
+        if conflicts(self.timezone.as_ref(), with.timezone.as_ref()) {
             errors.push("conflicting values for 'timezone' found".to_owned());
         }
 
         if conflicts(
-            &self.acknowledgements.enabled,
-            &with.acknowledgements.enabled,
+            self.acknowledgements.enabled.as_ref(),
+            with.acknowledgements.enabled.as_ref(),
         ) {
             errors.push("conflicting values for 'acknowledgements' found".to_owned());
+        }
+
+        if conflicts(self.expire_metrics.as_ref(), with.expire_metrics.as_ref()) {
+            errors.push("conflicting values for 'expire_metrics' found".to_owned());
+        }
+
+        if conflicts(
+            self.expire_metrics_secs.as_ref(),
+            with.expire_metrics_secs.as_ref(),
+        ) {
+            errors.push("conflicting values for 'expire_metrics_secs' found".to_owned());
         }
 
         let data_dir = if self.data_dir.is_none() || self.data_dir == default_data_dir() {
@@ -214,9 +330,20 @@ impl GlobalOptions {
         let mut telemetry = self.telemetry.clone();
         telemetry.merge(&with.telemetry);
 
+        let merged_expire_metrics_per_metric_set = match (
+            &self.expire_metrics_per_metric_set,
+            &with.expire_metrics_per_metric_set,
+        ) {
+            (Some(a), Some(b)) => Some(a.iter().chain(b).cloned().collect()),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+
         if errors.is_empty() {
             Ok(Self {
                 data_dir,
+                wildcard_matching: self.wildcard_matching.or(with.wildcard_matching),
                 log_schema,
                 telemetry,
                 acknowledgements: self.acknowledgements.merge_default(&with.acknowledgements),
@@ -224,6 +351,14 @@ impl GlobalOptions {
                 proxy: self.proxy.merge(&with.proxy),
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),
                 expire_metrics_secs: self.expire_metrics_secs.or(with.expire_metrics_secs),
+                expire_metrics_per_metric_set: merged_expire_metrics_per_metric_set,
+                buffer_utilization_ewma_half_life_seconds: self
+                    .buffer_utilization_ewma_half_life_seconds
+                    .or(with.buffer_utilization_ewma_half_life_seconds),
+                latency_ewma_alpha: self.latency_ewma_alpha.or(with.latency_ewma_alpha),
+                metrics_storage_refresh_period: self
+                    .metrics_storage_refresh_period
+                    .or(with.metrics_storage_refresh_period),
             })
         } else {
             Err(errors)
@@ -234,9 +369,42 @@ impl GlobalOptions {
     pub fn timezone(&self) -> TimeZone {
         self.timezone.unwrap_or(TimeZone::Local)
     }
+
+    /// Returns a list of top-level field names that differ between two [`GlobalOptions`] values.
+    ///
+    /// This function performs a shallow comparison by serializing both configs to JSON
+    /// and comparing their top-level keys.
+    ///
+    /// Useful for logging which global fields changed during config reload attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if either of the [`GlobalOptions`] values
+    /// cannot be serialized into a JSON object. This is unlikely under normal usage,
+    /// but may occur if serialization fails due to unexpected data structures or changes
+    /// in the type definition.
+    pub fn diff(&self, other: &Self) -> Result<Vec<String>, serde_json::Error> {
+        let old_value = serde_json::to_value(self)?;
+        let new_value = serde_json::to_value(other)?;
+
+        let serde_json::Value::Object(old_map) = old_value else {
+            return Ok(vec![]);
+        };
+        let serde_json::Value::Object(new_map) = new_value else {
+            return Ok(vec![]);
+        };
+
+        Ok(old_map
+            .iter()
+            .filter_map(|(k, v_old)| match new_map.get(k) {
+                Some(v_new) if v_new != v_old => Some(k.clone()),
+                _ => None,
+            })
+            .collect())
+    }
 }
 
-fn conflicts<T: PartialEq>(this: &Option<T>, that: &Option<T>) -> bool {
+fn conflicts<T: PartialEq>(this: Option<&T>, that: Option<&T>) -> bool {
     matches!((this, that), (Some(this), Some(that)) if this != that)
 }
 
@@ -344,7 +512,28 @@ mod tests {
         assert_eq!(merge(Some(1.0), None), Ok(Some(1.0)));
         assert_eq!(merge(None, Some(2.0)), Ok(Some(2.0)));
         assert_eq!(merge(Some(3.0), Some(3.0)), Ok(Some(3.0)));
-        assert_eq!(merge(Some(4.0), Some(5.0)), Ok(Some(4.0))); // Uses minimum
+        assert_eq!(
+            merge(Some(4.0), Some(5.0)),
+            Err(vec![
+                "conflicting values for 'expire_metrics_secs' found".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn diff_detects_changed_keys() {
+        let old = GlobalOptions {
+            data_dir: Some(std::path::PathBuf::from("/path1")),
+            ..Default::default()
+        };
+        let new = GlobalOptions {
+            data_dir: Some(std::path::PathBuf::from("/path2")),
+            ..Default::default()
+        };
+        assert_eq!(
+            old.diff(&new).expect("diff failed"),
+            vec!["data_dir".to_string()]
+        );
     }
 
     fn merge<P: Debug, T>(
@@ -360,7 +549,7 @@ mod tests {
     }
 
     fn make_config<P: Debug>(name: &str, value: Option<P>) -> GlobalOptions {
-        toml::from_str(&value.map_or(String::new(), |value| format!(r#"{name} = {value:?}"#)))
+        toml::from_str(&value.map_or(String::new(), |value| format!(r"{name} = {value:?}")))
             .unwrap()
     }
 }

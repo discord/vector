@@ -1,23 +1,49 @@
-use super::{Count, InternalEvent, InternalEventHandle, RegisterInternalEvent};
-use metrics::{counter, Counter};
+use metrics::{Counter, Label};
+
+use crate::counter;
+
+use super::{Count, CounterName, InternalEvent, InternalEventHandle, RegisterInternalEvent};
+use crate::NamedInternalEvent;
 
 pub const INTENTIONAL: bool = true;
 pub const UNINTENTIONAL: bool = false;
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ComponentEventsDropped<'a, const INTENTIONAL: bool> {
     pub count: usize,
     pub reason: &'a str,
 }
 
-impl<'a, const INTENTIONAL: bool> InternalEvent for ComponentEventsDropped<'a, INTENTIONAL> {
+impl<const INTENTIONAL: bool> InternalEvent for ComponentEventsDropped<'_, INTENTIONAL> {
     fn emit(self) {
+        self.emit_with_group(None);
+    }
+}
+
+impl<'a, const INTENTIONAL: bool> ComponentEventsDropped<'a, INTENTIONAL> {
+    /// Emits the discarded events metric with an optional `group` label.
+    pub fn emit_with_group(self, group: Option<String>) {
+        #[cfg(any(test, feature = "test"))]
+        crate::event_test_util::record_internal_event(<Self as super::NamedInternalEvent>::name(
+            &self,
+        ));
+
         let count = self.count;
-        self.register().emit(Count(count));
+        self.register_with_group(group).emit(Count(count));
     }
 
-    fn name(&self) -> Option<&'static str> {
-        Some("ComponentEventsDropped")
+    fn register_with_group(self, group: Option<String>) -> DroppedHandle<'a, INTENTIONAL> {
+        let tags = std::iter::once(Label::new(
+            "intentional",
+            if INTENTIONAL { "true" } else { "false" },
+        ))
+        .chain(group.map(|value| Label::new("group", value)))
+        .collect::<Vec<_>>();
+
+        DroppedHandle {
+            discarded_events: counter!(CounterName::ComponentDiscardedEventsTotal, tags),
+            reason: self.reason,
+        }
     }
 }
 
@@ -27,18 +53,15 @@ impl<'a, const INTENTIONAL: bool> From<&'a str> for ComponentEventsDropped<'a, I
     }
 }
 
+// ComponentEventsDropped is the foundation type the `registered_event!` macro
+// abstracts over, so we have to implement RegisterInternalEvent by hand here.
 impl<'a, const INTENTIONAL: bool> RegisterInternalEvent
     for ComponentEventsDropped<'a, INTENTIONAL>
 {
+    // ## skip check-validity-events ##
     type Handle = DroppedHandle<'a, INTENTIONAL>;
     fn register(self) -> Self::Handle {
-        Self::Handle {
-            discarded_events: counter!(
-                "component_discarded_events_total",
-                "intentional" => if INTENTIONAL { "true" } else { "false" },
-            ),
-            reason: self.reason,
-        }
+        self.register_with_group(None)
     }
 }
 
@@ -48,7 +71,7 @@ pub struct DroppedHandle<'a, const INTENDED: bool> {
     reason: &'a str,
 }
 
-impl<'a, const INTENDED: bool> InternalEventHandle for DroppedHandle<'a, INTENDED> {
+impl<const INTENDED: bool> InternalEventHandle for DroppedHandle<'_, INTENDED> {
     type Data = Count;
     fn emit(&self, data: Self::Data) {
         let message = "Events dropped";
@@ -58,7 +81,6 @@ impl<'a, const INTENDED: bool> InternalEventHandle for DroppedHandle<'a, INTENDE
                 intentional = INTENDED,
                 count = data.0,
                 reason = self.reason,
-                internal_log_rate_limit = true,
             );
         } else {
             error!(
@@ -66,7 +88,6 @@ impl<'a, const INTENDED: bool> InternalEventHandle for DroppedHandle<'a, INTENDE
                 intentional = INTENDED,
                 count = data.0,
                 reason = self.reason,
-                internal_log_rate_limit = true,
             );
         }
         self.discarded_events.increment(data.0 as u64);

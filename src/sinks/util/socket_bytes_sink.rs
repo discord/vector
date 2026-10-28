@@ -1,8 +1,8 @@
 use std::{
-    io::{Error as IoError, ErrorKind},
+    io::Error as IoError,
     marker::Unpin,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
@@ -107,7 +107,7 @@ where
     T: AsyncWrite + Unpin,
 {
     fn drop(self: Pin<&mut Self>) {
-        self.get_mut().state.ack(EventStatus::Dropped)
+        self.get_mut().state.ack(EventStatus::Dropped);
     }
 }
 
@@ -118,10 +118,10 @@ where
     type Error = <FramedWrite<T, BytesCodec> as Sink<Bytes>>::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.as_mut().project().state.events_total >= MAX_PENDING_ITEMS {
-            if let Err(error) = ready!(self.as_mut().poll_flush(cx)) {
-                return Poll::Ready(Err(error));
-            }
+        if self.as_mut().project().state.events_total >= MAX_PENDING_ITEMS
+            && let Err(error) = ready!(self.as_mut().poll_flush(cx))
+        {
+            return Poll::Ready(Err(error));
         }
 
         let inner = self.project().inner;
@@ -151,7 +151,7 @@ where
                     return Poll::Ready(Err(error));
                 }
 
-                return Poll::Ready(Err(IoError::new(ErrorKind::Other, reason)));
+                return Poll::Ready(Err(IoError::other(reason)));
             }
             ShutdownCheck::Alive => {}
         }
@@ -161,7 +161,7 @@ where
             inner, cx
         ));
         self.as_mut().get_mut().state.ack(match result {
-            Ok(_) => EventStatus::Delivered,
+            Ok(()) => EventStatus::Delivered,
             Err(_) => EventStatus::Errored,
         });
         Poll::Ready(result)

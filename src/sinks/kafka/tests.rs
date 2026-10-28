@@ -6,32 +6,34 @@ mod integration_test {
     use std::{collections::HashMap, future::ready, thread, time::Duration};
 
     use bytes::Bytes;
-    use futures::StreamExt;
+    use futures::{StreamExt, stream};
     use rdkafka::{
+        Message, Offset, TopicPartitionList,
         consumer::{BaseConsumer, Consumer},
         message::Headers,
-        Message, Offset, TopicPartitionList,
     };
-    use vector_lib::codecs::TextSerializerConfig;
-    use vector_lib::lookup::lookup_v2::ConfigTargetPath;
     use vector_lib::{
-        config::{init_telemetry, Tags, Telemetry},
+        codecs::{JsonSerializerConfig, TextSerializerConfig},
+        config::{Tags, Telemetry, init_telemetry},
         event::{BatchNotifier, BatchStatus},
+        lookup::lookup_v2::ConfigTargetPath,
     };
+    use vrl::event_path;
 
     use super::super::{config::KafkaSinkConfig, sink::KafkaSink, *};
     use crate::{
-        event::{ObjectMap, Value},
+        event::{ObjectMap, TraceEvent, Value},
         kafka::{KafkaAuthConfig, KafkaCompression, KafkaSaslConfig},
         sinks::prelude::*,
+        template::ConfinementConfig,
         test_util::{
             components::{
-                assert_data_volume_sink_compliance, assert_sink_compliance, DATA_VOLUME_SINK_TAGS,
-                SINK_TAGS,
+                DATA_VOLUME_SINK_TAGS, SINK_TAGS, assert_data_volume_sink_compliance,
+                assert_sink_compliance,
             },
-            random_lines_with_stream, random_string, wait_for,
+            map_event_batch_stream, random_lines_with_stream, random_string, wait_for,
         },
-        tls::{TlsConfig, TlsEnableableConfig, TEST_PEM_INTERMEDIATE_CA_PATH},
+        tls::{TEST_PEM_INTERMEDIATE_CA_PATH, TlsConfig, TlsEnableableConfig},
     };
 
     fn kafka_host() -> String {
@@ -39,7 +41,18 @@ mod integration_test {
     }
 
     fn kafka_address(port: u16) -> String {
-        format!("{}:{}", kafka_host(), port)
+        format!("{}:{port}", kafka_host())
+    }
+
+    // Tests exercise the sink itself, not confinement; build a checkerless confined topic.
+    fn confined_topic(topic: Template) -> ConfinedTemplate {
+        topic
+            .confine(
+                &ConfinementConfig::default(),
+                KafkaSinkConfig::NAME,
+                "topic",
+            )
+            .unwrap()
     }
 
     #[tokio::test]
@@ -47,23 +60,33 @@ mod integration_test {
         crate::test_util::trace_init();
 
         let topic = format!("test-{}", random_string(10));
+        let topic = Template::try_from(topic.clone()).unwrap();
 
         let config = KafkaSinkConfig {
             bootstrap_servers: kafka_address(9091),
-            topic: Template::try_from(topic.clone()).unwrap(),
+            topic: topic.clone(),
             healthcheck_topic: None,
             key_field: None,
             encoding: TextSerializerConfig::default().into(),
             batch: BatchConfig::default(),
             compression: KafkaCompression::None,
             auth: KafkaAuthConfig::default(),
-            socket_timeout_ms: Duration::from_millis(60000),
-            message_timeout_ms: Duration::from_millis(300000),
+            socket_timeout_ms: Duration::from_mins(1),
+            message_timeout_ms: Duration::from_mins(5),
+            rate_limit_duration_secs: 1,
+            rate_limit_num: i64::MAX as u64,
             librdkafka_options: HashMap::new(),
             headers_key: None,
-            acknowledgements: Default::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
         };
-        self::sink::healthcheck(config).await.unwrap();
+        self::sink::healthcheck(
+            config.clone(),
+            confined_topic(topic),
+            crate::config::SinkHealthcheckOptions::default(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -71,23 +94,33 @@ mod integration_test {
         crate::test_util::trace_init();
 
         let topic = format!("{{ {} }}", random_string(10));
+        let topic = Template::try_from(topic.clone()).unwrap();
 
         let config = KafkaSinkConfig {
             bootstrap_servers: kafka_address(9091),
-            topic: Template::try_from(topic.clone()).unwrap(),
+            topic: topic.clone(),
             healthcheck_topic: Some(String::from("topic-1234")),
             key_field: None,
             encoding: TextSerializerConfig::default().into(),
             batch: BatchConfig::default(),
             compression: KafkaCompression::None,
             auth: KafkaAuthConfig::default(),
-            socket_timeout_ms: Duration::from_millis(60000),
-            message_timeout_ms: Duration::from_millis(300000),
+            socket_timeout_ms: Duration::from_mins(1),
+            message_timeout_ms: Duration::from_mins(5),
+            rate_limit_duration_secs: 1,
+            rate_limit_num: i64::MAX as u64,
             librdkafka_options: HashMap::new(),
             headers_key: None,
-            acknowledgements: Default::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
         };
-        self::sink::healthcheck(config).await.unwrap();
+        self::sink::healthcheck(
+            config.clone(),
+            confined_topic(topic),
+            crate::config::SinkHealthcheckOptions::default(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -168,9 +201,10 @@ mod integration_test {
         librdkafka_options: HashMap<String, String>,
     ) -> crate::Result<KafkaSink> {
         let topic = format!("test-{}", random_string(10));
+        let topic = Template::try_from(format!("{topic}-%Y%m%d")).unwrap();
         let config = KafkaSinkConfig {
             bootstrap_servers: kafka_address(9091),
-            topic: Template::try_from(format!("{}-%Y%m%d", topic)).unwrap(),
+            topic: topic.clone(),
             compression: KafkaCompression::None,
             healthcheck_topic: None,
             encoding: TextSerializerConfig::default().into(),
@@ -179,16 +213,25 @@ mod integration_test {
                 sasl: None,
                 tls: None,
             },
-            socket_timeout_ms: Duration::from_millis(60000),
-            message_timeout_ms: Duration::from_millis(300000),
+            socket_timeout_ms: Duration::from_mins(1),
+            message_timeout_ms: Duration::from_mins(5),
+            rate_limit_duration_secs: 1,
+            rate_limit_num: i64::MAX as u64,
             batch,
             librdkafka_options,
             headers_key: None,
-            acknowledgements: Default::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
         };
         config.clone().to_rdkafka()?;
-        self::sink::healthcheck(config.clone()).await?;
-        KafkaSink::new(config)
+        let topic = confined_topic(topic);
+        self::sink::healthcheck(
+            config.clone(),
+            topic.clone(),
+            crate::config::SinkHealthcheckOptions::default(),
+        )
+        .await?;
+        KafkaSink::new(config.clone(), topic)
     }
 
     #[tokio::test]
@@ -197,16 +240,18 @@ mod integration_test {
         let mut batch = BatchConfig::default();
         batch.max_bytes = Some(1000);
 
-        assert!(kafka_batch_options_overrides(
-            batch,
-            indexmap::indexmap! {
-                "batch.size".to_string() => 1.to_string(),
-            }
-            .into_iter()
-            .collect()
-        )
-        .await
-        .is_err())
+        assert!(
+            kafka_batch_options_overrides(
+                batch,
+                indexmap::indexmap! {
+                    "batch.size".to_string() => 1.to_string(),
+                }
+                .into_iter()
+                .collect()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -227,16 +272,18 @@ mod integration_test {
         let mut batch = BatchConfig::default();
         batch.max_events = Some(10);
 
-        assert!(kafka_batch_options_overrides(
-            batch,
-            indexmap::indexmap! {
-                "batch.num.messages".to_string() => 1.to_string(),
-            }
-            .into_iter()
-            .collect()
-        )
-        .await
-        .is_err())
+        assert!(
+            kafka_batch_options_overrides(
+                batch,
+                indexmap::indexmap! {
+                    "batch.num.messages".to_string() => 1.to_string(),
+                }
+                .into_iter()
+                .collect()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -245,16 +292,18 @@ mod integration_test {
         let mut batch = BatchConfig::default();
         batch.timeout_secs = Some(10.0);
 
-        assert!(kafka_batch_options_overrides(
-            batch,
-            indexmap::indexmap! {
-                "queue.buffering.max.ms".to_string() => 1.to_string(),
-            }
-            .into_iter()
-            .collect()
-        )
-        .await
-        .is_err())
+        assert!(
+            kafka_batch_options_overrides(
+                batch,
+                indexmap::indexmap! {
+                    "queue.buffering.max.ms".to_string() => 1.to_string(),
+                }
+                .into_iter()
+                .collect()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -295,6 +344,141 @@ mod integration_test {
         .await;
     }
 
+    #[tokio::test]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::too_many_lines, reason = "Keep the broker fixture together.")]
+    async fn kafka_happy_path_trace_events() {
+        crate::test_util::trace_init();
+
+        assert_sink_compliance(&SINK_TAGS, async move {
+            let topic_prefix = format!("test-trace-{}", random_string(10));
+            let topic_now = format!("{topic_prefix}-{}", chrono::Utc::now().format("%Y%m%d"));
+            let topic = Template::try_from(format!("{topic_prefix}-%Y%m%d")).unwrap();
+            let key_field = ConfigTargetPath::try_from("trace_key".to_string()).unwrap();
+            let headers_key = ConfigTargetPath::try_from("trace_headers".to_string()).unwrap();
+            let trace_key = "trace-partition-key";
+            let header_name = "trace-header-key";
+            let header_value = "trace-header-value";
+
+            let config = KafkaSinkConfig {
+                bootstrap_servers: kafka_address(9091),
+                topic: topic.clone(),
+                healthcheck_topic: None,
+                key_field: Some(key_field.clone()),
+                encoding: JsonSerializerConfig::default().into(),
+                batch: BatchConfig::default(),
+                compression: KafkaCompression::None,
+                auth: KafkaAuthConfig::default(),
+                socket_timeout_ms: Duration::from_mins(1),
+                message_timeout_ms: Duration::from_mins(5),
+                rate_limit_duration_secs: 1,
+                rate_limit_num: i64::MAX as u64,
+                librdkafka_options: HashMap::new(),
+                headers_key: Some(headers_key.clone()),
+                acknowledgements: AcknowledgementsConfig::default(),
+                confinement: ConfinementConfig::default(),
+            };
+
+            let num_events = 100;
+            let mut expected_messages = Vec::with_capacity(num_events);
+
+            let (batch, receiver) = BatchNotifier::new_with_receiver();
+            let mut events = Vec::with_capacity(num_events);
+            for i in 0..num_events {
+                let message = format!("trace-message-{i}");
+                expected_messages.push(message.clone());
+
+                let mut trace = TraceEvent::default();
+                trace.insert(event_path!("message"), message);
+                trace.insert(event_path!("trace_key"), trace_key);
+                trace.insert(event_path!("timestamp"), chrono::Utc::now());
+
+                let mut trace_headers = ObjectMap::new();
+                trace_headers.insert(header_name.into(), Value::Bytes(Bytes::from(header_value)));
+                trace.insert(&headers_key, trace_headers);
+
+                events.push(Event::Trace(trace.with_batch_notifier(&batch)));
+            }
+
+            let sink = KafkaSink::new(config.clone(), confined_topic(topic)).unwrap();
+            let sink = VectorSink::from_event_streamsink(sink);
+            let stream = map_event_batch_stream(stream::iter(events), Some(batch));
+            sink.run(stream).await.unwrap();
+            assert_eq!(receiver.await, BatchStatus::Delivered);
+
+            // Read back everything from the beginning.
+            let mut client_config = rdkafka::ClientConfig::new();
+            client_config.set("bootstrap.servers", kafka_address(9091).as_str());
+            client_config.set("group.id", random_string(10));
+            client_config.set("enable.partition.eof", "true");
+            let mut tpl = TopicPartitionList::new();
+            tpl.add_partition(&topic_now, 0)
+                .set_offset(Offset::Beginning)
+                .unwrap();
+            let consumer: BaseConsumer = client_config.create().unwrap();
+            consumer.assign(&tpl).unwrap();
+
+            wait_for(
+                || match consumer.fetch_watermarks(&topic_now, 0, Duration::from_secs(3)) {
+                    Ok((_low, high)) => ready(
+                        high >= i64::try_from(num_events).expect("test event count fits in i64"),
+                    ),
+                    Err(err) => {
+                        println!("retrying due to error fetching watermarks: {err}");
+                        ready(false)
+                    }
+                },
+            )
+            .await;
+
+            let (low, high) = consumer
+                .fetch_watermarks(&topic_now, 0, Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(
+                (
+                    0,
+                    i64::try_from(num_events).expect("test event count fits in i64")
+                ),
+                (low, high)
+            );
+
+            let mut failures = 0;
+            let mut observed_messages = Vec::new();
+            while failures < 100 {
+                match consumer.poll(Duration::from_secs(3)) {
+                    Some(Ok(msg)) => {
+                        let payload: &str = msg.payload_view().unwrap().unwrap();
+                        let payload_json: serde_json::Value =
+                            serde_json::from_str(payload).unwrap();
+                        observed_messages
+                            .push(payload_json["message"].as_str().unwrap().to_owned());
+
+                        let key = msg.key().unwrap();
+                        assert_eq!(key, trace_key.as_bytes());
+
+                        let timestamp = msg.timestamp().to_millis();
+                        assert!(timestamp.is_some());
+
+                        let header = msg.headers().unwrap().get(0);
+                        assert_eq!(header.key, header_name);
+                        assert_eq!(header.value.unwrap(), header_value.as_bytes());
+                    }
+                    None if observed_messages.len() >= num_events => break,
+                    _ => {
+                        failures += 1;
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+
+            assert_eq!(observed_messages.len(), num_events);
+            assert_eq!(observed_messages, expected_messages);
+        })
+        .await;
+    }
+
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::too_many_lines, reason = "Keep the broker fixture together.")]
     async fn kafka_happy_path(
         server: String,
         sasl: Option<KafkaSaslConfig>,
@@ -317,25 +501,29 @@ mod integration_test {
         }
 
         let topic = format!("test-{}", random_string(10));
+        let topic_template = Template::try_from(format!("{topic}-%Y%m%d")).unwrap();
         let headers_key = ConfigTargetPath::try_from("headers_key".to_string()).unwrap();
         let kafka_auth = KafkaAuthConfig { sasl, tls };
         let config = KafkaSinkConfig {
             bootstrap_servers: server.clone(),
-            topic: Template::try_from(format!("{}-%Y%m%d", topic)).unwrap(),
+            topic: topic_template.clone(),
             healthcheck_topic: None,
             key_field: None,
             encoding: TextSerializerConfig::default().into(),
             batch: BatchConfig::default(),
             compression,
             auth: kafka_auth.clone(),
-            socket_timeout_ms: Duration::from_millis(60000),
-            message_timeout_ms: Duration::from_millis(300000),
+            socket_timeout_ms: Duration::from_mins(1),
+            message_timeout_ms: Duration::from_mins(5),
+            rate_limit_duration_secs: 1,
+            rate_limit_num: i64::MAX as u64,
             librdkafka_options: HashMap::new(),
             headers_key: Some(headers_key.clone()),
-            acknowledgements: Default::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
         };
-        let topic = format!("{}-{}", topic, chrono::Utc::now().format("%Y%m%d"));
-        println!("Topic name generated in test: {:?}", topic);
+        let topic = format!("{topic}-{}", chrono::Utc::now().format("%Y%m%d"));
+        println!("Topic name generated in test: {topic:?}");
 
         let num_events = 1000;
         let (batch, mut receiver) = BatchNotifier::new_with_receiver();
@@ -356,9 +544,10 @@ mod integration_test {
             events
         });
 
+        let topic_template = confined_topic(topic_template);
         if test_telemetry_tags {
             assert_data_volume_sink_compliance(&DATA_VOLUME_SINK_TAGS, async move {
-                let sink = KafkaSink::new(config).unwrap();
+                let sink = KafkaSink::new(config.clone(), topic_template).unwrap();
                 let sink = VectorSink::from_event_streamsink(sink);
                 sink.run(input_events).await
             })
@@ -366,7 +555,7 @@ mod integration_test {
             .expect("Running sink failed");
         } else {
             assert_sink_compliance(&SINK_TAGS, async move {
-                let sink = KafkaSink::new(config).unwrap();
+                let sink = KafkaSink::new(config.clone(), topic_template).unwrap();
                 let sink = VectorSink::from_event_streamsink(sink);
                 sink.run(input_events).await
             })
@@ -378,7 +567,7 @@ mod integration_test {
         // read back everything from the beginning
         let mut client_config = rdkafka::ClientConfig::new();
         client_config.set("bootstrap.servers", server.as_str());
-        client_config.set("group.id", &random_string(10));
+        client_config.set("group.id", random_string(10));
         client_config.set("enable.partition.eof", "true");
         kafka_auth.apply(&mut client_config).unwrap();
 
@@ -395,7 +584,7 @@ mod integration_test {
             || match consumer.fetch_watermarks(&topic, 0, Duration::from_secs(3)) {
                 Ok((_low, high)) => ready(high > 0),
                 Err(err) => {
-                    println!("retrying due to error fetching watermarks: {}", err);
+                    println!("retrying due to error fetching watermarks: {err}");
                     ready(false)
                 }
             },
@@ -406,7 +595,13 @@ mod integration_test {
         let (low, high) = consumer
             .fetch_watermarks(&topic, 0, Duration::from_secs(3))
             .unwrap();
-        assert_eq!((0, num_events as i64), (low, high));
+        assert_eq!(
+            (
+                0,
+                i64::try_from(num_events).expect("test event count fits in i64")
+            ),
+            (low, high)
+        );
 
         // loop instead of iter so we can set a timeout
         let mut failures = 0;

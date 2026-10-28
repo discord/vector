@@ -3,29 +3,28 @@ mod http;
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use vector_lib::{
     codecs::{
+        BytesEncoder, Decoder, DecodingConfig, Encoder, EncodingConfig, EncodingConfigWithFraming,
         decoding::{self, DeserializerConfig},
         encoding::{
             self, Framer, FramingConfig, JsonSerializerConfig, SerializerConfig,
             TextSerializerConfig,
         },
-        BytesEncoder,
     },
-    config::LogNamespace,
+    config::{DataType, LogNamespace},
+    event::Event,
 };
-use vector_lib::{config::DataType, event::Event};
 
-use crate::codecs::{Decoder, DecodingConfig, Encoder, EncodingConfig, EncodingConfigWithFraming};
-
-pub use self::event::{encode_test_event, TestEvent};
-pub use self::http::HttpResourceConfig;
 use self::http::HttpResourceOutputContext;
-
+pub use self::{
+    event::{TestEvent, encode_test_event},
+    http::HttpResourceConfig,
+};
 use super::{
-    sync::{Configuring, TaskCoordinator},
     RunnerMetrics,
+    sync::{Configuring, TaskCoordinator},
 };
 
 /// The codec used by the external resource.
@@ -63,6 +62,7 @@ impl ResourceCodec {
     /// Not all codecs support all possible event types (i.e. a codec has no means to losslessly
     /// represent the data in a particular event type) so we must check at runtime to ensure that
     /// we're only generating event payloads that can be encoded/decoded for the given component.
+    #[must_use]
     pub fn allowed_event_data_types(self) -> DataType {
         match self {
             Self::Encoding(encoding) => encoding.config().input_type(),
@@ -75,6 +75,9 @@ impl ResourceCodec {
     ///
     /// The encoder is generated as an inverse to the input codec: if a decoding configuration was
     /// given, we generate an encoder that satisfies that decoding configuration, and vice versa.
+    #[must_use]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_panics_doc, reason = "Panic documentation deferred")]
     pub fn into_encoder(&self) -> Encoder<encoding::Framer> {
         let (framer, serializer) = match self {
             Self::Encoding(config) => (
@@ -106,6 +109,8 @@ impl ResourceCodec {
     ///
     /// The decoder is generated as an inverse to the input codec: if an encoding configuration was
     /// given, we generate a decoder that satisfies that encoding configuration, and vice versa.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn into_decoder(&self, log_namespace: LogNamespace) -> vector_lib::Result<Decoder> {
         let (framer, deserializer) = match self {
             Self::Decoding(config) => return config.build(),
@@ -145,6 +150,11 @@ impl From<DecodingConfig> for ResourceCodec {
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::default_trait_access,
+    reason = "Preserve inferred default types"
+)]
 fn deserializer_config_to_serializer(config: &DeserializerConfig) -> encoding::Serializer {
     let serializer_config = match config {
         // TODO: This isn't necessarily a one-to-one conversion, at least not in the future when
@@ -157,6 +167,7 @@ fn deserializer_config_to_serializer(config: &DeserializerConfig) -> encoding::S
                 protobuf: vector_lib::codecs::encoding::ProtobufSerializerOptions {
                     desc_file: config.protobuf.desc_file.clone(),
                     message_type: config.protobuf.message_type.clone(),
+                    use_json_names: config.protobuf.use_json_names,
                 },
             })
         }
@@ -167,11 +178,13 @@ fn deserializer_config_to_serializer(config: &DeserializerConfig) -> encoding::S
         DeserializerConfig::Syslog { .. } => SerializerConfig::Logfmt,
         DeserializerConfig::Native => SerializerConfig::Native,
         DeserializerConfig::NativeJson { .. } => SerializerConfig::NativeJson,
-        DeserializerConfig::Gelf { .. } => SerializerConfig::Gelf,
+        DeserializerConfig::Gelf { .. } => SerializerConfig::Gelf(Default::default()),
         DeserializerConfig::Avro { avro } => SerializerConfig::Avro { avro: avro.into() },
         // TODO: Influxdb has no serializer yet
-        DeserializerConfig::Influxdb { .. } => todo!(),
+        DeserializerConfig::Influxdb { .. } => unimplemented!(),
         DeserializerConfig::Vrl { .. } => unimplemented!(),
+        #[cfg(feature = "codecs-opentelemetry")]
+        DeserializerConfig::Otlp { .. } => SerializerConfig::Otlp,
     };
 
     serializer_config
@@ -197,21 +210,36 @@ fn decoder_framing_to_encoding_framer(framing: &decoding::FramingConfig) -> enco
         decoding::FramingConfig::NewlineDelimited(_) => encoding::FramingConfig::NewlineDelimited,
         // TODO: There's no equivalent octet counting framer for encoding... although
         // there's no particular reason that would make it hard to write.
-        decoding::FramingConfig::OctetCounting(_) => todo!(),
+        decoding::FramingConfig::OctetCounting(_) => unimplemented!(),
+        // TODO: chunked gelf is not supported yet in encoding
+        decoding::FramingConfig::ChunkedGelf(_) => unimplemented!(),
+        decoding::FramingConfig::VarintLengthDelimited(config) => {
+            encoding::FramingConfig::VarintLengthDelimited(
+                encoding::VarintLengthDelimitedEncoderConfig {
+                    max_frame_length: config.max_frame_length,
+                },
+            )
+        }
     };
 
     framing_config.build()
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::default_trait_access,
+    reason = "Preserve inferred default types"
+)]
 fn serializer_config_to_deserializer(
     config: &SerializerConfig,
 ) -> vector_lib::Result<decoding::Deserializer> {
     let deserializer_config = match config {
-        SerializerConfig::Avro { .. } => todo!(),
-        SerializerConfig::Csv { .. } => todo!(),
-        SerializerConfig::Gelf => DeserializerConfig::Gelf(Default::default()),
+        SerializerConfig::Avro { .. } => unimplemented!(),
+        SerializerConfig::Cef { .. } => unimplemented!(),
+        SerializerConfig::Csv { .. } => unimplemented!(),
+        SerializerConfig::Gelf { .. } => DeserializerConfig::Gelf(Default::default()),
         SerializerConfig::Json(_) => DeserializerConfig::Json(Default::default()),
-        SerializerConfig::Logfmt => todo!(),
+        SerializerConfig::Logfmt => unimplemented!(),
         SerializerConfig::Native => DeserializerConfig::Native,
         SerializerConfig::NativeJson => DeserializerConfig::NativeJson(Default::default()),
         SerializerConfig::Protobuf(config) => {
@@ -219,15 +247,25 @@ fn serializer_config_to_deserializer(
                 protobuf: vector_lib::codecs::decoding::ProtobufDeserializerOptions {
                     desc_file: config.protobuf.desc_file.clone(),
                     message_type: config.protobuf.message_type.clone(),
+                    use_json_names: config.protobuf.use_json_names,
                 },
             })
         }
         SerializerConfig::RawMessage | SerializerConfig::Text(_) => DeserializerConfig::Bytes,
+        #[cfg(feature = "codecs-opentelemetry")]
+        SerializerConfig::Otlp => unimplemented!(),
+        #[cfg(feature = "codecs-syslog")]
+        SerializerConfig::Syslog(_) => unimplemented!(),
     };
 
     deserializer_config.build()
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::default_trait_access,
+    reason = "Preserve inferred default types"
+)]
 fn encoder_framing_to_decoding_framer(framing: encoding::FramingConfig) -> decoding::Framer {
     let framing_config = match framing {
         encoding::FramingConfig::Bytes => decoding::FramingConfig::Bytes,
@@ -236,16 +274,24 @@ fn encoder_framing_to_decoding_framer(framing: encoding::FramingConfig) -> decod
                 character_delimited: decoding::CharacterDelimitedDecoderOptions {
                     delimiter: config.character_delimited.delimiter,
                     max_length: None,
+                    oversized_action: Default::default(),
                 },
             })
         }
         encoding::FramingConfig::LengthDelimited(config) => {
             decoding::FramingConfig::LengthDelimited(decoding::LengthDelimitedDecoderConfig {
-                length_delimited: config.length_delimited.clone(),
+                length_delimited: config.length_delimited,
             })
         }
         encoding::FramingConfig::NewlineDelimited => {
             decoding::FramingConfig::NewlineDelimited(Default::default())
+        }
+        vector_lib::codecs::encoding::FramingConfig::VarintLengthDelimited(config) => {
+            decoding::FramingConfig::VarintLengthDelimited(
+                decoding::VarintLengthDelimitedDecoderConfig {
+                    max_frame_length: config.max_frame_length,
+                },
+            )
         }
     };
 
@@ -351,6 +397,8 @@ impl ExternalResource {
     }
 
     /// Spawns this resource for use as an output for a sink.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     pub fn spawn_as_output(
         self,
         output_tx: mpsc::Sender<Vec<Event>>,

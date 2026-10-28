@@ -4,15 +4,20 @@ use bytes::Bytes;
 use chrono::Utc;
 use derivative::Derivative;
 use prost_reflect::{DynamicMessage, MessageDescriptor};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use vector_config::configurable_component;
-use vector_core::event::LogEvent;
 use vector_core::{
-    config::{log_schema, DataType, LogNamespace},
-    event::Event,
+    config::{DataType, LogNamespace, log_schema},
+    event::{Event, LogEvent},
     schema,
 };
-use vrl::value::Kind;
+use vrl::{
+    protobuf::{
+        descriptor::{get_message_descriptor, get_message_descriptor_from_bytes},
+        parse::{Options, proto_to_value},
+    },
+    value::{Kind, Value},
+};
 
 use super::Deserializer;
 
@@ -27,16 +32,23 @@ pub struct ProtobufDeserializerConfig {
 
 impl ProtobufDeserializerConfig {
     /// Build the `ProtobufDeserializer` from this configuration.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "The codec API error documentation needs a separate audit."
+    )]
     pub fn build(&self) -> vector_common::Result<ProtobufDeserializer> {
         ProtobufDeserializer::try_from(self)
     }
 
     /// Return the type of event build by this deserializer.
+    #[must_use]
     pub fn output_type(&self) -> DataType {
         DataType::Log
     }
 
     /// The schema produced by the deserializer.
+    #[must_use]
     pub fn schema_definition(&self, log_namespace: LogNamespace) -> schema::Definition {
         match log_namespace {
             LogNamespace::Legacy => {
@@ -66,24 +78,82 @@ impl ProtobufDeserializerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct ProtobufDeserializerOptions {
-    /// Path to desc file
+    /// The path to the protobuf descriptor set file.
+    ///
+    /// This file is the output of `protoc -I <include path> -o <desc output path> <proto>`.
+    ///
+    /// For more information, see [How Buf images work](https://buf.build/docs/reference/images/#how-buf-images-work).
     pub desc_file: PathBuf,
 
-    /// message type. e.g package.message
+    /// The name of the message type to use for serializing.
+    #[configurable(metadata(docs::examples = "package.Message"))]
     pub message_type: String,
+
+    /// Use JSON field names (camelCase) instead of protobuf field names (snake_case).
+    ///
+    /// When enabled, the deserializer will output fields using their JSON names as defined
+    /// in the `.proto` file (for example, `jobDescription` instead of `job_description`).
+    ///
+    /// This is useful when working with data that needs to be converted to JSON or
+    /// when interfacing with systems that use JSON naming conventions.
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::doc_markdown,
+        reason = "Preserve generated configuration documentation during the lint rollout."
+    )]
+    pub use_json_names: bool,
 }
 
 /// Deserializer that builds `Event`s from a byte frame containing protobuf.
 #[derive(Debug, Clone)]
 pub struct ProtobufDeserializer {
     message_descriptor: MessageDescriptor,
+    options: Options,
 }
 
 impl ProtobufDeserializer {
     /// Creates a new `ProtobufDeserializer`.
+    #[must_use]
     pub fn new(message_descriptor: MessageDescriptor) -> Self {
-        Self { message_descriptor }
+        Self {
+            message_descriptor,
+            options: Options::default(),
+        }
     }
+
+    /// Creates a new deserializer instance using the descriptor bytes directly.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "The codec API error documentation needs a separate audit."
+    )]
+    pub fn new_from_bytes(
+        desc_bytes: &[u8],
+        message_type: &str,
+        options: Options,
+    ) -> vector_common::Result<Self> {
+        let message_descriptor = get_message_descriptor_from_bytes(desc_bytes, message_type)?;
+        Ok(Self {
+            message_descriptor,
+            options,
+        })
+    }
+}
+
+fn extract_vrl_value(
+    bytes: Bytes,
+    message_descriptor: &MessageDescriptor,
+    options: &Options,
+) -> vector_common::Result<Value> {
+    let dynamic_message = DynamicMessage::decode(message_descriptor.clone(), bytes)
+        .map_err(|error| format!("Error parsing protobuf: {error:?}"))?;
+
+    Ok(proto_to_value(
+        &prost_reflect::Value::Message(dynamic_message),
+        None,
+        options,
+    )?)
 }
 
 impl Deserializer for ProtobufDeserializer {
@@ -92,12 +162,9 @@ impl Deserializer for ProtobufDeserializer {
         bytes: Bytes,
         log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
-        let dynamic_message = DynamicMessage::decode(self.message_descriptor.clone(), bytes)
-            .map_err(|error| format!("Error parsing protobuf: {:?}", error))?;
+        let vrl_value = extract_vrl_value(bytes, &self.message_descriptor, &self.options)?;
+        let mut event = Event::Log(LogEvent::from(vrl_value));
 
-        let proto_vrl =
-            vrl::protobuf::proto_to_value(&prost_reflect::Value::Message(dynamic_message), None)?;
-        let mut event = Event::Log(LogEvent::from(proto_vrl));
         let event = match log_namespace {
             LogNamespace::Vector => event,
             LogNamespace::Legacy => {
@@ -119,11 +186,14 @@ impl Deserializer for ProtobufDeserializer {
 impl TryFrom<&ProtobufDeserializerConfig> for ProtobufDeserializer {
     type Error = vector_common::Error;
     fn try_from(config: &ProtobufDeserializerConfig) -> vector_common::Result<Self> {
-        let message_descriptor = vrl::protobuf::get_message_descriptor(
-            &config.protobuf.desc_file,
-            &config.protobuf.message_type,
-        )?;
-        Ok(Self::new(message_descriptor))
+        let message_descriptor =
+            get_message_descriptor(&config.protobuf.desc_file, &config.protobuf.message_type)?;
+        Ok(Self {
+            message_descriptor,
+            options: Options {
+                use_json_names: config.protobuf.use_json_names,
+            },
+        })
     }
 }
 
@@ -131,9 +201,10 @@ impl TryFrom<&ProtobufDeserializerConfig> for ProtobufDeserializer {
 mod tests {
     // TODO: add test for bad file path & invalid message_type
 
-    use std::path::PathBuf;
-    use std::{env, fs};
+    use std::{env, fs, path::PathBuf};
+
     use vector_core::config::log_schema;
+    use vrl::event_path;
 
     use super::*;
 
@@ -141,6 +212,11 @@ mod tests {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("tests/data/protobuf")
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Keep the existing owned-argument API during the lint rollout."
+    )]
     fn parse_and_validate(
         protobuf_bin_message: String,
         protobuf_desc_path: PathBuf,
@@ -148,8 +224,7 @@ mod tests {
         validate_log: fn(&LogEvent),
     ) {
         let input = Bytes::from(protobuf_bin_message);
-        let message_descriptor =
-            vrl::protobuf::get_message_descriptor(&protobuf_desc_path, message_type).unwrap();
+        let message_descriptor = get_message_descriptor(&protobuf_desc_path, message_type).unwrap();
         let deserializer = ProtobufDeserializer::new(message_descriptor);
 
         for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
@@ -180,7 +255,7 @@ mod tests {
             assert_eq!(log["name"], "someone".into());
             assert_eq!(
                 log["phones"].as_array().unwrap()[0].as_object().unwrap()["number"]
-                    .as_str()
+                    .to_str_lossy()
                     .unwrap(),
                 "123456"
             );
@@ -203,7 +278,7 @@ mod tests {
             assert_eq!(log["name"], "someone".into());
             assert_eq!(
                 log["phones"].as_array().unwrap()[0].as_object().unwrap()["number"]
-                    .as_str()
+                    .to_str_lossy()
                     .unwrap(),
                 "1234"
             );
@@ -223,15 +298,15 @@ mod tests {
 
     #[test]
     fn deserialize_empty_buffer() {
-        let protobuf_bin_message = "".to_string();
+        let protobuf_bin_message = String::new();
         let protobuf_desc_path = test_data_dir().join("protos/test_protobuf.desc");
         let message_type = "test_protobuf.Person";
         let validate_log = |log: &LogEvent| {
             // No field will be set.
-            assert!(!log.contains("name"));
-            assert!(!log.contains("id"));
-            assert!(!log.contains("email"));
-            assert!(!log.contains("phones"));
+            assert!(!log.contains(event_path!("name")));
+            assert!(!log.contains(event_path!("id")));
+            assert!(!log.contains(event_path!("email")));
+            assert!(!log.contains(event_path!("phones")));
         };
 
         parse_and_validate(
@@ -245,7 +320,7 @@ mod tests {
     #[test]
     fn deserialize_error_invalid_protobuf() {
         let input = Bytes::from("{ foo");
-        let message_descriptor = vrl::protobuf::get_message_descriptor(
+        let message_descriptor = get_message_descriptor(
             &test_data_dir().join("protos/test_protobuf.desc"),
             "test_protobuf.Person",
         )

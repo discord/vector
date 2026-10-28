@@ -1,12 +1,21 @@
-use bytes::BytesMut;
-use codecs::decoding::format::Deserializer;
-use codecs::encoding::format::Serializer;
-use codecs::{NativeJsonDeserializerConfig, NativeJsonSerializerConfig};
-use vector_core::buckets;
-use vector_core::config::LogNamespace;
-use vector_core::event::{Event, Metric};
-use vector_core::event::{MetricKind, MetricValue};
+#![allow(clippy::unwrap_used)]
 
+use bytes::{Bytes, BytesMut};
+use codecs::{
+    NativeJsonDeserializerConfig, NativeJsonSerializerConfig, decoding::format::Deserializer,
+    encoding::format::Serializer,
+};
+use vector_core::{
+    buckets,
+    config::LogNamespace,
+    event::{Event, Metric, MetricKind, MetricValue},
+};
+
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Keep the existing owned-argument API during the lint rollout."
+)]
 fn assert_roundtrip(
     input_event: Event,
     serializer: &mut dyn Serializer<Error = vector_common::Error>,
@@ -82,5 +91,35 @@ fn histogram_metric_roundtrip() {
         &mut NativeJsonSerializerConfig.build(),
         &NativeJsonDeserializerConfig::default().build(),
         expected_json_value,
-    )
+    );
+}
+
+/// Newer encoders omit `sum` on a histogram that reported no sum. It must still decode, as zero.
+#[test]
+fn histogram_without_sum_decodes_as_zero() {
+    let json = r#"{
+        "metric": {
+            "name": "histogram",
+            "kind": "absolute",
+            "aggregated_histogram": {
+                "buckets": [{"upper_limit": 1.0, "count": 1}],
+                "count": 1
+            }
+        }
+    }"#;
+
+    let events = NativeJsonDeserializerConfig::default()
+        .build()
+        .parse(Bytes::from(json), LogNamespace::Vector)
+        .unwrap();
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].as_metric().value(),
+        &MetricValue::AggregatedHistogram {
+            buckets: buckets!(1.0 => 1),
+            count: 1,
+            sum: 0.0,
+        }
+    );
 }

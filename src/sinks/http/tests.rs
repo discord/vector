@@ -1,23 +1,37 @@
 //! Unit tests for the `http` sink.
 
-use std::sync::{atomic, Arc};
+use std::{
+    future::ready,
+    sync::{Arc, atomic},
+};
 
 use bytes::{Buf, Bytes};
-use flate2::{read::MultiGzDecoder, read::ZlibDecoder};
 use futures::stream;
 use headers::{Authorization, HeaderMapExt};
 use hyper::{Body, Method, Response, StatusCode};
-use serde::{de, Deserialize};
-use vector_lib::codecs::{
-    encoding::{Framer, FramingConfig},
-    JsonSerializerConfig, NewlineDelimitedEncoderConfig, TextSerializerConfig,
+use serde::{Deserialize, de};
+use vector_common::decompression::CappedDecoder;
+use vector_lib::{
+    codecs::{
+        JsonSerializerConfig, NewlineDelimitedEncoderConfig, TextSerializerConfig,
+        encoding::FramingConfig,
+    },
+    event::{BatchNotifier, BatchStatus, Event, LogEvent},
+    finalization::AddBatchNotifier,
+    serde::AsciiChar,
 };
 
-use vector_lib::event::{BatchNotifier, BatchStatus, Event, LogEvent};
+use vrl::event_path;
 
+use super::{
+    config::{HttpSinkConfig, validate_headers, validate_payload_wrapper},
+    encoder::HttpEncoder,
+};
 use crate::{
     assert_downcast_matches,
-    codecs::{EncodingConfigWithFraming, SinkType},
+    codecs::EncodingConfigWithFraming,
+    config::ProxyConfig,
+    log_event,
     sinks::{
         prelude::*,
         util::{
@@ -30,15 +44,15 @@ use crate::{
         },
     },
     test_util::{
-        components::{self, COMPONENT_ERROR_TAGS, HTTP_SINK_TAGS},
-        next_addr, random_lines_with_stream,
+        addr::next_addr,
+        components::{
+            self, COMPONENT_ERROR_TAGS, HTTP_SINK_TAGS, init_test, run_and_assert_sink_compliance,
+            run_and_assert_sink_error_with_events,
+        },
+        create_events_batch_with_fn,
+        http::spawn_authenticated_http_proxy,
+        random_lines_with_stream,
     },
-};
-
-use super::{
-    config::HttpSinkConfig,
-    config::{validate_headers, validate_payload_wrapper},
-    encoder::HttpEncoder,
 };
 
 #[test]
@@ -48,18 +62,19 @@ fn generate_config() {
 
 fn default_cfg(encoding: EncodingConfigWithFraming) -> HttpSinkConfig {
     HttpSinkConfig {
-        uri: Default::default(),
-        method: Default::default(),
-        auth: Default::default(),
-        headers: Default::default(),
-        compression: Default::default(),
+        uri: crate::template::UriTemplate::default(),
+        method: super::config::HttpMethod::default(),
+        auth: Option::default(),
+        compression: Compression::default(),
         encoding,
-        payload_prefix: Default::default(),
-        payload_suffix: Default::default(),
-        batch: Default::default(),
-        request: Default::default(),
-        tls: Default::default(),
-        acknowledgements: Default::default(),
+        payload_prefix: String::default(),
+        payload_suffix: String::default(),
+        batch: BatchConfig::default(),
+        request: crate::sinks::util::http::RequestConfig::default(),
+        tls: Option::default(),
+        acknowledgements: AcknowledgementsConfig::default(),
+        retry_strategy: crate::sinks::util::http::RetryStrategy::default(),
+        confinement: crate::template::ConfinementConfig::default(),
     }
 }
 
@@ -71,17 +86,27 @@ fn http_encode_event_text() {
     let encoder = cfg.build_encoder().unwrap();
     let transformer = cfg.encoding.transformer();
 
-    let encoder = HttpEncoder::new(encoder, transformer, "".to_owned(), "".to_owned());
+    let encoder = HttpEncoder::new(encoder, transformer, String::new(), String::new());
 
-    let mut encoded = vec![];
-    let (encoded_size, _byte_size) = encoder.encode_input(vec![event], &mut encoded).unwrap();
+    let mut output_buffer = vec![];
+    let (encoded_size, _byte_size) = encoder
+        .encode_input(vec![event], &mut output_buffer)
+        .unwrap();
 
-    assert_eq!(encoded, Vec::from("hello world\n"));
-    assert_eq!(encoded.len(), encoded_size);
+    assert_eq!(output_buffer, Vec::from("hello world\n"));
+    assert_eq!(output_buffer.len(), encoded_size);
 }
 
 #[test]
 fn http_encode_event_ndjson() {
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)] // deserialize all fields
+    struct ExpectedEvent {
+        message: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    }
+
     let event = Event::Log(LogEvent::from("hello world"));
 
     let cfg = default_cfg(
@@ -94,47 +119,45 @@ fn http_encode_event_ndjson() {
     let encoder = cfg.build_encoder().unwrap();
     let transformer = cfg.encoding.transformer();
 
-    let encoder = HttpEncoder::new(encoder, transformer, "".to_owned(), "".to_owned());
+    let encoder = HttpEncoder::new(encoder, transformer, String::new(), String::new());
 
-    let mut encoded = vec![];
-    encoder.encode_input(vec![event], &mut encoded).unwrap();
+    let mut output_buffer = vec![];
+    encoder
+        .encode_input(vec![event], &mut output_buffer)
+        .unwrap();
 
-    #[derive(Deserialize, Debug)]
-    #[serde(deny_unknown_fields)]
-    #[allow(dead_code)] // deserialize all fields
-    struct ExpectedEvent {
-        message: String,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    }
-
-    let output = serde_json::from_slice::<ExpectedEvent>(&encoded[..]).unwrap();
+    let output = serde_json::from_slice::<ExpectedEvent>(&output_buffer[..]).unwrap();
 
     assert_eq!(output.message, "hello world".to_string());
 }
 
 #[test]
 fn http_validates_normal_headers() {
-    let config = r#"
-        uri = "http://$IN_ADDR/frames"
-        encoding.codec = "text"
-        [request.headers]
-        Auth = "token:thing_and-stuff"
-        X-Custom-Nonsense = "_%_{}_-_&_._`_|_~_!_#_&_$_"
-        "#;
-    let config: HttpSinkConfig = toml::from_str(config).unwrap();
+    let config = indoc::indoc! {r#"
+        uri: "http://$IN_ADDR/frames"
+        encoding:
+          codec: text
+        request:
+          headers:
+            Auth: "token:thing_and-stuff"
+            X-Custom-Nonsense: "_%_{}_-_&_._`_|_~_!_#_&_$_"
+        "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(config).unwrap();
 
     assert!(validate_headers(&config.request.headers, false).is_ok());
 }
 
 #[test]
 fn http_catches_bad_header_names() {
-    let config = r#"
-        uri = "http://$IN_ADDR/frames"
-        encoding.codec = "text"
-        [request.headers]
-        "\u0001" = "bad"
-        "#;
-    let config: HttpSinkConfig = toml::from_str(config).unwrap();
+    let config = indoc::indoc! {r#"
+        uri: "http://$IN_ADDR/frames"
+        encoding:
+          codec: text
+        request:
+          headers:
+            "\x01": "bad"
+        "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(config).unwrap();
 
     assert_downcast_matches!(
         validate_headers(&config.request.headers, false).unwrap_err(),
@@ -145,33 +168,57 @@ fn http_catches_bad_header_names() {
 
 #[test]
 fn http_validates_payload_prefix_and_suffix() {
-    let config = r#"
-        uri = "http://$IN_ADDR/"
-        encoding.codec = "json"
-        payload_prefix = '{"data":'
-        payload_suffix = "}"
-        "#;
-    let config: HttpSinkConfig = toml::from_str(config).unwrap();
-    let (framer, serializer) = config.encoding.build(SinkType::MessageBased).unwrap();
-    let encoder = Encoder::<Framer>::new(framer, serializer);
+    let config = indoc::indoc! {r#"
+        uri: "http://$IN_ADDR/"
+        encoding:
+          codec: json
+        payload_prefix: '{"data":'
+        payload_suffix: "}"
+        "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(config).unwrap();
+    let serializer = config.encoding.config().1;
+    let framer = config.encoding.config().0.clone().unwrap_or_else(|| {
+        // Message-based default for JSON is comma-delimited framing.
+        FramingConfig::CharacterDelimited(vector_lib::codecs::CharacterDelimitedEncoderConfig::new(
+            AsciiChar::new(','),
+        ))
+    });
     assert!(
-        validate_payload_wrapper(&config.payload_prefix, &config.payload_suffix, &encoder).is_ok()
+        validate_payload_wrapper(
+            &config.payload_prefix,
+            &config.payload_suffix,
+            serializer,
+            &framer,
+        )
+        .is_ok()
     );
 }
 
 #[test]
 fn http_validates_payload_prefix_and_suffix_fails_on_invalid_json() {
-    let config = r#"
-        uri = "http://$IN_ADDR/"
-        encoding.codec = "json"
-        payload_prefix = '{"data":'
-        payload_suffix = ""
-        "#;
-    let config: HttpSinkConfig = toml::from_str(config).unwrap();
-    let (framer, serializer) = config.encoding.build(SinkType::MessageBased).unwrap();
-    let encoder = Encoder::<Framer>::new(framer, serializer);
+    let config = indoc::indoc! {r#"
+        uri: "http://$IN_ADDR/"
+        encoding:
+          codec: json
+        payload_prefix: '{"data":'
+        payload_suffix: ""
+        "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(config).unwrap();
+    let serializer = config.encoding.config().1;
+    let framer = config.encoding.config().0.clone().unwrap_or_else(|| {
+        // Message-based default for JSON is comma-delimited framing.
+        FramingConfig::CharacterDelimited(vector_lib::codecs::CharacterDelimitedEncoderConfig::new(
+            AsciiChar::new(','),
+        ))
+    });
     assert!(
-        validate_payload_wrapper(&config.payload_prefix, &config.payload_suffix, &encoder).is_err()
+        validate_payload_wrapper(
+            &config.payload_prefix,
+            &config.payload_suffix,
+            serializer,
+            &framer,
+        )
+        .is_err()
     );
 }
 
@@ -180,17 +227,19 @@ fn http_validates_payload_prefix_and_suffix_fails_on_invalid_json() {
 #[tokio::test]
 #[should_panic(expected = "Authorization header can not be used with defined auth options")]
 async fn http_headers_auth_conflict() {
-    let config = r#"
-        uri = "http://$IN_ADDR/"
-        encoding.codec = "text"
-        [request.headers]
-        Authorization = "Basic base64encodedstring"
-        [auth]
-        strategy = "basic"
-        user = "user"
-        password = "password"
-        "#;
-    let config: HttpSinkConfig = toml::from_str(config).unwrap();
+    let config = indoc::indoc! {r#"
+        uri: "http://$IN_ADDR/"
+        encoding:
+          codec: text
+        request:
+          headers:
+            Authorization: "Basic base64encodedstring"
+        auth:
+          strategy: basic
+          user: user
+          password: password
+        "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(config).unwrap();
 
     let cx = SinkContext::default();
 
@@ -200,12 +249,12 @@ async fn http_headers_auth_conflict() {
 #[tokio::test]
 async fn http_happy_path_post() {
     run_sink(
-        r#"
-        [auth]
-        strategy = "basic"
-        user = "waldo"
-        password = "hunter2"
-    "#,
+        indoc::indoc! {r"
+        auth:
+          strategy: basic
+          user: waldo
+          password: hunter2
+        "},
         |parts| {
             assert_eq!(Method::POST, parts.method);
             assert_eq!("/frames", parts.uri.path());
@@ -221,13 +270,13 @@ async fn http_happy_path_post() {
 #[tokio::test]
 async fn http_happy_path_put() {
     run_sink(
-        r#"
-        method = "put"
-        [auth]
-        strategy = "basic"
-        user = "waldo"
-        password = "hunter2"
-    "#,
+        indoc::indoc! {r"
+        method: put
+        auth:
+          strategy: basic
+          user: waldo
+          password: hunter2
+        "},
         |parts| {
             assert_eq!(Method::PUT, parts.method);
             assert_eq!("/frames", parts.uri.path());
@@ -243,11 +292,12 @@ async fn http_happy_path_put() {
 #[tokio::test]
 async fn http_passes_custom_headers() {
     run_sink(
-        r#"
-        [request.headers]
-        foo = "bar"
-        baz = "quux"
-    "#,
+        indoc::indoc! {r"
+        request:
+          headers:
+            foo: bar
+            baz: quux
+        "},
         |parts| {
             assert_eq!(Method::POST, parts.method);
             assert_eq!("/frames", parts.uri.path());
@@ -258,6 +308,102 @@ async fn http_passes_custom_headers() {
             assert_eq!(
                 Some("quux"),
                 parts.headers.get("baz").map(|v| v.to_str().unwrap())
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn http_passes_template_headers() {
+    run_sink_with_events(
+        indoc::indoc! {r#"
+        request:
+          headers:
+            Static-Header: static-value
+            Accept: "application/vnd.api+json"
+            X-Event-Level: "level-{{level}}"
+            X-Event-Message: "message-{{message}}"
+            X-Static-Template: constant-value
+        "#},
+        || {
+            let mut event = Event::Log(LogEvent::from("test message"));
+            event.as_mut_log().insert(event_path!("level"), "info");
+            event
+                .as_mut_log()
+                .insert(event_path!("message"), "templated message");
+            event
+        },
+        10,
+        |parts| {
+            assert_eq!(
+                Some("static-value"),
+                parts
+                    .headers
+                    .get("Static-Header")
+                    .map(|v| v.to_str().unwrap())
+            );
+
+            assert_eq!(
+                Some("application/vnd.api+json"),
+                parts.headers.get("Accept").map(|v| v.to_str().unwrap())
+            );
+
+            assert_eq!(
+                Some("constant-value"),
+                parts
+                    .headers
+                    .get("X-Static-Template")
+                    .map(|v| v.to_str().unwrap())
+            );
+
+            assert_eq!(
+                Some("level-info"),
+                parts
+                    .headers
+                    .get("X-Event-Level")
+                    .map(|v| v.to_str().unwrap())
+            );
+            assert_eq!(
+                Some("message-templated message"),
+                parts
+                    .headers
+                    .get("X-Event-Message")
+                    .map(|v| v.to_str().unwrap())
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn http_template_headers_missing_fields() {
+    run_sink_with_events(
+        indoc::indoc! {r#"
+        request:
+          headers:
+            X-Required-Field: "required-{{required_field}}"
+            X-Static: static-value
+        "#},
+        || {
+            let mut event = Event::Log(LogEvent::from("good event"));
+            event
+                .as_mut_log()
+                .insert(event_path!("required_field"), "present");
+            event
+        },
+        10,
+        |parts| {
+            assert_eq!(
+                Some("required-present"),
+                parts
+                    .headers
+                    .get("X-Required-Field")
+                    .map(|v| v.to_str().unwrap())
+            );
+            assert_eq!(
+                Some("static-value"),
+                parts.headers.get("X-Static").map(|v| v.to_str().unwrap())
             );
         },
     )
@@ -349,6 +495,109 @@ async fn retries_on_temporary_error() {
 }
 
 #[tokio::test]
+async fn custom_retry_retries_only_configured_status_code() {
+    components::assert_sink_compliance(&HTTP_SINK_TAGS, async {
+        const NUM_LINES: usize = 1;
+        const NUM_FAILURES: usize = 2;
+        const CUSTOM_RETRY_CONFIG: &str = indoc::indoc! {r"
+            request:
+              retry_attempts: 2
+              retry_initial_backoff_secs: 1
+              retry_max_duration_secs: 1
+            retry_strategy:
+              type: custom
+              status_codes: [408, 425, 429, 503]
+        "};
+
+        let (in_addr, sink) = build_sink(CUSTOM_RETRY_CONFIG).await;
+
+        let counter = Arc::new(atomic::AtomicUsize::new(0));
+        let in_counter = Arc::clone(&counter);
+        let (rx, trigger, server) = build_test_server_generic(in_addr, move || {
+            let count = in_counter.fetch_add(1, atomic::Ordering::Relaxed);
+            if count < NUM_FAILURES {
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| unreachable!())
+            } else {
+                Response::new(Body::empty())
+            }
+        });
+
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+        let (input_lines, events) = random_lines_with_stream(100, NUM_LINES, Some(batch));
+        let pump = sink.run(events);
+
+        tokio::spawn(server);
+
+        pump.await.unwrap();
+        drop(trigger);
+
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+
+        let output_lines = get_received_gzip(rx, |parts| {
+            assert_eq!(Method::POST, parts.method);
+            assert_eq!("/frames", parts.uri.path());
+        })
+        .await;
+
+        let tries = counter.load(atomic::Ordering::Relaxed);
+        assert_eq!(tries, NUM_FAILURES + 1);
+        assert_eq!(NUM_LINES, output_lines.len());
+        assert_eq!(input_lines, output_lines);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn custom_retry_does_not_retry_unconfigured_status_code() {
+    components::assert_sink_error(&COMPONENT_ERROR_TAGS, async {
+        const NUM_LINES: usize = 1;
+        const CUSTOM_RETRY_CONFIG: &str = indoc::indoc! {r"
+            request:
+              retry_attempts: 2
+              retry_initial_backoff_secs: 1
+              retry_max_duration_secs: 1
+            retry_strategy:
+              type: custom
+              status_codes: [408, 425, 429, 503]
+        "};
+
+        let (in_addr, sink) = build_sink(CUSTOM_RETRY_CONFIG).await;
+
+        let counter = Arc::new(atomic::AtomicUsize::new(0));
+        let in_counter = Arc::clone(&counter);
+        let (rx, trigger, server) = build_test_server_generic(in_addr, move || {
+            in_counter.fetch_add(1, atomic::Ordering::Relaxed);
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .unwrap_or_else(|_| unreachable!())
+        });
+
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+        let (_input_lines, events) = random_lines_with_stream(100, NUM_LINES, Some(batch));
+        let pump = sink.run(events);
+
+        tokio::spawn(server);
+
+        pump.await.unwrap();
+        drop(trigger);
+
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Rejected));
+        assert_eq!(counter.load(atomic::Ordering::Relaxed), 1);
+
+        let output_lines = get_received_gzip(rx, |_| {
+            unreachable!("There should be no successful requests")
+        })
+        .await;
+        assert!(output_lines.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn fails_on_permanent_error() {
     components::assert_sink_error(&COMPONENT_ERROR_TAGS, async {
         let num_lines = 1000;
@@ -409,23 +658,23 @@ async fn json_compression(compression: &str) {
     components::assert_sink_compliance(&HTTP_SINK_TAGS, async {
         let num_lines = 1000;
 
-        let in_addr = next_addr();
+        let (_guard, in_addr) = next_addr();
 
         let config = r#"
-        uri = "http://$IN_ADDR/frames"
-        compression = "$COMPRESSION"
-        encoding.codec = "json"
-        method = "post"
-
-        [auth]
-        strategy = "basic"
-        user = "waldo"
-        password = "hunter2"
+        uri: "http://$IN_ADDR/frames"
+        compression: "$COMPRESSION"
+        encoding:
+          codec: json
+        method: post
+        auth:
+          strategy: basic
+          user: waldo
+          password: hunter2
     "#
         .replace("$IN_ADDR", &in_addr.to_string())
         .replace("$COMPRESSION", compression);
 
-        let config: HttpSinkConfig = toml::from_str(&config).unwrap();
+        let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
 
         let cx = SinkContext::default();
 
@@ -468,25 +717,25 @@ async fn json_compression_with_payload_wrapper(compression: &str) {
     components::assert_sink_compliance(&HTTP_SINK_TAGS, async {
         let num_lines = 1000;
 
-        let in_addr = next_addr();
+        let (_guard, in_addr) = next_addr();
 
         let config = r#"
-        uri = "http://$IN_ADDR/frames"
-        compression = "$COMPRESSION"
-        encoding.codec = "json"
-        payload_prefix = '{"data":'
-        payload_suffix = "}"
-        method = "post"
-
-        [auth]
-        strategy = "basic"
-        user = "waldo"
-        password = "hunter2"
+        uri: "http://$IN_ADDR/frames"
+        compression: "$COMPRESSION"
+        encoding:
+          codec: json
+        payload_prefix: '{"data":'
+        payload_suffix: "}"
+        method: post
+        auth:
+          strategy: basic
+          user: waldo
+          password: hunter2
     "#
         .replace("$IN_ADDR", &in_addr.to_string())
         .replace("$COMPRESSION", compression);
 
-        let config: HttpSinkConfig = toml::from_str(&config).unwrap();
+        let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
 
         let cx = SinkContext::default();
 
@@ -515,7 +764,7 @@ async fn json_compression_with_payload_wrapper(compression: &str) {
 
                 let message: serde_json::Value = parse_compressed_json(compression, body);
 
-                let lines: Vec<serde_json::Value> = message["data"].as_array().unwrap().to_vec();
+                let lines: Vec<serde_json::Value> = message["data"].as_array().unwrap().clone();
                 stream::iter(lines)
             })
             .map(|line| line.get("message").unwrap().as_str().unwrap().to_owned())
@@ -528,15 +777,247 @@ async fn json_compression_with_payload_wrapper(compression: &str) {
     .await;
 }
 
+#[tokio::test]
+async fn templateable_uri_path() {
+    fn create_event_with_id(id: i64) -> Event {
+        log_event!["id" => id]
+    }
+
+    init_test();
+
+    let num_events_per_id = 100;
+    let an_id = 1;
+    let another_id = 2;
+    let (_guard, in_addr) = next_addr();
+
+    let config = format!(
+        r#"
+        uri: "http://{in_addr}/id/{{{{id}}}}"
+        encoding:
+          codec: json
+        "#
+    );
+
+    let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
+
+    let cx = SinkContext::default();
+
+    let (sink, _) = config.build(cx).await.unwrap();
+    let (rx, trigger, server) = build_test_server(in_addr);
+
+    let (some_events_with_an_id, mut a_receiver) =
+        create_events_batch_with_fn(|| create_event_with_id(an_id), num_events_per_id);
+    let (some_events_with_another_id, mut another_receiver) =
+        create_events_batch_with_fn(|| create_event_with_id(another_id), num_events_per_id);
+    let all_events = some_events_with_an_id
+        .into_iter()
+        .chain(some_events_with_another_id);
+    let event_stream = stream::iter(all_events);
+
+    tokio::spawn(server);
+
+    run_and_assert_sink_compliance(sink, event_stream, &HTTP_SINK_TAGS).await;
+
+    drop(trigger);
+
+    assert_eq!(a_receiver.try_recv(), Ok(BatchStatus::Delivered));
+    assert_eq!(another_receiver.try_recv(), Ok(BatchStatus::Delivered));
+
+    let request_batches = rx
+        .inspect(|(parts, body)| {
+            let events: Vec<serde_json::Value> = serde_json::from_slice(body).unwrap();
+
+            // Assert that all the events are received
+            assert_eq!(events.len(), num_events_per_id);
+
+            // Assert that all events have the same id
+            let expected_event_id = events[0]["id"].as_i64().unwrap();
+
+            for event in events {
+                let event_id = event["id"].as_i64().unwrap();
+                assert_eq!(event_id, expected_event_id);
+            }
+
+            // Assert that the uri path is the expected one for the given id
+            let expected_uri_path = format!("/id/{expected_event_id}");
+            assert_eq!(parts.uri.path(), expected_uri_path);
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(request_batches.len(), 2);
+}
+
+#[tokio::test]
+async fn templateable_uri_auth() {
+    fn create_event_with_user_and_pass(user: &str, pass: &str) -> Event {
+        log_event!["user" => user, "pass" => pass]
+    }
+
+    init_test();
+
+    let num_events_per_auth = 100;
+    let an_user = "an_user";
+    let a_pass = "a_pass";
+    let another_user = "another_user";
+    let another_pass = "another_pass";
+    let (_guard, in_addr) = next_addr();
+    // Event-controlled credentials have no static URI authority, so they
+    // require the opt-out flag. This is intentional: an attacker who controls
+    // the `user` or `pass` fields could inject `@evil.com` as the username and
+    // redirect the request. Operators using this pattern accept that risk.
+    let config = format!(
+        r#"
+        uri: "http://{{{{user}}}}:{{{{pass}}}}@{in_addr}/"
+        encoding:
+          codec: json
+        dangerously_allow_unconfined_template_resolution: true
+        "#
+    );
+
+    let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
+
+    let cx = SinkContext::default();
+
+    let (sink, _) = config.build(cx).await.unwrap();
+    let (rx, trigger, server) = build_test_server(in_addr);
+
+    let (some_events_with_an_auth, mut a_receiver) = create_events_batch_with_fn(
+        || create_event_with_user_and_pass(an_user, a_pass),
+        num_events_per_auth,
+    );
+    let (some_events_with_another_auth, mut another_receiver) = create_events_batch_with_fn(
+        || create_event_with_user_and_pass(another_user, another_pass),
+        num_events_per_auth,
+    );
+    let all_events = some_events_with_an_auth
+        .into_iter()
+        .chain(some_events_with_another_auth);
+    let event_stream = stream::iter(all_events);
+
+    tokio::spawn(server);
+
+    run_and_assert_sink_compliance(sink, event_stream, &HTTP_SINK_TAGS).await;
+
+    drop(trigger);
+
+    assert_eq!(a_receiver.try_recv(), Ok(BatchStatus::Delivered));
+    assert_eq!(another_receiver.try_recv(), Ok(BatchStatus::Delivered));
+
+    let request_batches = rx
+        .inspect(|(parts, body)| {
+            let events: Vec<serde_json::Value> = serde_json::from_slice(body).unwrap();
+
+            // Assert that all the events are received
+            assert_eq!(events.len(), num_events_per_auth);
+
+            // Assert that all events have the same user & pass
+            let expected_user = events[0]["user"].as_str().unwrap().to_string();
+            let expected_pass = events[0]["pass"].as_str().unwrap().to_string();
+
+            for event in events {
+                let event_user = event["user"].as_str().unwrap();
+                let event_pass = event["pass"].as_str().unwrap();
+                assert_eq!(event_user, expected_user);
+                assert_eq!(event_pass, expected_pass);
+            }
+
+            // Assert that the auth is the expected one for the given user & pass
+            let expected_auth = Authorization::basic(&expected_user, &expected_pass);
+            assert_eq!(parts.headers.typed_get(), Some(expected_auth));
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(request_batches.len(), 2);
+}
+
+#[tokio::test]
+async fn missing_field_in_uri_template() {
+    init_test();
+
+    let (_guard, in_addr) = next_addr();
+    let config = format!(
+        r#"
+        uri: "http://{in_addr}/{{{{missing_field}}}}"
+        encoding:
+          codec: json
+        "#
+    );
+    let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
+
+    let cx = SinkContext::default();
+
+    let (sink, _) = config.build(cx).await.unwrap();
+    let (rx, trigger, server) = build_test_server(in_addr);
+
+    let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+    let mut event = Event::Log(LogEvent::default());
+    event.add_batch_notifier(batch);
+
+    tokio::spawn(server);
+    let expected_emitted_error_events = ["TemplateRenderingError"];
+    run_and_assert_sink_error_with_events(
+        sink,
+        stream::once(ready(event)),
+        &expected_emitted_error_events,
+        &COMPONENT_ERROR_TAGS,
+    )
+    .await;
+
+    drop(trigger);
+
+    // TODO(https://github.com/vectordotdev/vector/issues/23366): Currently, When the KeyPartitioner fails to build the batch key from
+    // an event, the finalizer is not notified with
+    // EventStatus::Rejected. The error is silently ignored.
+    // See src/sinks/http/sink.rs:47
+    assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+
+    // No requests should have been made to the server
+    let requests = rx.collect::<Vec<_>>().await;
+    assert!(requests.is_empty());
+}
+
+#[tokio::test]
+async fn http_uri_auth_conflict() {
+    init_test();
+
+    let (_guard, in_addr) = next_addr();
+    let config = format!(
+        r#"
+        uri: "http://user:pass@{in_addr}/"
+        encoding:
+          codec: json
+        auth:
+          strategy: basic
+          user: user
+          password: pass
+        "#
+    );
+    let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
+
+    let cx = SinkContext::default();
+
+    // The URI embeds credentials that conflict with the explicit `auth`;
+    // validation now rejects this configuration up front instead of failing
+    // at request time.
+    match config.build(cx).await {
+        Err(err) => assert!(
+            err.to_string().contains("Two authorization credentials"),
+            "unexpected error: {err}"
+        ),
+        Ok(_) => panic!("build should reject the URI/auth credential conflict"),
+    }
+}
+
 fn parse_compressed_json<T>(compression: &str, buf: Bytes) -> T
 where
     T: de::DeserializeOwned,
 {
     match compression {
-        "gzip" => serde_json::from_reader(MultiGzDecoder::new(buf.reader())).unwrap(),
-        "zstd" => serde_json::from_reader(zstd::Decoder::new(buf.reader()).unwrap()).unwrap(),
-        "zlib" => serde_json::from_reader(ZlibDecoder::new(buf.reader())).unwrap(),
-        _ => panic!("undefined compression: {}", compression),
+        "gzip" => serde_json::from_reader(CappedDecoder::gzip(buf.reader()).into_reader()).unwrap(),
+        "zstd" => serde_json::from_reader(CappedDecoder::zstd(buf.reader()).unwrap().into_reader())
+            .unwrap(),
+        "zlib" => serde_json::from_reader(CappedDecoder::zlib(buf.reader()).into_reader()).unwrap(),
+        _ => panic!("undefined compression: {compression}"),
     }
 }
 
@@ -561,24 +1042,107 @@ async fn run_sink(extra_config: &str, assert_parts: impl Fn(http::request::Parts
     assert_eq!(input_lines, output_lines);
 }
 
-async fn build_sink(extra_config: &str) -> (std::net::SocketAddr, crate::sinks::VectorSink) {
-    let in_addr = next_addr();
+async fn run_sink_with_events(
+    extra_config: &str,
+    event_generator: impl Fn() -> Event + Clone,
+    num_events: usize,
+    assert_parts: impl Fn(http::request::Parts),
+) {
+    let (in_addr, sink) = build_sink(extra_config).await;
+    let (rx, trigger, server) = build_test_server(in_addr);
+    tokio::spawn(server);
 
-    let config = format!(
-        r#"
-                uri = "http://{addr}/frames"
-                compression = "gzip"
-                framing.method = "newline_delimited"
-                encoding.codec = "json"
-                {extras}
-            "#,
-        addr = in_addr,
-        extras = extra_config,
-    );
-    let config: HttpSinkConfig = toml::from_str(&config).unwrap();
+    let (events, mut receiver) = create_events_batch_with_fn(event_generator, num_events);
+    let events = stream::iter(events);
+
+    components::run_and_assert_sink_compliance(sink, events, &HTTP_SINK_TAGS).await;
+    drop(trigger);
+
+    assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+    let _output_lines = get_received_gzip(rx, assert_parts).await;
+}
+
+async fn build_sink(extra_config: &str) -> (std::net::SocketAddr, crate::sinks::VectorSink) {
+    let (_guard, in_addr) = next_addr();
+
+    let config = indoc::formatdoc! {r#"
+        uri: "http://{in_addr}/frames"
+        compression: gzip
+        framing:
+          method: newline_delimited
+        encoding:
+          codec: json
+        {extra_config}
+    "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
 
     let cx = SinkContext::default();
 
     let (sink, _) = config.build(cx).await.unwrap();
     (in_addr, sink)
+}
+
+/// Events should be delivered through the configured authenticated HTTP proxy,
+/// which forwards the request to the origin without leaking the proxy credentials.
+#[tokio::test]
+async fn sends_through_authenticated_proxy() {
+    init_test();
+
+    let (_guard, in_addr) = next_addr();
+    let (origin_rx, trigger, origin) = build_test_server(in_addr);
+    tokio::spawn(origin);
+
+    let mut proxy = spawn_authenticated_http_proxy();
+    let proxy_config = ProxyConfig {
+        enabled: true,
+        http: Some(proxy.url().to_owned()),
+        https: None,
+        no_proxy: vector_lib::config::proxy::NoProxy::default(),
+    };
+
+    let config = indoc::formatdoc! {r#"
+        uri: "http://{in_addr}/frames"
+        framing:
+          method: newline_delimited
+        encoding:
+          codec: json
+    "#};
+    let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
+
+    let cx = SinkContext {
+        proxy: proxy_config,
+        ..SinkContext::default()
+    };
+
+    let (sink, _) = config.build(cx).await.unwrap();
+    let event = Event::Log(LogEvent::from("simple message"));
+
+    run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
+
+    let observation = proxy.next_request().await;
+    assert_eq!(observation.method, Method::POST);
+    assert_eq!(
+        observation.uri.to_string(),
+        format!("http://{in_addr}/frames")
+    );
+    assert!(
+        observation
+            .headers
+            .contains_key(hyper::header::PROXY_AUTHORIZATION)
+    );
+
+    // The proxy forwards the request to the origin without the proxy credentials,
+    // and the origin receives the encoded event.
+    let (parts, body) = origin_rx.into_future().await.0.unwrap();
+    assert_eq!(Method::POST, parts.method);
+    assert_eq!("/frames", parts.uri.path());
+    assert!(
+        !parts
+            .headers
+            .contains_key(hyper::header::PROXY_AUTHORIZATION)
+    );
+    let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event["message"], "simple message");
+
+    drop(trigger);
 }

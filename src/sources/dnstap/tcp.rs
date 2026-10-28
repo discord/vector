@@ -1,33 +1,35 @@
-use ipnet::IpNet;
 use std::time::Duration;
 
 use bytes::Bytes;
+use ipnet::IpNet;
 use serde_with::serde_as;
-use vector_lib::configurable::configurable_component;
-use vector_lib::ipallowlist::IpAllowlistConfig;
-use vector_lib::lookup::{owned_value_path, path};
-use vector_lib::tcp::TcpKeepaliveConfig;
-use vector_lib::tls::{CertificateMetadata, MaybeTlsSettings, TlsSourceConfig};
-use vector_lib::EstimatedJsonEncodedSizeOf;
-use vrl::path::OwnedValuePath;
-use vrl::value::ObjectMap;
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    ipallowlist::IpAllowlistConfig,
+    lookup::{lookup_v2::OptionalValuePath, owned_value_path, path},
+    tcp::TcpKeepaliveConfig,
+    tls::{CertificateMetadata, MaybeTlsSettings, TlsSourceConfig},
+};
+use vrl::{path::OwnedValuePath, value::ObjectMap};
 
-use crate::internal_events::{SocketEventsReceived, SocketMode};
-use crate::sources::util::framestream::{FrameHandler, TcpFrameHandler};
-use crate::{event::Event, sources::util::net::SocketListenAddr};
-
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::lookup::lookup_v2::OptionalValuePath;
+use crate::{
+    event::Event,
+    internal_events::{SocketEventsReceived, SocketMode},
+    sources::util::{
+        framestream::{FrameHandler, TcpFrameHandler},
+        net::SocketListenAddr,
+    },
+};
 
 /// TCP configuration for the `dnstap` source.
 #[serde_as]
 #[configurable_component]
 #[derive(Clone, Debug)]
 pub struct TcpConfig {
-    #[configurable(derived)]
     address: SocketListenAddr,
 
-    #[configurable(derived)]
     keepalive: Option<TcpKeepaliveConfig>,
 
     /// The timeout before a connection is forcefully closed during shutdown.
@@ -46,10 +48,8 @@ pub struct TcpConfig {
     #[serde(default = "default_port_key")]
     pub port_key: OptionalValuePath,
 
-    #[configurable(derived)]
     permit_origin: Option<IpAllowlistConfig>,
 
-    #[configurable(derived)]
     tls: Option<TlsSourceConfig>,
 
     /// The size of the receive buffer used for each connection.
@@ -76,6 +76,7 @@ fn default_port_key() -> OptionalValuePath {
 }
 
 impl TcpConfig {
+    #[must_use]
     pub fn from_address(address: SocketListenAddr) -> Self {
         Self {
             address,
@@ -90,30 +91,37 @@ impl TcpConfig {
         }
     }
 
+    #[must_use]
     pub const fn port_key(&self) -> &OptionalValuePath {
         &self.port_key
     }
 
+    #[must_use]
     pub const fn tls(&self) -> &Option<TlsSourceConfig> {
         &self.tls
     }
 
+    #[must_use]
     pub const fn address(&self) -> SocketListenAddr {
         self.address
     }
 
+    #[must_use]
     pub const fn keepalive(&self) -> Option<TcpKeepaliveConfig> {
         self.keepalive
     }
 
+    #[must_use]
     pub const fn shutdown_timeout_secs(&self) -> Duration {
         self.shutdown_timeout_secs
     }
 
+    #[must_use]
     pub const fn receive_buffer_bytes(&self) -> Option<usize> {
         self.receive_buffer_bytes
     }
 
+    #[must_use]
     pub const fn max_connection_duration_secs(&self) -> Option<u64> {
         self.max_connection_duration_secs
     }
@@ -175,10 +183,10 @@ impl<T: FrameHandler + Clone> FrameHandler for DnstapFrameHandler<T> {
     }
 
     /**
-     * Function to pass into util::framestream::build_framestream_unix_source
+     * Function to pass into `util::framestream::build_framestream_unix_source`
      * Takes a data frame from the unix socket and turns it into a Vector Event.
      **/
-    fn handle_event(&self, received_from: Option<Bytes>, frame: Bytes) -> Option<Event> {
+    fn handle_event(&self, received_from: Option<String>, frame: Bytes) -> Option<Event> {
         self.frame_handler
             .handle_event(received_from, frame)
             .map(|mut event| {
@@ -211,7 +219,7 @@ impl<T: FrameHandler + Clone> FrameHandler for DnstapFrameHandler<T> {
         self.frame_handler.multithreaded()
     }
 
-    fn max_frame_handling_tasks(&self) -> u32 {
+    fn max_frame_handling_tasks(&self) -> usize {
         self.frame_handler.max_frame_handling_tasks()
     }
 

@@ -2,10 +2,12 @@ use std::path::Path;
 
 use crate::{
     config::Config,
+    extra_context::ExtraContext,
     test_util::{
         mock::{basic_sink, basic_source},
         start_topology, trace_init,
     },
+    topology::ReloadError::*,
 };
 
 #[tokio::test]
@@ -22,10 +24,12 @@ async fn topology_doesnt_reload_new_data_dir() {
 
     new_config.global.data_dir = Some(Path::new("/qwerty").to_path_buf());
 
-    topology
-        .reload_config_and_respawn(new_config.build().unwrap(), Default::default())
-        .await
-        .unwrap();
+    let result = topology
+        .reload_config_and_respawn(new_config.build().unwrap(), ExtraContext::default())
+        .await;
+
+    // Should fail with GlobalOptionsChanged error
+    assert!(matches!(result, Err(GlobalOptionsChanged { .. })));
 
     assert_eq!(
         topology.config.global.data_dir,

@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::app;
+use crate::{app, utils::git::git_ls_files};
 
 /// Check that markdown is styled properly
 #[derive(clap::Args, Debug)]
@@ -9,20 +9,13 @@ pub struct Cli {}
 
 impl Cli {
     pub fn exec(self) -> Result<()> {
-        app::exec(
-            "markdownlint",
-            [
-                "--config",
-                "scripts/.markdownlintrc",
-                "--ignore",
-                "scripts/node_modules",
-                "--ignore",
-                "website/node_modules",
-                "--ignore",
-                "target",
-                ".",
-            ],
-            true,
-        )
+        let files = git_ls_files(Some("*.md"))?;
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let args: Vec<&str> = files.iter().map(String::as_str).collect();
+
+        app::exec("markdownlint-cli2", &args, true)
     }
 }

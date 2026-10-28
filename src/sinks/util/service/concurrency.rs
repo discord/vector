@@ -1,26 +1,24 @@
 use std::{cell::RefCell, fmt};
 
-use serde::Serializer;
-use serde_json::Value;
-use vector_lib::configurable::attributes::CustomAttribute;
-use vector_lib::configurable::{
-    schema::{
-        apply_base_metadata, generate_const_string_schema, generate_number_schema,
-        generate_one_of_schema, SchemaGenerator, SchemaObject,
-    },
-    Configurable, GenerateError, Metadata, ToValue,
-};
-
 use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Unexpected, Visitor},
-    Deserialize, Deserializer, Serialize,
+};
+use serde_json::Value;
+use vector_lib::configurable::{
+    Configurable, GenerateError, Metadata, ToValue,
+    attributes::CustomAttribute,
+    schema::{
+        SchemaGenerator, SchemaObject, apply_metadata, generate_const_string_schema,
+        generate_number_schema, generate_one_of_schema,
+    },
 };
 
 /// Configuration for outbound request concurrency.
 ///
 /// This can be set either to one of the below enum values or to a positive integer, which denotes
 /// a fixed concurrency limit.
-#[derive(Clone, Copy, Debug, Derivative, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum Concurrency {
     /// A fixed concurrency of 1.
     ///
@@ -29,7 +27,8 @@ pub enum Concurrency {
 
     /// Concurrency is managed by the [Adaptive Request Concurrency][arc] feature.
     ///
-    /// [arc]: https://vector.dev/docs/about/under-the-hood/networking/arc/
+    /// [arc]: https://vector.dev/docs/architecture/arc/
+    #[default]
     Adaptive,
 
     /// A fixed amount of concurrency is allowed.
@@ -49,13 +48,8 @@ impl Serialize for Concurrency {
     }
 }
 
-impl Default for Concurrency {
-    fn default() -> Self {
-        Self::Adaptive
-    }
-}
-
 impl Concurrency {
+    #[must_use]
     pub const fn parse_concurrency(&self) -> Option<usize> {
         match self {
             Concurrency::None => Some(1),
@@ -73,7 +67,7 @@ impl<'de> Deserialize<'de> for Concurrency {
     {
         struct UsizeOrAdaptive;
 
-        impl<'de> Visitor<'de> for UsizeOrAdaptive {
+        impl Visitor<'_> for UsizeOrAdaptive {
             type Value = Concurrency;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -90,9 +84,13 @@ impl<'de> Deserialize<'de> for Concurrency {
                 }
             }
 
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "Preserve existing conversion on 32-bit targets. https://github.com/vectordotdev/vector/issues/23659"
+            )]
             fn visit_i64<E: de::Error>(self, value: i64) -> Result<Concurrency, E> {
                 if value > 0 {
-                    Ok(Concurrency::Fixed(value as usize))
+                    Ok(Concurrency::Fixed(value.cast_unsigned() as usize))
                 } else {
                     Err(de::Error::invalid_value(
                         Unexpected::Signed(value),
@@ -101,6 +99,10 @@ impl<'de> Deserialize<'de> for Concurrency {
                 }
             }
 
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "Preserve existing conversion on 32-bit targets. https://github.com/vectordotdev/vector/issues/23659"
+            )]
             fn visit_u64<E: de::Error>(self, value: u64) -> Result<Concurrency, E> {
                 if value > 0 {
                     Ok(Concurrency::Fixed(value as usize))
@@ -126,10 +128,10 @@ impl Configurable for Concurrency {
     fn metadata() -> Metadata {
         let mut metadata = Metadata::default();
         metadata.set_description(
-            r#"Configuration for outbound request concurrency.
+            r"Configuration for outbound request concurrency.
 
 This can be set either to one of the below enum values or to a positive integer, which denotes
-a fixed concurrency limit."#,
+a fixed concurrency limit.",
         );
         metadata.add_custom_attribute(CustomAttribute::kv("docs::enum_tagging", "external"));
         metadata
@@ -140,16 +142,15 @@ a fixed concurrency limit."#,
         let mut none_metadata = Metadata::with_title("A fixed concurrency of 1.");
         none_metadata.set_description("Only one request can be outstanding at any given time.");
         none_metadata.add_custom_attribute(CustomAttribute::kv("logical_name", "None"));
-        apply_base_metadata(&mut none_schema, none_metadata);
+        apply_metadata(&mut none_schema, none_metadata);
 
         let mut adaptive_schema = generate_const_string_schema("adaptive".to_string());
         let mut adaptive_metadata = Metadata::with_title(
-            "Concurrency will be managed by Vector's [Adaptive Request Concurrency][arc] feature.",
+            "Concurrency is managed by Vector's [Adaptive Request Concurrency][arc] feature.",
         );
-        adaptive_metadata
-            .set_description("[arc]: https://vector.dev/docs/about/under-the-hood/networking/arc/");
+        adaptive_metadata.set_description("[arc]: https://vector.dev/docs/architecture/arc/");
         adaptive_metadata.add_custom_attribute(CustomAttribute::kv("logical_name", "Adaptive"));
-        apply_base_metadata(&mut adaptive_schema, adaptive_metadata);
+        apply_metadata(&mut adaptive_schema, adaptive_metadata);
 
         let mut fixed_schema = generate_number_schema::<usize>();
         let mut fixed_metadata =
@@ -157,7 +158,7 @@ a fixed concurrency limit."#,
         fixed_metadata.set_transparent();
         fixed_metadata.add_custom_attribute(CustomAttribute::kv("docs::numeric_type", "uint"));
         fixed_metadata.add_custom_attribute(CustomAttribute::kv("logical_name", "Fixed"));
-        apply_base_metadata(&mut fixed_schema, fixed_metadata);
+        apply_metadata(&mut fixed_schema, fixed_metadata);
 
         Ok(generate_one_of_schema(&[
             none_schema,
@@ -186,6 +187,6 @@ fn is_serialization_reversible() {
         let deserialized = serde_json::from_value::<Concurrency>(value)
             .expect("Failed to deserialize a previously serialized Concurrency value");
 
-        assert_eq!(v, deserialized)
+        assert_eq!(v, deserialized);
     }
 }

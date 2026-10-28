@@ -1,39 +1,418 @@
-use vector_lib::config::LegacyKey;
-use vrl::event_path;
+use std::{fmt, mem, num::NonZeroU64};
+
+use lru::LruCache;
+use vector_lib::{
+    ByteSizeOf,
+    config::LegacyKey,
+    lookup::{OwnedTargetPath, lookup_v2::OptionalValuePath},
+    sampling::RatioSampler,
+};
 
 use crate::{
     conditions::Condition,
-    event::Event,
+    event::{Event, Value},
     internal_events::SampleEventDiscarded,
+    sinks::prelude::TemplateRenderingError,
+    template::UnconfinedTemplate,
     transforms::{FunctionTransform, OutputBuffer},
 };
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Preserve existing numeric conversion behavior. https://github.com/vectordotdev/vector/issues/23659"
+)]
+fn hash_ratio_threshold(ratio: f64) -> u64 {
+    (ratio * u128::from(u64::MAX) as f64) as u64
+}
+
+/// Approximate bytes retained for one cached group: the key (including its heap allocation), the
+/// sampling state, the LRU node's previous/next pointers, and the hash table slot pointing at it.
+#[expect(
+    clippy::ref_option,
+    reason = "Measure the owned Option and its heap allocation."
+)]
+pub(super) fn group_state_entry_bytes(group_by_key: &Option<String>) -> usize {
+    group_by_key.size_of() + mem::size_of::<GroupState>() + 4 * mem::size_of::<usize>()
+}
+
+/// Exists only for backwards compatibility purposes so that the value of `sample_rate_key` is
+/// consistent after the internal implementation of the Sample class was modified to work in terms
+/// of percentages
+#[derive(Clone, Debug)]
+pub enum SampleMode {
+    Rate {
+        rate: u64,
+    },
+    Ratio {
+        ratio: f64,
+        hash_ratio_threshold: u64,
+    },
+}
+
+impl SampleMode {
+    #[must_use]
+    pub const fn new_rate(rate: u64) -> Self {
+        Self::Rate { rate }
+    }
+
+    #[must_use]
+    pub fn new_ratio(ratio: f64) -> Self {
+        Self::Ratio {
+            ratio,
+            // Supports the 'key_field' option, assuming an equal distribution of values for a given
+            // field, hashing its contents this component should output events according to the
+            // configured ratio.
+            //
+            // To do one option would be to convert the hash to a number between 0 and 1 and compare
+            // to the ratio. However to address issues with precision, here the ratio is scaled to
+            // meet the width of the type of the hash.
+            hash_ratio_threshold: hash_ratio_threshold(ratio),
+        }
+    }
+
+    fn new_state(&self) -> StaticSampleState {
+        match self {
+            Self::Rate { rate } => StaticSampleState::Rate {
+                rate: *rate,
+                counter: 0,
+            },
+            Self::Ratio { ratio, .. } => StaticSampleState::Ratio {
+                sampler: RatioSampler::new(*ratio),
+            },
+        }
+    }
+
+    fn hash_within_ratio(&self, value: &[u8]) -> bool {
+        let hash = seahash::hash(value);
+        match self {
+            Self::Rate { rate } => hash.is_multiple_of(*rate),
+            Self::Ratio {
+                hash_ratio_threshold,
+                ..
+            } => hash <= *hash_ratio_threshold,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StaticSampleState {
+    Rate { rate: u64, counter: u64 },
+    Ratio { sampler: RatioSampler },
+}
+
+impl StaticSampleState {
+    fn sample(&mut self) -> bool {
+        match self {
+            Self::Rate { rate, counter } => {
+                let old_counter_value = *counter;
+                *counter += 1;
+                old_counter_value % *rate == 0
+            }
+            Self::Ratio { sampler } => sampler.sample(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GroupState {
+    static_state: StaticSampleState,
+    dynamic_event_counter: u64,
+}
+
+impl GroupState {
+    fn take_next(&mut self) -> Self {
+        let next = self.clone();
+        self.static_state.sample();
+        self.dynamic_event_counter += 1;
+        next
+    }
+}
+
+enum EventSampleMode {
+    Ratio(f64),
+    Rate(NonZeroU64),
+}
+
+impl EventSampleMode {
+    fn sample_rate_label(&self) -> String {
+        match self {
+            Self::Ratio(ratio) => ratio.to_string(),
+            Self::Rate(rate) => rate.to_string(),
+        }
+    }
+
+    fn sample(&self, counter: &mut u64) -> bool {
+        let old_counter_value = *counter;
+        *counter += 1;
+        let hash = seahash::hash(&old_counter_value.to_ne_bytes());
+
+        match self {
+            Self::Ratio(ratio) => hash <= hash_ratio_threshold(*ratio),
+            Self::Rate(rate) => hash.is_multiple_of(rate.get()),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct DynamicSampleFields {
+    pub ratio_field: Option<String>,
+    pub rate_field: Option<String>,
+}
+
+impl fmt::Display for SampleMode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Avoids the print of an additional '.0' which was not performed in the previous
+        // implementation
+        match self {
+            Self::Rate { rate, .. } => write!(f, "{rate}"),
+            Self::Ratio { ratio, .. } => write!(f, "{ratio}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum SampleKeySource {
+    Static {
+        key_field: Option<String>,
+        group_by: Option<UnconfinedTemplate>,
+    },
+    Dynamic {
+        fields: DynamicSampleFields,
+        group_by: Option<UnconfinedTemplate>,
+    },
+}
+
+impl SampleKeySource {
+    const fn group_by(&self) -> Option<&UnconfinedTemplate> {
+        match self {
+            Self::Static { group_by, .. } | Self::Dynamic { group_by, .. } => group_by.as_ref(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Sample {
     name: String,
-    rate: u64,
-    key_field: Option<String>,
+    static_mode: SampleMode,
+    key_source: SampleKeySource,
+    next_group_state: GroupState,
+    group_states: LruCache<Option<String>, GroupState>,
+    group_state_bytes: usize,
+    max_state_bytes: usize,
     exclude: Option<Condition>,
-    count: u64,
+    rate_key: OptionalValuePath,
+    include_group_tag: bool,
 }
 
 impl Sample {
     // This function is dead code when the feature flag `transforms-impl-sample` is specified but not
     // `transforms-sample`.
     #![allow(dead_code)]
-    pub const fn new(
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
         name: String,
-        rate: u64,
+        static_mode: SampleMode,
         key_field: Option<String>,
+        group_by: Option<UnconfinedTemplate>,
+        max_state_bytes: usize,
         exclude: Option<Condition>,
+        sample_rate_key: OptionalValuePath,
+        include_group_tag: bool,
     ) -> Self {
+        Self::new_with_source(
+            name,
+            static_mode,
+            SampleKeySource::Static {
+                key_field,
+                group_by,
+            },
+            max_state_bytes,
+            exclude,
+            sample_rate_key,
+            include_group_tag,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new_with_dynamic(
+        name: String,
+        static_mode: SampleMode,
+        fields: DynamicSampleFields,
+        group_by: Option<UnconfinedTemplate>,
+        max_state_bytes: usize,
+        exclude: Option<Condition>,
+        sample_rate_key: OptionalValuePath,
+        include_group_tag: bool,
+    ) -> Self {
+        Self::new_with_source(
+            name,
+            static_mode,
+            SampleKeySource::Dynamic { fields, group_by },
+            max_state_bytes,
+            exclude,
+            sample_rate_key,
+            include_group_tag,
+        )
+    }
+
+    fn new_with_source(
+        name: String,
+        static_mode: SampleMode,
+        key_source: SampleKeySource,
+        max_state_bytes: usize,
+        exclude: Option<Condition>,
+        sample_rate_key: OptionalValuePath,
+        include_group_tag: bool,
+    ) -> Self {
+        let next_group_state = GroupState {
+            static_state: static_mode.new_state(),
+            dynamic_event_counter: 0,
+        };
         Self {
             name,
-            rate,
-            key_field,
+            static_mode,
+            key_source,
+            next_group_state,
+            group_states: LruCache::unbounded(),
+            group_state_bytes: 0,
+            max_state_bytes,
             exclude,
-            count: 0,
+            rate_key: sample_rate_key,
+            include_group_tag,
         }
+    }
+
+    /// Runs `sample` against the group's state, admitting unknown groups from the shared
+    /// admission state and evicting least recently used groups to stay within `max_state_bytes`.
+    ///
+    /// A group whose entry alone exceeds the limit is sampled but not retained, so each of its
+    /// events is admitted like a new group.
+    fn sample_group(
+        &mut self,
+        group_by_key: Option<String>,
+        sample: impl FnOnce(&mut GroupState) -> bool,
+    ) -> bool {
+        if let Some(state) = self.group_states.get_mut(&group_by_key) {
+            return sample(state);
+        }
+
+        let mut state = self.next_group_state.take_next();
+        let should_sample = sample(&mut state);
+
+        let entry_bytes = group_state_entry_bytes(&group_by_key);
+        if entry_bytes <= self.max_state_bytes {
+            while self.group_state_bytes + entry_bytes > self.max_state_bytes {
+                let Some((evicted_key, _)) = self.group_states.pop_lru() else {
+                    break;
+                };
+                self.group_state_bytes -= group_state_entry_bytes(&evicted_key);
+            }
+            self.group_states.put(group_by_key, state);
+            self.group_state_bytes += entry_bytes;
+        }
+
+        should_sample
+    }
+
+    #[cfg(test)]
+    pub const fn retained_state_bytes(&self) -> usize {
+        self.group_state_bytes
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Preserve existing numeric conversion behavior. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    pub fn ratio(&self) -> f64 {
+        match &self.static_mode {
+            SampleMode::Rate { rate, .. } => 1.0f64 / *rate as f64,
+            SampleMode::Ratio { ratio, .. } => *ratio,
+        }
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Preserve existing numeric conversion behavior. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    fn event_ratio(&self, event: &Event) -> Option<f64> {
+        let ratio_field = match &self.key_source {
+            SampleKeySource::Dynamic { fields, .. } => fields.ratio_field.as_ref()?,
+            SampleKeySource::Static { .. } => return None,
+        };
+
+        let value = Self::get_event_value(event, ratio_field.as_str())?;
+
+        let ratio = match value {
+            Value::Integer(value) => *value as f64,
+            Value::Float(value) => value.into_inner(),
+            Value::Bytes(bytes) => std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()?,
+            Value::String(string) => string.parse::<f64>().ok()?,
+            _ => return None,
+        };
+
+        (ratio > 0.0 && ratio <= 1.0).then_some(ratio)
+    }
+
+    fn event_rate(&self, event: &Event) -> Option<NonZeroU64> {
+        let rate_field = match &self.key_source {
+            SampleKeySource::Dynamic { fields, .. } => fields.rate_field.as_ref()?,
+            SampleKeySource::Static { .. } => return None,
+        };
+
+        let value = Self::get_event_value(event, rate_field.as_str())?;
+
+        match value {
+            Value::Integer(value) => u64::try_from(*value).ok().and_then(NonZeroU64::new),
+            Value::Bytes(bytes) => std::str::from_utf8(bytes).ok()?.parse::<NonZeroU64>().ok(),
+            Value::String(string) => string.parse::<NonZeroU64>().ok(),
+            _ => None,
+        }
+    }
+
+    fn get_event_value<'a>(event: &'a Event, path: &str) -> Option<&'a Value> {
+        match event {
+            Event::Log(event) => event.parse_path_and_get_value(path).ok().flatten(),
+            Event::Trace(event) => event.parse_path_and_get_value(path).ok().flatten(),
+            Event::Metric(_) => panic!("component can never receive metric events"),
+        }
+    }
+
+    fn event_sample_mode(&self, event: &Event) -> Option<EventSampleMode> {
+        self.event_ratio(event)
+            .map(EventSampleMode::Ratio)
+            .or_else(|| self.event_rate(event).map(EventSampleMode::Rate))
+    }
+
+    fn group_by_key(&self, event: &Event) -> Option<String> {
+        let group_by = self.key_source.group_by()?;
+
+        match event {
+            Event::Log(event) => group_by.render_string(event),
+            Event::Trace(event) => group_by.render_string(event),
+            Event::Metric(_) => panic!("component can never receive metric events"),
+        }
+        .map_err(|error| {
+            emit!(TemplateRenderingError {
+                error,
+                field: Some("group_by"),
+                drop_event: false,
+            });
+        })
+        .ok()
+    }
+
+    fn static_key_value<'a>(&self, event: &'a Event) -> Option<&'a Value> {
+        let key_field = match &self.key_source {
+            SampleKeySource::Static { key_field, .. } => key_field.as_ref()?,
+            SampleKeySource::Dynamic { .. } => return None,
+        };
+
+        Self::get_event_value(event, key_field)
     }
 }
 
@@ -45,277 +424,61 @@ impl FunctionTransform for Sample {
                 if result {
                     output.push(event);
                     return;
-                } else {
-                    event
                 }
+                event
             } else {
                 event
             }
         };
 
-        let value = self
-            .key_field
-            .as_ref()
-            .and_then(|key_field| match &event {
-                Event::Log(event) => event
-                    .parse_path_and_get_value(key_field.as_str())
-                    .ok()
-                    .flatten(),
-                Event::Trace(event) => event
-                    .parse_path_and_get_value(key_field.as_str())
-                    .ok()
-                    .flatten(),
-                Event::Metric(_) => panic!("component can never receive metric events"),
-            })
-            .map(|v| v.to_string_lossy());
+        let group_by_key = self.group_by_key(&event);
+        let discarded_group = self
+            .include_group_tag
+            .then(|| group_by_key.clone())
+            .flatten();
+        let static_key_sample = self.static_key_value(&event).map(|value| {
+            self.static_mode
+                .hash_within_ratio(value.to_string_lossy().as_bytes())
+        });
+        let event_sample_mode = self.event_sample_mode(&event);
+        let sample_rate = event_sample_mode.as_ref().map_or_else(
+            || self.static_mode.to_string(),
+            EventSampleMode::sample_rate_label,
+        );
 
-        let num = if let Some(value) = value {
-            seahash::hash(value.as_bytes())
-        } else {
-            self.count
-        };
+        let should_sample = self.sample_group(group_by_key, |group_state| {
+            if let Some(mode) = event_sample_mode {
+                mode.sample(&mut group_state.dynamic_event_counter)
+            } else {
+                let threshold_exceeded = group_state.static_state.sample();
+                static_key_sample.unwrap_or(threshold_exceeded)
+            }
+        });
 
-        self.count = (self.count + 1) % self.rate;
-
-        if num % self.rate == 0 {
-            match event {
-                Event::Log(ref mut event) => {
-                    event.namespace().insert_source_metadata(
-                        self.name.as_str(),
-                        event,
-                        Some(LegacyKey::Overwrite(vrl::path!("sample_rate"))),
-                        vrl::path!("sample_rate"),
-                        self.rate.to_string(),
-                    );
+        if should_sample {
+            if let Some(path) = &self.rate_key.path {
+                match event {
+                    Event::Log(ref mut event) => {
+                        event.namespace().insert_source_metadata(
+                            self.name.as_str(),
+                            event,
+                            Some(LegacyKey::Overwrite(path)),
+                            path,
+                            sample_rate,
+                        );
+                    }
+                    Event::Trace(ref mut event) => {
+                        event.insert(&OwnedTargetPath::event(path.clone()), sample_rate);
+                    }
+                    Event::Metric(_) => panic!("component can never receive metric events"),
                 }
-                Event::Trace(ref mut event) => {
-                    event.insert(event_path!("sample_rate"), self.rate.to_string());
-                }
-                Event::Metric(_) => panic!("component can never receive metric events"),
-            };
+            }
             output.push(event);
         } else {
-            emit!(SampleEventDiscarded);
+            emit!(SampleEventDiscarded {
+                group: discarded_group,
+                include_group_tag: self.include_group_tag,
+            });
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::{
-        conditions::{Condition, ConditionalConfig, VrlConfig},
-        config::log_schema,
-        event::{Event, LogEvent, TraceEvent},
-        test_util::random_lines,
-        transforms::test::transform_one,
-        transforms::OutputBuffer,
-    };
-    use approx::assert_relative_eq;
-
-    fn condition_contains(key: &str, needle: &str) -> Condition {
-        let vrl_config = VrlConfig {
-            source: format!(r#"contains!(."{}", "{}")"#, key, needle),
-            runtime: Default::default(),
-        };
-
-        vrl_config
-            .build(&Default::default())
-            .expect("should not fail to build VRL condition")
-    }
-
-    #[test]
-    fn hash_samples_at_roughly_the_configured_rate() {
-        let num_events = 10000;
-
-        let events = random_events(num_events);
-        let mut sampler = Sample::new(
-            "sample".to_string(),
-            2,
-            log_schema().message_key().map(ToString::to_string),
-            Some(condition_contains(
-                log_schema().message_key().unwrap().to_string().as_str(),
-                "na",
-            )),
-        );
-        let total_passed = events
-            .into_iter()
-            .filter_map(|event| {
-                let mut buf = OutputBuffer::with_capacity(1);
-                sampler.transform(&mut buf, event);
-                buf.into_events().next()
-            })
-            .count();
-        let ideal = 1.0f64 / 2.0f64;
-        let actual = total_passed as f64 / num_events as f64;
-        assert_relative_eq!(ideal, actual, epsilon = ideal * 0.5);
-
-        let events = random_events(num_events);
-        let mut sampler = Sample::new(
-            "sample".to_string(),
-            25,
-            log_schema().message_key().map(ToString::to_string),
-            Some(condition_contains(
-                log_schema().message_key().unwrap().to_string().as_str(),
-                "na",
-            )),
-        );
-        let total_passed = events
-            .into_iter()
-            .filter_map(|event| {
-                let mut buf = OutputBuffer::with_capacity(1);
-                sampler.transform(&mut buf, event);
-                buf.into_events().next()
-            })
-            .count();
-        let ideal = 1.0f64 / 25.0f64;
-        let actual = total_passed as f64 / num_events as f64;
-        assert_relative_eq!(ideal, actual, epsilon = ideal * 0.5);
-    }
-
-    #[test]
-    fn hash_consistently_samples_the_same_events() {
-        let events = random_events(1000);
-        let mut sampler = Sample::new(
-            "sample".to_string(),
-            2,
-            log_schema().message_key().map(ToString::to_string),
-            Some(condition_contains(
-                log_schema().message_key().unwrap().to_string().as_str(),
-                "na",
-            )),
-        );
-
-        let first_run = events
-            .clone()
-            .into_iter()
-            .filter_map(|event| {
-                let mut buf = OutputBuffer::with_capacity(1);
-                sampler.transform(&mut buf, event);
-                buf.into_events().next()
-            })
-            .collect::<Vec<_>>();
-        let second_run = events
-            .into_iter()
-            .filter_map(|event| {
-                let mut buf = OutputBuffer::with_capacity(1);
-                sampler.transform(&mut buf, event);
-                buf.into_events().next()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(first_run, second_run);
-    }
-
-    #[test]
-    fn always_passes_events_matching_pass_list() {
-        for key_field in &[None, log_schema().message_key().map(ToString::to_string)] {
-            let event = Event::Log(LogEvent::from("i am important"));
-            let mut sampler = Sample::new(
-                "sample".to_string(),
-                0,
-                key_field.clone(),
-                Some(condition_contains(
-                    log_schema().message_key().unwrap().to_string().as_str(),
-                    "important",
-                )),
-            );
-            let iterations = 0..1000;
-            let total_passed = iterations
-                .filter_map(|_| {
-                    transform_one(&mut sampler, event.clone())
-                        .map(|result| assert_eq!(result, event))
-                })
-                .count();
-            assert_eq!(total_passed, 1000);
-        }
-    }
-
-    #[test]
-    fn handles_key_field() {
-        for key_field in &[None, Some("other_field".into())] {
-            let mut event = Event::Log(LogEvent::from("nananana"));
-            let log = event.as_mut_log();
-            log.insert("other_field", "foo");
-            let mut sampler = Sample::new(
-                "sample".to_string(),
-                0,
-                key_field.clone(),
-                Some(condition_contains("other_field", "foo")),
-            );
-            let iterations = 0..1000;
-            let total_passed = iterations
-                .filter_map(|_| {
-                    transform_one(&mut sampler, event.clone())
-                        .map(|result| assert_eq!(result, event))
-                })
-                .count();
-            assert_eq!(total_passed, 1000);
-        }
-    }
-
-    #[test]
-    fn sampler_adds_sampling_rate_to_event() {
-        for key_field in &[None, log_schema().message_key().map(ToString::to_string)] {
-            let events = random_events(10000);
-            let message_key = log_schema().message_key().unwrap().to_string();
-            let mut sampler = Sample::new(
-                "sample".to_string(),
-                10,
-                key_field.clone(),
-                Some(condition_contains(&message_key, "na")),
-            );
-            let passing = events
-                .into_iter()
-                .filter(|s| !s.as_log()[&message_key].to_string_lossy().contains("na"))
-                .find_map(|event| transform_one(&mut sampler, event))
-                .unwrap();
-            assert_eq!(passing.as_log()["sample_rate"], "10".into());
-
-            let events = random_events(10000);
-            let mut sampler = Sample::new(
-                "sample".to_string(),
-                25,
-                key_field.clone(),
-                Some(condition_contains(&message_key, "na")),
-            );
-            let passing = events
-                .into_iter()
-                .filter(|s| !s.as_log()[&message_key].to_string_lossy().contains("na"))
-                .find_map(|event| transform_one(&mut sampler, event))
-                .unwrap();
-            assert_eq!(passing.as_log()["sample_rate"], "25".into());
-
-            // If the event passed the regex check, don't include the sampling rate
-            let mut sampler = Sample::new(
-                "sample".to_string(),
-                25,
-                key_field.clone(),
-                Some(condition_contains(&message_key, "na")),
-            );
-            let event = Event::Log(LogEvent::from("nananana"));
-            let passing = transform_one(&mut sampler, event).unwrap();
-            assert!(passing.as_log().get("sample_rate").is_none());
-        }
-    }
-
-    #[test]
-    fn handles_trace_event() {
-        let event: TraceEvent = LogEvent::from("trace").into();
-        let trace = Event::Trace(event);
-        let mut sampler = Sample::new("sample".to_string(), 2, None, None);
-        let iterations = 0..2;
-        let total_passed = iterations
-            .filter_map(|_| transform_one(&mut sampler, trace.clone()))
-            .count();
-        assert_eq!(total_passed, 1);
-    }
-
-    fn random_events(n: usize) -> Vec<Event> {
-        random_lines(10)
-            .take(n)
-            .map(|e| Event::Log(LogEvent::from(e)))
-            .collect()
     }
 }

@@ -1,20 +1,34 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use vector_lib::event::{EventFinalizers, Finalizable};
-use vector_lib::request_metadata::RequestMetadata;
+use vector_lib::{
+    event::{EventFinalizers, Finalizable},
+    request_metadata::RequestMetadata,
+};
 
 use super::{encoder::HecMetricsEncoder, sink::HecProcessedEvent};
 use crate::sinks::{
     splunk_hec::common::request::HecRequest,
     util::{
-        metadata::RequestMetadataBuilder, request_builder::EncodeResult, Compression,
-        RequestBuilder,
+        Compression, RequestBuilder, metadata::RequestMetadataBuilder,
+        request_builder::EncodeResult,
     },
 };
 
 pub struct HecMetricsRequestBuilder {
     pub(super) compression: Compression,
+    pub(super) encoder: HecMetricsEncoder,
+}
+
+impl HecMetricsRequestBuilder {
+    pub const fn new(compression: Compression, templated_field_keys: Box<[String]>) -> Self {
+        Self {
+            compression,
+            encoder: HecMetricsEncoder {
+                templated_field_keys,
+            },
+        }
+    }
 }
 
 impl RequestBuilder<(Option<Arc<str>>, Vec<HecProcessedEvent>)> for HecMetricsRequestBuilder {
@@ -30,7 +44,7 @@ impl RequestBuilder<(Option<Arc<str>>, Vec<HecProcessedEvent>)> for HecMetricsRe
     }
 
     fn encoder(&self) -> &Self::Encoder {
-        &HecMetricsEncoder
+        &self.encoder
     }
 
     fn split_input(

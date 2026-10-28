@@ -1,11 +1,10 @@
 mod component_spec;
 
-pub use self::component_spec::ComponentSpecValidator;
-
 use std::fmt::{Display, Formatter};
 
 use vector_lib::event::Event;
 
+pub use self::component_spec::ComponentSpecValidator;
 use super::{ComponentType, RunnerMetrics, TestCaseExpectation, TestEvent};
 
 /// A component validator.
@@ -20,6 +19,8 @@ pub trait Validator {
     ///
     /// Additionally, all telemetry events received for the component for the validation run are
     /// provided as well.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::missing_errors_doc, reason = "Error documentation deferred")]
     fn check_validation(
         &self,
         component_type: ComponentType,

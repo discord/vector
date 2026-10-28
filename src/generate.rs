@@ -1,21 +1,23 @@
 #![allow(missing_docs)]
 use std::{
-    fs::{create_dir_all, File},
+    fs::{File, create_dir_all},
     io::Write,
     path::{Path, PathBuf},
 };
 
 use clap::Parser;
-use colored::*;
+use colored::Colorize;
 use indexmap::IndexMap;
 use serde::Serialize;
-use toml::{map::Map, Value};
-use vector_lib::configurable::component::{
-    SinkDescription, SourceDescription, TransformDescription,
+use serde_json::{Map, Value};
+use vector_lib::{
+    buffers::BufferConfig,
+    config::GlobalOptions,
+    configurable::component::{SinkDescription, SourceDescription, TransformDescription},
+    default_data_dir,
 };
-use vector_lib::{buffers::BufferConfig, config::GlobalOptions, default_data_dir};
 
-use crate::config::{format, Format, SinkHealthcheckOptions};
+use crate::config::{Format, SinkHealthcheckOptions, format};
 
 #[derive(Parser, Debug)]
 #[command(rename_all = "kebab-case")]
@@ -89,22 +91,6 @@ pub struct Config {
     pub sinks: Option<IndexMap<String, SinkOuter>>,
 }
 
-/// Controls how the resulting transform topology is wired up. This is not
-/// user-configurable.
-pub(crate) enum TransformInputsStrategy {
-    /// Default.
-    ///
-    /// The first transform generated will consume from all sources and
-    /// subsequent transforms will consume from their predecessor.
-    Auto,
-    /// Used for property testing `vector config`.
-    ///
-    /// All transforms use a list of all sources as inputs.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    All,
-}
-
 #[derive(Serialize, Default)]
 struct FullConfig {
     #[serde(flatten)]
@@ -113,13 +99,29 @@ struct FullConfig {
     config: Config,
 }
 
-pub(crate) fn generate_example(
-    opts: &Opts,
-    transform_inputs_strategy: TransformInputsStrategy,
-) -> Result<String, Vec<String>> {
+pub(crate) fn strip_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_nulls(v)))
+                .collect(),
+        ),
+        Value::Array(arr) => Value::Array(arr.into_iter().map(strip_nulls).collect()),
+        other => other,
+    }
+}
+
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::too_many_lines, reason = "Keep command flow")]
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Preserve path escaping"
+)]
+pub(crate) fn generate_example(opts: &Opts) -> Result<String, Vec<String>> {
     let components: Vec<Vec<_>> = opts
         .expression
-        .split(|c| c == '|' || c == '/')
+        .split(['|', '/'])
         .map(|s| {
             s.split(',')
                 .map(|s| s.trim().to_string())
@@ -140,8 +142,7 @@ pub(crate) fn generate_example(
             let (name, source_type) = if let Some(c_index) = source_expr.find(':') {
                 if c_index == 0 {
                     errs.push(format!(
-                        "failed to generate source '{}': empty name is not allowed",
-                        source_expr
+                        "failed to generate source '{source_expr}': empty name is not allowed"
                     ));
                     continue;
                 }
@@ -151,24 +152,21 @@ pub(crate) fn generate_example(
                     chopped_expr.drain(1..).collect(),
                 )
             } else {
-                (format!("source{}", i), source_expr.clone())
+                (format!("source{i}"), source_expr.clone())
             };
             source_names.push(name.clone());
 
             let mut example = match SourceDescription::example(&source_type) {
-                Ok(example) => example,
+                Ok(example) => strip_nulls(example),
                 Err(err) => {
-                    errs.push(format!(
-                        "failed to generate source '{}': {}",
-                        source_type, err
-                    ));
-                    Value::Table(Map::new())
+                    errs.push(format!("failed to generate source '{source_type}': {err}"));
+                    Value::Object(Map::new())
                 }
             };
             example
-                .as_table_mut()
+                .as_object_mut()
                 .expect("examples are always tables")
-                .insert("type".into(), source_type.to_owned().into());
+                .insert("type".to_string(), Value::String(source_type.clone()));
 
             sources.insert(name, example);
         }
@@ -186,8 +184,7 @@ pub(crate) fn generate_example(
             let (name, transform_type) = if let Some(c_index) = transform_expr.find(':') {
                 if c_index == 0 {
                     errs.push(format!(
-                        "failed to generate transform '{}': empty name is not allowed",
-                        transform_expr
+                        "failed to generate transform '{transform_expr}': empty name is not allowed"
                     ));
                     continue;
                 }
@@ -197,39 +194,34 @@ pub(crate) fn generate_example(
                     chopped_expr.drain(1..).collect(),
                 )
             } else {
-                (format!("transform{}", i), transform_expr.clone())
+                (format!("transform{i}"), transform_expr.clone())
             };
             transform_names.push(name.clone());
 
-            let targets = match transform_inputs_strategy {
-                TransformInputsStrategy::Auto => {
-                    if i == 0 {
-                        source_names.clone()
-                    } else {
-                        vec![transform_names
-                            .get(i - 1)
-                            .unwrap_or(&"component-id".to_owned())
-                            .to_owned()]
-                    }
-                }
-                #[cfg(test)]
-                TransformInputsStrategy::All => source_names.clone(),
+            let targets = if i == 0 {
+                source_names.clone()
+            } else {
+                vec![
+                    transform_names
+                        .get(i - 1)
+                        .unwrap_or(&"component-id".to_owned())
+                        .to_owned(),
+                ]
             };
 
             let mut example = match TransformDescription::example(&transform_type) {
-                Ok(example) => example,
+                Ok(example) => strip_nulls(example),
                 Err(err) => {
                     errs.push(format!(
-                        "failed to generate transform '{}': {}",
-                        transform_type, err
+                        "failed to generate transform '{transform_type}': {err}"
                     ));
-                    Value::Table(Map::new())
+                    Value::Object(Map::new())
                 }
             };
             example
-                .as_table_mut()
+                .as_object_mut()
                 .expect("examples are always tables")
-                .insert("type".into(), transform_type.to_owned().into());
+                .insert("type".to_string(), Value::String(transform_type.clone()));
 
             transforms.insert(
                 name,
@@ -252,8 +244,7 @@ pub(crate) fn generate_example(
             let (name, sink_type) = if let Some(c_index) = sink_expr.find(':') {
                 if c_index == 0 {
                     errs.push(format!(
-                        "failed to generate sink '{}': empty name is not allowed",
-                        sink_expr
+                        "failed to generate sink '{sink_expr}': empty name is not allowed"
                     ));
                     continue;
                 }
@@ -263,20 +254,20 @@ pub(crate) fn generate_example(
                     chopped_expr.drain(1..).collect(),
                 )
             } else {
-                (format!("sink{}", i), sink_expr.clone())
+                (format!("sink{i}"), sink_expr.clone())
             };
 
             let mut example = match SinkDescription::example(&sink_type) {
-                Ok(example) => example,
+                Ok(example) => strip_nulls(example),
                 Err(err) => {
-                    errs.push(format!("failed to generate sink '{}': {}", sink_type, err));
-                    Value::Table(Map::new())
+                    errs.push(format!("failed to generate sink '{sink_type}': {err}"));
+                    Value::Object(Map::new())
                 }
             };
             example
-                .as_table_mut()
+                .as_object_mut()
                 .expect("examples are always tables")
-                .insert("type".into(), sink_type.to_owned().into());
+                .insert("type".to_string(), Value::String(sink_type.clone()));
 
             sinks.insert(
                 name,
@@ -285,10 +276,10 @@ pub(crate) fn generate_example(
                         .last()
                         .map(|s| vec![s.to_owned()])
                         .or_else(|| {
-                            if !source_names.is_empty() {
-                                Some(source_names.clone())
-                            } else {
+                            if source_names.is_empty() {
                                 None
+                            } else {
+                                Some(source_names.clone())
                             }
                         })
                         .unwrap_or_else(|| vec!["component-id".to_owned()]),
@@ -309,13 +300,13 @@ pub(crate) fn generate_example(
     }
 
     let full_config = FullConfig {
-        global_options: if !opts.fragment {
+        global_options: if opts.fragment {
+            None
+        } else {
             Some(GlobalOptions {
                 data_dir: default_data_dir(),
                 ..Default::default()
             })
-        } else {
-            None
         },
         config,
     };
@@ -329,45 +320,53 @@ pub(crate) fn generate_example(
     };
 
     let file = opts.file.as_ref();
-    if file.is_some() {
-        #[allow(clippy::print_stdout)]
-        match write_config(file.as_ref().unwrap(), &builder) {
-            Ok(_) => {
+    if let Some(path) = file {
+        match write_config(path, &builder) {
+            #[allow(clippy::print_stdout)]
+            Ok(()) => {
                 println!(
                     "Config file written to {:?}",
                     &file.as_ref().unwrap().join("\n")
-                )
+                );
             }
             Err(e) => errs.push(format!("failed to write to file: {e}")),
-        };
-    };
+        }
+    }
 
-    if !errs.is_empty() {
-        Err(errs)
-    } else {
+    if errs.is_empty() {
         Ok(builder)
+    } else {
+        Err(errs)
     }
 }
 
+#[must_use]
 pub fn cmd(opts: &Opts) -> exitcode::ExitCode {
-    match generate_example(opts, TransformInputsStrategy::Auto) {
+    match generate_example(opts) {
         Ok(s) => {
             #[allow(clippy::print_stdout)]
             {
-                println!("{}", s);
+                println!("{s}");
             }
             exitcode::OK
         }
         Err(errs) => {
             #[allow(clippy::print_stderr)]
             {
-                errs.iter().for_each(|e| eprintln!("{}", e.red()));
+                for error in errs {
+                    eprintln!("{}", error.red());
+                }
             }
             exitcode::SOFTWARE
         }
     }
 }
 
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Preserve path escaping"
+)]
 fn write_config(filepath: &Path, body: &str) -> Result<(), crate::Error> {
     if filepath.exists() {
         // If the file exists, we don't want to overwrite, that's just rude.
@@ -384,9 +383,10 @@ fn write_config(filepath: &Path, body: &str) -> Result<(), crate::Error> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::config::ConfigBuilder;
-    use rstest::rstest;
 
     fn generate_and_deserialize(expression: String, format: Format) {
         let opts = Opts {
@@ -395,7 +395,7 @@ mod tests {
             file: None,
             format,
         };
-        let cfg_string = generate_example(&opts, TransformInputsStrategy::Auto).unwrap();
+        let cfg_string = generate_example(&opts).unwrap();
         if let Err(error) = format::deserialize::<ConfigBuilder>(&cfg_string, opts.format) {
             panic!(
                 "Failed to generate example for {} with error: {error:?})",
@@ -411,15 +411,15 @@ mod tests {
     #[test]
     fn generate_all(#[case] format: Format) {
         for name in SourceDescription::types() {
-            generate_and_deserialize(format!("{}//", name), format);
+            generate_and_deserialize(format!("{name}//"), format);
         }
 
         for name in TransformDescription::types() {
-            generate_and_deserialize(format!("/{}/", name), format);
+            generate_and_deserialize(format!("/{name}/"), format);
         }
 
         for name in SinkDescription::types() {
-            generate_and_deserialize(format!("//{}", name), format);
+            generate_and_deserialize(format!("//{name}"), format);
         }
     }
 
@@ -439,17 +439,19 @@ mod tests {
             format: Format::Toml,
         };
 
-        let cfg = generate_example(&opts, TransformInputsStrategy::Auto);
+        let cfg = generate_example(&opts);
         let filecontents = fs::read_to_string(
             fs::canonicalize(&filepath).expect("Could not return canonicalized filepath"),
         )
         .expect("Could not read config file");
         fs::remove_file(filepath).expect("Could not cleanup config file!");
-        assert_eq!(cfg.unwrap(), filecontents)
+        assert_eq!(cfg.unwrap(), filecontents);
     }
 
     #[cfg(all(feature = "sources-stdin", feature = "sinks-console"))]
     #[test]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::too_many_lines, reason = "Keep test scenario")]
     fn generate_basic_toml() {
         let mut opts = Opts {
             fragment: false,
@@ -459,7 +461,7 @@ mod tests {
         };
 
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto),
+            generate_example(&opts),
             Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sources.source0]
@@ -471,8 +473,8 @@ mod tests {
 
                 [transforms.transform0]
                 inputs = ["source0"]
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
 
                 [sinks.sink0]
@@ -499,7 +501,7 @@ mod tests {
 
         opts.expression = "stdin|test_basic|console".to_string();
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto),
+            generate_example(&opts),
             Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sources.source0]
@@ -511,8 +513,8 @@ mod tests {
 
                 [transforms.transform0]
                 inputs = ["source0"]
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
 
                 [sinks.sink0]
@@ -539,7 +541,7 @@ mod tests {
 
         opts.expression = "stdin//console".to_string();
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto),
+            generate_example(&opts),
             Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sources.source0]
@@ -573,7 +575,7 @@ mod tests {
 
         opts.expression = "//console".to_string();
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto),
+            generate_example(&opts),
             Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sinks.sink0]
@@ -600,25 +602,25 @@ mod tests {
 
         opts.expression = "/test_basic,test_basic,test_basic".to_string();
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto),
+            generate_example(&opts),
             Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [transforms.transform0]
                 inputs = []
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
 
                 [transforms.transform1]
                 inputs = ["transform0"]
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
 
                 [transforms.transform2]
                 inputs = ["transform1"]
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
             "#}
             .to_string())
@@ -627,24 +629,24 @@ mod tests {
         opts.fragment = true;
         opts.expression = "/test_basic,test_basic,test_basic".to_string();
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto),
+            generate_example(&opts),
             Ok(indoc::indoc! {r#"
                 [transforms.transform0]
                 inputs = []
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
 
                 [transforms.transform1]
                 inputs = ["transform0"]
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
 
                 [transforms.transform2]
                 inputs = ["transform1"]
-                increase = 0.0
                 suffix = ""
+                increase = 0.0
                 type = "test_basic"
             "#}
             .to_string())
@@ -666,26 +668,26 @@ mod tests {
         };
 
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto).unwrap(),
-            indoc::indoc! {r#"
+            generate_example(&opts).unwrap(),
+            indoc::indoc! {r"
             data_dir: /var/lib/vector/
             sources:
               source0:
+                interval: 1.0
                 count: 9223372036854775807
                 format: json
-                interval: 1.0
-                type: demo_logs
-                decoding:
-                  codec: bytes
                 framing:
                   method: bytes
+                decoding:
+                  codec: bytes
+                type: demo_logs
             transforms:
               transform0:
                 inputs:
                 - source0
-                drop_on_abort: false
-                drop_on_error: false
                 metric_tag_values: single
+                drop_on_error: false
+                drop_on_abort: false
                 reroute_dropped: false
                 runtime: ast
                 type: remap
@@ -694,11 +696,11 @@ mod tests {
                 inputs:
                 - transform0
                 target: stdout
-                type: console
                 encoding:
                   codec: json
                   json:
                     pretty: false
+                type: console
                 healthcheck:
                   enabled: true
                   uri: null
@@ -706,7 +708,7 @@ mod tests {
                   type: memory
                   max_events: 500
                   when_full: block
-            "#}
+            "}
         );
     }
 
@@ -725,22 +727,22 @@ mod tests {
         };
 
         assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto).unwrap(),
+            generate_example(&opts).unwrap(),
             indoc::indoc! {r#"
             {
               "data_dir": "/var/lib/vector/",
               "sources": {
                 "source0": {
+                  "interval": 1.0,
                   "count": 9223372036854775807,
                   "format": "json",
-                  "interval": 1.0,
-                  "type": "demo_logs",
+                  "framing": {
+                    "method": "bytes"
+                  },
                   "decoding": {
                     "codec": "bytes"
                   },
-                  "framing": {
-                    "method": "bytes"
-                  }
+                  "type": "demo_logs"
                 }
               },
               "transforms": {
@@ -748,9 +750,9 @@ mod tests {
                   "inputs": [
                     "source0"
                   ],
-                  "drop_on_abort": false,
-                  "drop_on_error": false,
                   "metric_tag_values": "single",
+                  "drop_on_error": false,
+                  "drop_on_abort": false,
                   "reroute_dropped": false,
                   "runtime": "ast",
                   "type": "remap"
@@ -762,13 +764,13 @@ mod tests {
                     "transform0"
                   ],
                   "target": "stdout",
-                  "type": "console",
                   "encoding": {
                     "codec": "json",
                     "json": {
                       "pretty": false
                     }
                   },
+                  "type": "console",
                   "healthcheck": {
                     "enabled": true,
                     "uri": null

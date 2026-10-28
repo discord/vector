@@ -1,6 +1,6 @@
 use futures_util::{
-    stream::{self, BoxStream},
     StreamExt,
+    stream::{self, BoxStream},
 };
 use vector_lib::event::Event;
 use vector_lib::sink::StreamSink;

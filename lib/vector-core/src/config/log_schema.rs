@@ -1,12 +1,10 @@
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
-use lookup::lookup_v2::OptionalTargetPath;
-use lookup::{OwnedTargetPath, OwnedValuePath};
-use once_cell::sync::Lazy;
+use lookup::{OwnedTargetPath, OwnedValuePath, lookup_v2::OptionalTargetPath};
 use vector_config::configurable_component;
 
 static LOG_SCHEMA: OnceLock<LogSchema> = OnceLock::new();
-static LOG_SCHEMA_DEFAULT: Lazy<LogSchema> = Lazy::new(LogSchema::default);
+static LOG_SCHEMA_DEFAULT: LazyLock<LogSchema> = LazyLock::new(LogSchema::default);
 
 const MESSAGE: &str = "message";
 const TIMESTAMP: &str = "timestamp";
@@ -46,6 +44,7 @@ pub fn log_schema() -> &'static LogSchema {
 #[configurable_component]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[serde(default)]
+#[allow(clippy::struct_field_names)]
 pub struct LogSchema {
     /// The name of the event field to treat as the event message.
     ///

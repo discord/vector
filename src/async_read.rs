@@ -24,7 +24,7 @@ pub trait VecAsyncReadExt: AsyncRead {
 
 impl<S> VecAsyncReadExt for S where S: AsyncRead {}
 
-/// A AsyncRead combinator which reads from a reader until a future resolves.
+/// A `AsyncRead` combinator which reads from a reader until a future resolves.
 #[pin_project]
 #[derive(Clone, Debug)]
 pub struct AllowReadUntil<S, F> {
@@ -39,7 +39,7 @@ impl<S, F> AllowReadUntil<S, F> {
         &self.reader
     }
 
-    pub fn get_mut(&mut self) -> &mut S {
+    pub const fn get_mut(&mut self) -> &mut S {
         &mut self.reader
     }
 }
@@ -56,7 +56,7 @@ where
     ) -> Poll<IoResult<()>> {
         let this = self.project();
         match this.until.poll(cx) {
-            Poll::Ready(_) => Poll::Ready(Ok(())),
+            Poll::Ready(()) => Poll::Ready(Ok(())),
             Poll::Pending => this.reader.poll_read(cx, buf),
         }
     }
@@ -66,7 +66,7 @@ where
 mod tests {
     use futures::FutureExt;
     use tokio::{
-        fs::{remove_file, File},
+        fs::{File, remove_file},
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     };
 

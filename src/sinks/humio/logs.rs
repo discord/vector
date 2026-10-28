@@ -1,23 +1,28 @@
-use vector_lib::codecs::JsonSerializerConfig;
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::lookup_v2::{ConfigValuePath, OptionalTargetPath};
-use vector_lib::sensitive_string::SensitiveString;
+use vector_lib::{
+    codecs::JsonSerializerConfig,
+    configurable::configurable_component,
+    lookup::lookup_v2::{ConfigValuePath, OptionalTargetPath},
+    sensitive_string::SensitiveString,
+};
 
 use super::config_host_key_target_path;
-use crate::sinks::splunk_hec::common::config_timestamp_key_target_path;
 use crate::{
     codecs::EncodingConfig,
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext,
+        ValidatedSink,
+    },
     sinks::{
+        Healthcheck, VectorSink,
         splunk_hec::{
             common::{
-                acknowledgements::HecClientAcknowledgementsConfig, EndpointTarget,
-                SplunkHecDefaultBatchSettings,
+                EndpointTarget, SplunkHecDefaultBatchSettings,
+                acknowledgements::HecClientAcknowledgementsConfig,
+                config_timestamp_key_target_path,
             },
-            logs::config::HecLogsSinkConfig,
+            logs::config::{HecLogsSinkConfig, ValidatedHecLogsSink},
         },
-        util::{BatchConfig, Compression, TowerRequestConfig},
-        Healthcheck, VectorSink,
+        util::{BatchConfig, Compression, HttpEndpoint, TowerRequestConfig},
     },
     template::Template,
     tls::TlsConfig,
@@ -35,7 +40,7 @@ pub struct HumioLogsConfig {
         docs::examples = "${HUMIO_TOKEN}",
         docs::examples = "A94A8FE5CCB19BA61C4C08"
     ))]
-    pub(super) token: SensitiveString,
+    pub token: SensitiveString,
 
     /// The base URL of the Humio instance.
     ///
@@ -49,15 +54,14 @@ pub struct HumioLogsConfig {
         docs::examples = "http://127.0.0.1",
         docs::examples = "https://example.com",
     ))]
-    pub(super) endpoint: String,
+    pub endpoint: HttpEndpoint,
 
     /// The source of events sent to this sink.
     ///
     /// Typically the filename the logs originated from. Maps to `@source` in Humio.
-    pub(super) source: Option<Template>,
+    pub source: Option<Template>,
 
-    #[configurable(derived)]
-    pub(super) encoding: EncodingConfig,
+    pub encoding: EncodingConfig,
 
     /// The type of events sent to this sink. Humio uses this as the name of the parser to use to ingest the data.
     ///
@@ -65,9 +69,9 @@ pub struct HumioLogsConfig {
     #[configurable(metadata(
         docs::examples = "json",
         docs::examples = "none",
-        docs::examples = "{{ event_type }}"
+        docs::examples = "event_type-{{ event_type }}"
     ))]
-    pub(super) event_type: Option<Template>,
+    pub event_type: Option<Template>,
 
     /// Overrides the name of the log field used to retrieve the hostname to send to Humio.
     ///
@@ -76,7 +80,7 @@ pub struct HumioLogsConfig {
     ///
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
     #[serde(default = "config_host_key_target_path")]
-    pub(super) host_key: OptionalTargetPath,
+    pub host_key: OptionalTargetPath,
 
     /// Event fields to be added to Humio’s extra fields.
     ///
@@ -86,7 +90,7 @@ pub struct HumioLogsConfig {
     ///
     /// [humio_data_format]: https://docs.humio.com/integrations/data-shippers/hec/#format-of-data
     #[serde(default)]
-    pub(super) indexed_fields: Vec<ConfigValuePath>,
+    pub indexed_fields: Vec<ConfigValuePath>,
 
     /// Optional name of the repository to ingest into.
     ///
@@ -98,29 +102,27 @@ pub struct HumioLogsConfig {
     ///
     /// [humio_data_format]: https://docs.humio.com/integrations/data-shippers/hec/#format-of-data
     #[serde(default)]
-    #[configurable(metadata(docs::examples = "{{ host }}", docs::examples = "custom_index"))]
-    pub(super) index: Option<Template>,
+    #[configurable(metadata(
+        docs::examples = "index-{{ host }}",
+        docs::examples = "custom_index"
+    ))]
+    pub index: Option<Template>,
 
-    #[configurable(derived)]
     #[serde(default)]
-    pub(super) compression: Compression,
+    pub compression: Compression,
 
-    #[configurable(derived)]
     #[serde(default)]
-    pub(super) request: TowerRequestConfig,
+    pub request: TowerRequestConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
-    pub(super) batch: BatchConfig<SplunkHecDefaultBatchSettings>,
+    pub batch: BatchConfig<SplunkHecDefaultBatchSettings>,
 
-    #[configurable(derived)]
-    pub(super) tls: Option<TlsConfig>,
+    pub tls: Option<TlsConfig>,
 
     /// Overrides the name of the log field used to retrieve the nanosecond-enabled timestamp to send to Humio.
     #[serde(default = "timestamp_nanos_key")]
-    pub(super) timestamp_nanos_key: Option<String>,
+    pub timestamp_nanos_key: Option<String>,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -136,20 +138,24 @@ pub struct HumioLogsConfig {
     ///
     /// [global_timestamp_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.timestamp_key
     #[serde(default = "config_timestamp_key_target_path")]
-    pub(super) timestamp_key: OptionalTargetPath,
+    pub timestamp_key: OptionalTargetPath,
+
+    #[serde(flatten)]
+    pub confinement: crate::template::ConfinementConfig,
 }
 
-fn default_endpoint() -> String {
-    HOST.to_string()
+fn default_endpoint() -> HttpEndpoint {
+    HttpEndpoint::parse(HOST).expect("static default endpoint should be a valid http(s) URL")
 }
 
+#[must_use]
 pub fn timestamp_nanos_key() -> Option<String> {
     Some("@timestamp.nanos".to_string())
 }
 
 impl GenerateConfig for HumioLogsConfig {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self {
             token: "${HUMIO_TOKEN}".to_owned().into(),
             endpoint: default_endpoint(),
             source: None,
@@ -163,8 +169,9 @@ impl GenerateConfig for HumioLogsConfig {
             batch: BatchConfig::default(),
             tls: None,
             timestamp_nanos_key: None,
-            acknowledgements: Default::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
             timestamp_key: config_timestamp_key_target_path(),
+            confinement: crate::template::ConfinementConfig::default(),
         })
         .unwrap()
     }
@@ -173,8 +180,8 @@ impl GenerateConfig for HumioLogsConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "humio_logs")]
 impl SinkConfig for HumioLogsConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        self.build_hec_config().build(cx).await
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
     }
 
     fn input(&self) -> Input {
@@ -186,7 +193,54 @@ impl SinkConfig for HumioLogsConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ValidatedHumioLogs {
+    pub(super) hec: ValidatedHecLogsSink,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for HumioLogsConfig {
+    type Validated = ValidatedHumioLogs;
+
+    fn validate(&self) -> crate::Result<ValidatedHumioLogs> {
+        self.validate_with_component_name(Self::NAME)
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedHumioLogs,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        self.build_from_validated(cx, &validated.hec)
+    }
+}
+
 impl HumioLogsConfig {
+    /// Pure structural validation. `component_name` is threaded through so
+    /// per-template security warnings carry the outer sink type — `humio_logs`
+    /// when this is the top-level sink, `humio_metrics` when
+    /// [`HumioMetricsConfig`] delegates here.
+    pub(super) fn validate_with_component_name(
+        &self,
+        component_name: &'static str,
+    ) -> crate::Result<ValidatedHumioLogs> {
+        Ok(ValidatedHumioLogs {
+            hec: self
+                .build_hec_config()
+                .validate_with_component_name(component_name)?,
+        })
+    }
+
+    /// Build the sink from validated state, delegating to the underlying
+    /// Splunk HEC logs sink without redoing any pure validation.
+    pub(super) fn build_from_validated(
+        &self,
+        cx: SinkContext,
+        validated: &ValidatedHecLogsSink,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        self.build_hec_config().build_from_validated(cx, validated)
+    }
+
     fn build_hec_config(&self) -> HecLogsSinkConfig {
         HecLogsSinkConfig {
             default_token: self.token.clone(),
@@ -209,6 +263,7 @@ impl HumioLogsConfig {
             timestamp_key: Some(config_timestamp_key_target_path()),
             endpoint_target: EndpointTarget::Event,
             auto_extract_timestamp: None,
+            confinement: self.confinement.clone(),
         }
     }
 }
@@ -221,26 +276,56 @@ mod tests {
     fn generate_config() {
         crate::test_util::test_generate_config::<HumioLogsConfig>();
     }
+
+    #[test]
+    fn validate_rejects_unconfined_template() {
+        use crate::config::ValidatedSink;
+
+        let config = HumioLogsConfig {
+            token: "token".to_string().into(),
+            endpoint: default_endpoint(),
+            source: None,
+            encoding: JsonSerializerConfig::default().into(),
+            event_type: None,
+            host_key: config_host_key_target_path(),
+            indexed_fields: vec![],
+            index: Some("{{ index }}".try_into().unwrap()),
+            compression: Compression::default(),
+            request: TowerRequestConfig::default(),
+            batch: BatchConfig::default(),
+            tls: None,
+            timestamp_nanos_key: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            timestamp_key: config_timestamp_key_target_path(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
 }
 
 #[cfg(test)]
 #[cfg(feature = "humio-integration-tests")]
 mod integration_tests {
+    use std::{collections::HashMap, convert::TryFrom};
+
     use chrono::{TimeZone, Utc};
     use futures::{future::ready, stream};
     use indoc::indoc;
     use serde::Deserialize;
-    use serde_json::{json, Value as JsonValue};
-    use std::{collections::HashMap, convert::TryFrom};
+    use serde_json::{Value as JsonValue, json};
     use tokio::time::Duration;
+
+    use vrl::event_path;
 
     use super::*;
     use crate::{
-        config::{log_schema, SinkConfig, SinkContext},
+        config::{SinkConfig, SinkContext, log_schema},
         event::LogEvent,
         sinks::util::Compression,
         test_util::{
-            components::{run_and_assert_sink_compliance, HTTP_SINK_TAGS},
+            components::{HTTP_SINK_TAGS, run_and_assert_sink_compliance},
             random_string,
         },
     };
@@ -259,7 +344,7 @@ mod integration_tests {
 
         let config = config(&repo.default_ingest_token);
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let (sink, _) = SinkConfig::build(&config, cx).await.unwrap();
 
         let message = random_string(100);
         let host = "192.168.1.1".to_string();
@@ -304,7 +389,7 @@ mod integration_tests {
         let mut config = config(&repo.default_ingest_token);
         config.source = Template::try_from("/var/log/syslog".to_string()).ok();
 
-        let (sink, _) = config.build(cx).await.unwrap();
+        let (sink, _) = SinkConfig::build(&config, cx).await.unwrap();
 
         let message = random_string(100);
         let event = LogEvent::from(message.clone());
@@ -333,13 +418,15 @@ mod integration_tests {
             let mut config = config(&repo.default_ingest_token);
             config.event_type = Template::try_from("json".to_string()).ok();
 
-            let (sink, _) = config.build(SinkContext::default()).await.unwrap();
+            let (sink, _) = SinkConfig::build(&config, SinkContext::default())
+                .await
+                .unwrap();
 
             let message = random_string(100);
             let mut event = LogEvent::from(message.clone());
             // Humio expects to find an @timestamp field for JSON lines
             // https://docs.humio.com/ingesting-data/parsers/built-in-parsers/#json
-            event.insert("@timestamp", Utc::now().to_rfc3339());
+            event.insert(event_path!("@timestamp"), Utc::now().to_rfc3339());
 
             run_and_assert_sink_compliance(sink, stream::once(ready(event)), &HTTP_SINK_TAGS).await;
 
@@ -359,7 +446,9 @@ mod integration_tests {
         {
             let config = config(&repo.default_ingest_token);
 
-            let (sink, _) = config.build(SinkContext::default()).await.unwrap();
+            let (sink, _) = SinkConfig::build(&config, SinkContext::default())
+                .await
+                .unwrap();
 
             let message = random_string(100);
             let event = LogEvent::from(message.clone());
@@ -379,7 +468,7 @@ mod integration_tests {
 
         HumioLogsConfig {
             token: token.to_string().into(),
-            endpoint: humio_address(),
+            endpoint: HttpEndpoint::parse(&humio_address()).unwrap(),
             source: None,
             encoding: JsonSerializerConfig::default().into(),
             event_type: None,
@@ -393,8 +482,9 @@ mod integration_tests {
             batch,
             tls: None,
             timestamp_nanos_key: timestamp_nanos_key(),
-            acknowledgements: Default::default(),
-            timestamp_key: Default::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            timestamp_key: OptionalTargetPath::default(),
+            confinement: crate::template::ConfinementConfig::default(),
         }
     }
 
@@ -474,11 +564,10 @@ mod integration_tests {
 
         // https://docs.humio.com/api/using-the-search-api-with-humio
         let search_url = format!(
-            "{}/api/v1/repositories/{}/query",
-            humio_address(),
-            repository_name
+            "{}/api/v1/repositories/{repository_name}/query",
+            humio_address()
         );
-        let search_query = format!(r#"message="{}""#, message);
+        let search_query = format!(r#"message="{message}""#);
 
         // events are not available to search API immediately
         // poll up 200 times for event to show up
@@ -499,10 +588,7 @@ mod integration_tests {
                 return logs[0].clone();
             }
         }
-        panic!(
-            "did not find event in Humio repository {} with message {}",
-            repository_name, message
-        );
+        panic!("did not find event in Humio repository {repository_name} with message {message}");
     }
 
     #[derive(Debug)]

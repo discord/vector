@@ -5,21 +5,24 @@ use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 use vector_lib::{
-    event::{metric::TagValue, Event, Metric, MetricKind, MetricTags, MetricValue, StatisticKind},
+    event::{Event, Metric, MetricKind, MetricTags, MetricValue, StatisticKind, metric::TagValue},
     metric_tags,
 };
 
+use super::StatsdSinkConfig;
 use crate::{
-    config::{SinkConfig, SinkContext},
-    sinks::{statsd::config::Mode, util::service::net::UdpConnectorConfig},
+    config::{AcknowledgementsConfig, SinkConfig, SinkContext},
+    sinks::{
+        statsd::config::Mode,
+        util::{BatchConfig, service::net::UdpConnectorConfig},
+    },
     test_util::{
+        addr::next_addr,
         collect_n,
-        components::{assert_sink_compliance, SINK_TAGS},
-        next_addr, trace_init,
+        components::{SINK_TAGS, assert_sink_compliance},
+        trace_init,
     },
 };
-
-use super::StatsdSinkConfig;
 
 fn tags() -> MetricTags {
     metric_tags!(
@@ -35,7 +38,7 @@ fn tags() -> MetricTags {
 async fn test_send_to_statsd() {
     trace_init();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
 
     let config = StatsdSinkConfig {
         default_namespace: Some("ns".into()),
@@ -43,8 +46,8 @@ async fn test_send_to_statsd() {
             addr.ip().to_string(),
             addr.port(),
         )),
-        batch: Default::default(),
-        acknowledgements: Default::default(),
+        batch: BatchConfig::default(),
+        acknowledgements: AcknowledgementsConfig::default(),
     };
 
     let events = vec![
@@ -88,13 +91,15 @@ async fn test_send_to_statsd() {
 
         sink.run(stream::iter(events).map(Into::into))
             .await
-            .expect("Running sink failed")
+            .expect("Running sink failed");
     })
     .await;
 
     let messages = collect_n(ReceiverStream::new(rx), 1).await;
     assert_eq!(
         messages[0],
-        Bytes::from("vector.counter:1.5|c|#bare_tag,multi_value:true,multi_value:false,multi_value,normal_tag:value\nvector.histogram:2|h|@0.01\n"),
+        Bytes::from(
+            "vector.counter:1.5|c|#bare_tag,multi_value:true,multi_value:false,multi_value,normal_tag:value\nvector.histogram:2|h|@0.01\n"
+        ),
     );
 }

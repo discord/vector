@@ -10,7 +10,7 @@ mod configurable_component;
 
 /// Designates a type as being part of a Vector configuration.
 ///
-/// This will automatically derive the [`Configurable`][vector-config::Configurable] trait for the given struct/enum, as
+/// This will automatically derive the `Configurable` trait for the given struct/enum, as
 /// well as ensuring that serialization/deserialization (via `serde`) is derived.
 ///
 /// ## Basics
@@ -97,7 +97,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(
     NamedComponent,
     attributes(
+        api_component,
         enrichment_table_component,
+        global_option_component,
         provider_component,
         secrets_component,
         sink_component,

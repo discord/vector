@@ -1,21 +1,26 @@
-use metrics::{counter, gauge};
-use vector_lib::internal_event::InternalEvent;
-use vector_lib::internal_event::{error_stage, error_type, ComponentEventsDropped, UNINTENTIONAL};
+use vector_lib::NamedInternalEvent;
+use vector_lib::internal_event::{
+    ComponentEventsDropped, CounterName, GaugeName, InternalEvent, UNINTENTIONAL, error_stage,
+    error_type,
+};
+use vector_lib::{counter, gauge};
 
 use crate::transforms::lua::v2::BuildError;
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct LuaGcTriggered {
     pub used_memory: usize,
 }
 
 impl InternalEvent for LuaGcTriggered {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::cast_precision_loss, reason = "Metrics use f64")]
     fn emit(self) {
-        gauge!("lua_memory_used_bytes").set(self.used_memory as f64);
+        gauge!(GaugeName::LuaMemoryUsedBytes).set(self.used_memory as f64);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct LuaScriptError {
     pub error: mlua::Error,
 }
@@ -28,10 +33,9 @@ impl InternalEvent for LuaScriptError {
             error_code = mlua_error_code(&self.error),
             error_type = error_type::COMMAND_FAILED,
             stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_code" => mlua_error_code(&self.error),
             "error_type" => error_type::SCRIPT_FAILED,
             "stage" => error_stage::PROCESSING,
@@ -44,7 +48,7 @@ impl InternalEvent for LuaScriptError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct LuaBuildError {
     pub error: BuildError,
 }
@@ -58,36 +62,44 @@ impl InternalEvent for LuaBuildError {
             error_type = error_type::SCRIPT_FAILED,
             error_code = lua_build_error_code(&self.error),
             stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true,
+            internal_log_rate_limit = false,
         );
         counter!(
-            "component_errors_total",
+            CounterName::ComponentErrorsTotal,
             "error_code" => lua_build_error_code(&self.error),
             "error_type" => error_type::SCRIPT_FAILED,
             "stage" => error_stage:: PROCESSING,
         )
         .increment(1);
 
-        emit!(ComponentEventsDropped::<UNINTENTIONAL> { count: 1, reason })
+        emit!(ComponentEventsDropped::<UNINTENTIONAL> { count: 1, reason });
     }
 }
 
-const fn mlua_error_code(err: &mlua::Error) -> &'static str {
-    use mlua::Error::*;
+fn mlua_error_code(err: &mlua::Error) -> &'static str {
+    use mlua::Error::{
+        BadArgument, BindError, CallbackDestructed, CallbackError, CoroutineUnresumable,
+        ExternalError, FromLuaConversionError, MemoryControlNotAvailable, MemoryError,
+        MetaMethodRestricted, MetaMethodTypeError, MismatchedRegistryKey, PreviouslyResumedPanic,
+        RecursiveMutCallback, RuntimeError, SafetyError, StackError, SyntaxError,
+        ToLuaConversionError, UserDataBorrowError, UserDataBorrowMutError, UserDataDestructed,
+        UserDataTypeMismatch, WithContext,
+    };
 
     match err {
         SyntaxError { .. } => "syntax_error",
         RuntimeError(_) => "runtime_error",
         MemoryError(_) => "memory_error",
         SafetyError(_) => "memory_safety_error",
-        MemoryLimitNotAvailable => "memory_limit_not_available",
+        MemoryControlNotAvailable => "memory_control_not_available",
         RecursiveMutCallback => "mutable_callback_called_recursively",
         CallbackDestructed => "callback_destructed",
         StackError => "out_of_stack",
         BindError => "too_many_arguments_to_function_bind",
+        BadArgument { .. } => "bad_argument",
         ToLuaConversionError { .. } => "error_converting_value_to_lua",
         FromLuaConversionError { .. } => "error_converting_value_from_lua",
-        CoroutineInactive => "coroutine_inactive",
+        CoroutineUnresumable => "coroutine_unresumable",
         UserDataTypeMismatch => "userdata_type_mismatch",
         UserDataDestructed => "userdata_destructed",
         UserDataBorrowError => "userdata_borrow_error",
@@ -98,12 +110,17 @@ const fn mlua_error_code(err: &mlua::Error) -> &'static str {
         CallbackError { .. } => "callback_error",
         PreviouslyResumedPanic => "previously_resumed_panic",
         ExternalError(_) => "external_error",
+        WithContext { cause, .. } => mlua_error_code(cause),
         _ => "unknown",
     }
 }
 
 const fn lua_build_error_code(err: &BuildError) -> &'static str {
-    use BuildError::*;
+    use BuildError::{
+        InvalidHooksInit, InvalidHooksProcess, InvalidHooksShutdown, InvalidSearchDirs,
+        InvalidSource, InvalidTimerHandler, RuntimeErrorGc, RuntimeErrorHooksInit,
+        RuntimeErrorHooksProcess, RuntimeErrorHooksShutdown, RuntimeErrorTimerHandler,
+    };
 
     match err {
         InvalidSearchDirs { .. } => "invalid_search_dir",

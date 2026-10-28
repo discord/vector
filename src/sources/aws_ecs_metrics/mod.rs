@@ -1,15 +1,20 @@
 use std::{env, time::Duration};
 
 use futures::StreamExt;
+use http_body::Collected;
 use hyper::{Body, Request};
 use serde_with::serde_as;
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol};
-use vector_lib::{config::LogNamespace, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    config::LogNamespace,
+    configurable::configurable_component,
+    internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
+};
 
 use crate::{
+    SourceSender,
     config::{GenerateConfig, SourceConfig, SourceContext, SourceOutput},
     http::HttpClient,
     internal_events::{
@@ -17,7 +22,6 @@ use crate::{
         HttpClientHttpResponseError, StreamClosedError,
     },
     shutdown::ShutdownSignal,
-    SourceSender,
 };
 
 mod parser;
@@ -101,12 +105,14 @@ pub struct AwsEcsMetricsSourceConfig {
 const METADATA_URI_V4: &str = "ECS_CONTAINER_METADATA_URI";
 const METADATA_URI_V3: &str = "ECS_CONTAINER_METADATA_URI_V4";
 
+#[must_use]
 pub fn default_endpoint() -> String {
     env::var(METADATA_URI_V4)
         .or_else(|_| env::var(METADATA_URI_V3))
         .unwrap_or_else(|_| "http://169.254.170.2/v2".into())
 }
 
+#[must_use]
 pub fn default_version() -> Version {
     if env::var(METADATA_URI_V4).is_ok() {
         Version::V4
@@ -117,10 +123,12 @@ pub fn default_version() -> Version {
     }
 }
 
+#[must_use]
 pub const fn default_scrape_interval_secs() -> Duration {
     Duration::from_secs(15)
 }
 
+#[must_use]
 pub fn default_namespace() -> String {
     "awsecs".to_string()
 }
@@ -135,8 +143,8 @@ impl AwsEcsMetricsSourceConfig {
 }
 
 impl GenerateConfig for AwsEcsMetricsSourceConfig {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self {
             endpoint: default_endpoint(),
             version: default_version(),
             scrape_interval_secs: default_scrape_interval_secs(),
@@ -153,7 +161,7 @@ impl SourceConfig for AwsEcsMetricsSourceConfig {
         let namespace = Some(self.namespace.clone()).filter(|namespace| !namespace.is_empty());
         let http_client = HttpClient::new(None, &cx.proxy)?;
 
-        Ok(Box::pin(aws_ecs_metrics(
+        Ok(crate::sources::source_with_error(aws_ecs_metrics(
             http_client,
             self.stats_endpoint(),
             self.scrape_interval_secs,
@@ -179,7 +187,7 @@ async fn aws_ecs_metrics(
     namespace: Option<String>,
     mut out: SourceSender,
     shutdown: ShutdownSignal,
-) -> Result<(), ()> {
+) -> vector_lib::source_sender::SendResult {
     let mut interval = IntervalStream::new(time::interval(interval)).take_until(shutdown);
     let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
     while interval.next().await.is_some() {
@@ -190,11 +198,14 @@ async fn aws_ecs_metrics(
 
         match http_client.send(request).await {
             Ok(response) if response.status() == hyper::StatusCode::OK => {
-                match hyper::body::to_bytes(response).await {
+                match http_body::Body::collect(response.into_body())
+                    .await
+                    .map(Collected::to_bytes)
+                {
                     Ok(body) => {
                         bytes_received.emit(ByteSize(body.len()));
 
-                        match parser::parse(body.as_ref(), namespace.clone()) {
+                        match parser::parse(body.as_ref(), namespace.as_deref()) {
                             Ok(metrics) => {
                                 let count = metrics.len();
                                 emit!(AwsEcsMetricsEventsReceived {
@@ -203,9 +214,9 @@ async fn aws_ecs_metrics(
                                     endpoint: uri.path(),
                                 });
 
-                                if (out.send_batch(metrics).await).is_err() {
+                                if let Err(error) = out.send_batch(metrics).await {
                                     emit!(StreamClosedError { count });
-                                    return Err(());
+                                    return Err(error);
                                 }
                             }
                             Err(error) => {
@@ -220,7 +231,7 @@ async fn aws_ecs_metrics(
                     Err(error) => {
                         emit!(HttpClientHttpError {
                             error: crate::Error::from(error),
-                            url: url.to_owned(),
+                            url: url.clone(),
                         });
                     }
                 }
@@ -228,13 +239,13 @@ async fn aws_ecs_metrics(
             Ok(response) => {
                 emit!(HttpClientHttpResponseError {
                     code: response.status(),
-                    url: url.to_owned(),
+                    url: url.clone(),
                 });
             }
             Err(error) => {
                 emit!(HttpClientHttpError {
                     error: crate::Error::from(error),
-                    url: url.to_owned(),
+                    url: url.clone(),
                 });
             }
         }
@@ -245,25 +256,31 @@ async fn aws_ecs_metrics(
 
 #[cfg(test)]
 mod test {
+    use crate::event::Event;
     use hyper::{
-        service::{make_service_fn, service_fn},
         Body, Response, Server,
+        service::{make_service_fn, service_fn},
     };
     use tokio::time::Duration;
 
     use super::*;
     use crate::{
+        Error,
         event::MetricValue,
         test_util::{
-            components::{run_and_assert_source_compliance, SOURCE_TAGS},
-            next_addr, wait_for_tcp,
+            addr::next_addr,
+            components::{SOURCE_TAGS, run_and_assert_source_compliance},
+            wait_for_tcp,
         },
-        Error,
     };
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this fixture is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     #[tokio::test]
     async fn test_aws_ecs_metrics_source() {
-        let in_addr = next_addr();
+        let (_guard, in_addr) = next_addr();
 
         let make_svc = make_service_fn(|_| async {
             Ok::<_, Error>(service_fn(|_| async {
@@ -572,7 +589,7 @@ mod test {
         wait_for_tcp(in_addr).await;
 
         let config = AwsEcsMetricsSourceConfig {
-            endpoint: format!("http://{}", in_addr),
+            endpoint: format!("http://{in_addr}"),
             version: Version::V4,
             scrape_interval_secs: Duration::from_secs(1),
             namespace: default_namespace(),
@@ -584,7 +601,7 @@ mod test {
 
         let metrics = events
             .into_iter()
-            .map(|e| e.into_metric())
+            .map(Event::into_metric)
             .collect::<Vec<_>>();
 
         match metrics
@@ -592,18 +609,20 @@ mod test {
             .find(|m| m.name() == "network_receive_bytes_total")
         {
             Some(m) => {
-                assert_eq!(m.value(), &MetricValue::Counter { value: 329932716.0 });
+                assert_eq!(
+                    m.value(),
+                    &MetricValue::Counter {
+                        value: 329_932_716.0
+                    }
+                );
                 assert_eq!(m.namespace(), Some("awsecs"));
 
                 match m.tags() {
                     Some(tags) => assert_eq!(tags.get("device"), Some("eth1")),
-                    None => panic!("No tags for metric. {:?}", m),
+                    None => panic!("No tags for metric. {m:?}"),
                 }
             }
-            None => panic!(
-                "Could not find 'network_receive_bytes_total' in {:?}.",
-                metrics
-            ),
+            None => panic!("Could not find 'network_receive_bytes_total' in {metrics:?}."),
         }
     }
 }
@@ -614,14 +633,14 @@ mod integration_tests {
     use tokio::time::Duration;
 
     use super::*;
-    use crate::test_util::components::{run_and_assert_source_compliance, SOURCE_TAGS};
+    use crate::test_util::components::{SOURCE_TAGS, run_and_assert_source_compliance};
 
     fn ecs_address() -> String {
         env::var("ECS_ADDRESS").unwrap_or_else(|_| "http://localhost:9088".into())
     }
 
     fn ecs_url(version: &str) -> String {
-        format!("{}/{}", ecs_address(), version)
+        format!("{}/{version}", ecs_address())
     }
 
     async fn scrape_metrics(endpoint: String, version: Version) {

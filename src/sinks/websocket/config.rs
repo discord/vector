@@ -1,18 +1,15 @@
-use std::num::NonZeroU64;
-
 use snafu::ResultExt;
-use vector_lib::codecs::JsonSerializerConfig;
-use vector_lib::configurable::configurable_component;
+use tokio_tungstenite::tungstenite::http::Uri;
+use vector_lib::{codecs::JsonSerializerConfig, configurable::configurable_component};
 
 use crate::{
-    codecs::EncodingConfig,
-    config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext},
-    http::Auth,
-    sinks::{
-        websocket::sink::{ConnectSnafu, WebSocketConnector, WebSocketError, WebSocketSink},
-        Healthcheck, VectorSink,
+    codecs::{EncodingConfig, Transformer},
+    common::websocket::{ConnectSnafu, WebSocketCommonConfig, WebSocketConnector, WebSocketError},
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, ValidatedSink,
     },
-    tls::{MaybeTlsSettings, TlsEnableableConfig},
+    sinks::{Healthcheck, VectorSink, websocket::sink::WebSocketSink},
+    tls::MaybeTlsSettings,
 };
 
 /// Configuration for the `websocket` sink.
@@ -22,59 +19,27 @@ use crate::{
 ))]
 #[derive(Clone, Debug)]
 pub struct WebSocketSinkConfig {
-    /// The WebSocket URI to connect to.
-    ///
-    /// This should include the protocol and host, but can also include the port, path, and any other valid part of a URI.
-    pub uri: String,
+    #[serde(flatten)]
+    pub common: WebSocketCommonConfig,
 
-    #[configurable(derived)]
-    pub tls: Option<TlsEnableableConfig>,
-
-    #[configurable(derived)]
     pub encoding: EncodingConfig,
 
-    /// The interval, in seconds, between sending [Ping][ping]s to the remote peer.
-    ///
-    /// If this option is not configured, pings are not sent on an interval.
-    ///
-    /// If the `ping_timeout` is not set, pings are still sent but there is no expectation of pong
-    /// response times.
-    ///
-    /// [ping]: https://www.rfc-editor.org/rfc/rfc6455#section-5.5.2
-    #[configurable(metadata(docs::type_unit = "seconds"))]
-    pub ping_interval: Option<NonZeroU64>,
-
-    /// The number of seconds to wait for a [Pong][pong] response from the remote peer.
-    ///
-    /// If a response is not received within this time, the connection is re-established.
-    ///
-    /// [pong]: https://www.rfc-editor.org/rfc/rfc6455#section-5.5.3
-    // NOTE: this option is not relevant if the `ping_interval` is not configured.
-    #[configurable(metadata(docs::type_unit = "seconds"))]
-    pub ping_timeout: Option<NonZeroU64>,
-
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
         skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
-
-    #[configurable(derived)]
-    pub auth: Option<Auth>,
 }
 
 impl GenerateConfig for WebSocketSinkConfig {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {
-            uri: "ws://127.0.0.1:9000/endpoint".into(),
-            tls: None,
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self {
+            common: WebSocketCommonConfig {
+                ..Default::default()
+            },
             encoding: JsonSerializerConfig::default().into(),
-            ping_interval: None,
-            ping_timeout: None,
-            acknowledgements: Default::default(),
-            auth: None,
+            acknowledgements: AcknowledgementsConfig::default(),
         })
         .unwrap()
     }
@@ -83,16 +48,6 @@ impl GenerateConfig for WebSocketSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "websocket")]
 impl SinkConfig for WebSocketSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let connector = self.build_connector()?;
-        let ws_sink = WebSocketSink::new(self, connector.clone())?;
-
-        Ok((
-            VectorSink::from_event_streamsink(ws_sink),
-            Box::pin(async move { connector.healthcheck().await }),
-        ))
-    }
-
     fn input(&self) -> Input {
         Input::new(self.encoding.config().input_type())
     }
@@ -102,19 +57,116 @@ impl SinkConfig for WebSocketSinkConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ValidatedWebSocketSink {
+    uri: Uri,
+    transformer: Transformer,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for WebSocketSinkConfig {
+    type Validated = ValidatedWebSocketSink;
+
+    fn validate(&self) -> crate::Result<ValidatedWebSocketSink> {
+        let uri = WebSocketConnector::parse_uri(&self.common.uri)?;
+        let transformer = self.encoding.transformer();
+        self.encoding.validate()?;
+        Ok(ValidatedWebSocketSink { uri, transformer })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedWebSocketSink,
+        _cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        // TLS settings may read certificate files from disk, so the connector is
+        // resolved at build time rather than during validation.
+        let ValidatedWebSocketSink { uri, transformer } = validated.clone();
+        let connector = self.build_connector(uri)?;
+        let serializer = self.encoding.build()?;
+        let ws_sink = WebSocketSink::new(self, connector.clone(), transformer, serializer);
+
+        Ok((
+            VectorSink::from_event_streamsink(ws_sink),
+            Box::pin(async move { connector.healthcheck().await }),
+        ))
+    }
+}
+
 impl WebSocketSinkConfig {
-    fn build_connector(&self) -> Result<WebSocketConnector, WebSocketError> {
-        let tls = MaybeTlsSettings::from_config(&self.tls, false).context(ConnectSnafu)?;
-        WebSocketConnector::new(self.uri.clone(), tls, self.auth.clone())
+    fn build_connector(&self, uri: Uri) -> Result<WebSocketConnector, WebSocketError> {
+        let tls =
+            MaybeTlsSettings::from_config(self.common.tls.as_ref(), false).context(ConnectSnafu)?;
+        Ok(WebSocketConnector::from_validated(
+            uri,
+            tls,
+            self.common.auth.clone(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use vector_lib::codecs::encoding::SerializerConfig;
+
+    use crate::config::ValidatedSink;
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<WebSocketSinkConfig>();
+    }
+
+    #[test]
+    fn validate_produces_usable_state() {
+        let config = WebSocketSinkConfig {
+            common: WebSocketCommonConfig {
+                uri: "ws://127.0.0.1:8080".to_string(),
+                ..Default::default()
+            },
+            encoding: JsonSerializerConfig::default().into(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        };
+        let _validated = config.validate().expect("validation should succeed");
+        // Serializer construction is deferred to `build`; validation retains the
+        // transformer so `build` can construct the serializer.
+        assert!(matches!(
+            config.encoding.config(),
+            SerializerConfig::Json(_)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_uri() {
+        let config = WebSocketSinkConfig {
+            common: WebSocketCommonConfig {
+                uri: "not a valid uri".to_string(),
+                ..Default::default()
+            },
+            encoding: JsonSerializerConfig::default().into(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        };
+
+        assert!(
+            config.validate().is_err(),
+            "a malformed URI should fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_uri_without_host() {
+        let config = WebSocketSinkConfig {
+            common: WebSocketCommonConfig {
+                uri: "ws:///path".to_string(),
+                ..Default::default()
+            },
+            encoding: JsonSerializerConfig::default().into(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        };
+
+        assert!(
+            config.validate().is_err(),
+            "a URI without a host should fail validation"
+        );
     }
 }

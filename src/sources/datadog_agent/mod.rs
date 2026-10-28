@@ -3,75 +3,82 @@ mod integration_tests;
 #[cfg(test)]
 mod tests;
 
+pub mod llmobs;
 pub mod logs;
 pub mod metrics;
 pub mod traces;
 
-#[allow(warnings, clippy::pedantic, clippy::nursery)]
-pub(crate) mod ddmetric_proto {
-    include!(concat!(env!("OUT_DIR"), "/datadog.agentpayload.rs"));
-}
-
-#[allow(warnings)]
-pub(crate) mod ddtrace_proto {
-    include!(concat!(env!("OUT_DIR"), "/dd_trace.rs"));
-}
-
-use std::convert::Infallible;
-use std::time::Duration;
-use std::{fmt::Debug, io::Read, net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, fmt::Debug, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Buf, Bytes};
-use chrono::{serde::ts_milliseconds, DateTime, Utc};
-use flate2::read::{MultiGzDecoder, ZlibDecoder};
+use chrono::{DateTime, Utc, serde::ts_milliseconds};
+pub(crate) use datadog_proto::agentpayload as ddmetric_proto;
+pub(crate) use datadog_proto::trace as ddtrace_proto;
 use futures::FutureExt;
 use http::StatusCode;
-use hyper::service::make_service_fn;
-use hyper::Server;
+use hyper::{Server, service::make_service_fn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use snafu::Snafu;
 use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
-use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::configurable::configurable_component;
-use vector_lib::event::{BatchNotifier, BatchStatus};
-use vector_lib::internal_event::{EventsReceived, Registered};
-use vector_lib::lookup::owned_value_path;
-use vector_lib::schema::meaning;
-use vector_lib::tls::MaybeTlsIncomingStream;
-use vrl::path::OwnedTargetPath;
-use vrl::value::kind::Collection;
-use vrl::value::Kind;
-use warp::{filters::BoxedFilter, reject::Rejection, reply::Response, Filter, Reply};
+use vector_lib::{
+    codecs::decoding::{DeserializerConfig, FramingConfig},
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    event::{BatchNotifier, BatchStatus},
+    internal_event::{EventsReceived, Registered},
+    lookup::owned_value_path,
+    schema::meaning,
+    source_sender::SendError,
+    tls::MaybeTlsIncomingStream,
+};
+use vrl::{
+    path::OwnedTargetPath,
+    value::{Kind, kind::Collection},
+};
+use warp::{Filter, Reply, filters::BoxedFilter, reject::Rejection, reply::Response};
 
-use crate::http::{build_http_trace_layer, KeepaliveConfig, MaxConnectionAgeLayer};
 use crate::{
+    SourceSender,
     codecs::{Decoder, DecodingConfig},
+    common::http::ErrorMessage,
     config::{
-        log_schema, DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
-        SourceContext, SourceOutput,
+        DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
+        SourceContext, SourceOutput, log_schema,
     },
     event::Event,
-    internal_events::{HttpBytesReceived, HttpDecompressError, StreamClosedError},
+    http::{KeepaliveConfig, MaxConnectionAgeLayer, build_http_trace_layer},
+    internal_events::{HttpBytesReceived, StreamClosedError},
     schema,
-    serde::{bool_or_struct, default_decoding, default_framing_message_based},
-    sources::{self, util::ErrorMessage},
+    serde::{default_decoding, default_framing_message_based},
+    sources::{
+        self,
+        util::{
+            decompression::{CappedDecoder, max_decompressed_size_bytes},
+            http::emit_decompress_error,
+        },
+    },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
-    SourceSender,
 };
 
 pub const LOGS: &str = "logs";
 pub const METRICS: &str = "metrics";
 pub const TRACES: &str = "traces";
+pub const LLMOBS: &str = "llmobs";
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Restructuring these source configuration fields is deferred to preserve the existing API. https://github.com/vectordotdev/vector/issues/23659"
+)]
 /// Configuration for the `datadog_agent` source.
 #[configurable_component(source(
     "datadog_agent",
     "Receive logs, metrics, and traces collected by a Datadog Agent."
 ))]
+#[serde_as]
 #[derive(Clone, Debug)]
 pub struct DatadogAgentConfig {
     /// The socket address to accept connections on.
@@ -83,24 +90,25 @@ pub struct DatadogAgentConfig {
 
     /// If this is set to `true`, when incoming events contain a Datadog API key, it is
     /// stored in the event metadata and used if the event is sent to a Datadog sink.
-    #[configurable(metadata(docs::advanced))]
     #[serde(default = "crate::serde::default_true")]
     store_api_key: bool,
 
     /// If this is set to `true`, logs are not accepted by the component.
-    #[configurable(metadata(docs::advanced))]
     #[serde(default = "crate::serde::default_false")]
     disable_logs: bool,
 
     /// If this is set to `true`, metrics (beta) are not accepted by the component.
-    #[configurable(metadata(docs::advanced))]
     #[serde(default = "crate::serde::default_false")]
     disable_metrics: bool,
 
     /// If this is set to `true`, traces (alpha) are not accepted by the component.
-    #[configurable(metadata(docs::advanced))]
     #[serde(default = "crate::serde::default_false")]
     disable_traces: bool,
+
+    /// If this is set to `true`, LLM Observability events are not accepted by the component.
+    #[configurable(metadata(docs::advanced))]
+    #[serde(default = "crate::serde::default_false")]
+    disable_llmobs: bool,
 
     /// If this is set to `true`, logs, metrics (beta), and traces (alpha) are sent to different outputs.
     ///
@@ -108,44 +116,56 @@ pub struct DatadogAgentConfig {
     /// For a source component named `agent`, the received logs, metrics (beta), and traces (alpha) can then be
     /// configured as input to other components by specifying `agent.logs`, `agent.metrics`, and
     /// `agent.traces`, respectively.
-    #[configurable(metadata(docs::advanced))]
     #[serde(default = "crate::serde::default_false")]
     multiple_outputs: bool,
 
     /// If this is set to `true`, when log events contain the field `ddtags`, the string value that
     /// contains a list of key:value pairs set by the Agent is parsed and expanded into an array.
-    #[configurable(metadata(docs::advanced))]
     #[serde(default = "crate::serde::default_false")]
     parse_ddtags: bool,
+
+    /// If this is set to `true`, metric names are split at the first '.' into a namespace and name.
+    /// For example, `system.cpu.usage` would be split into namespace `system` and name `cpu.usage`.
+    /// If `false`, the full metric name is used without splitting. This may be useful if you are using a
+    /// default namespace for metrics in sinks connected to this source.
+    #[serde(default = "crate::serde::default_true")]
+    split_metric_namespace: bool,
 
     /// The namespace to use for logs. This overrides the global setting.
     #[serde(default)]
     #[configurable(metadata(docs::hidden))]
     log_namespace: Option<bool>,
 
-    #[configurable(derived)]
     tls: Option<TlsEnableableConfig>,
 
-    #[configurable(derived)]
     #[serde(default = "default_framing_message_based")]
     framing: FramingConfig,
 
-    #[configurable(derived)]
     #[serde(default = "default_decoding")]
     decoding: DeserializerConfig,
 
-    #[configurable(derived)]
-    #[serde(default, deserialize_with = "bool_or_struct")]
+    #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     acknowledgements: SourceAcknowledgementsConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     keepalive: KeepaliveConfig,
+
+    /// The timeout before responding to requests with a HTTP 503 Service Unavailable error.
+    ///
+    /// If not set, responses to completed requests will block indefinitely until connected
+    /// transforms or sinks are ready to receive the events. When this happens, the sending Datadog
+    /// Agent will eventually time out the request and drop the connection, resulting Vector
+    /// generating an "Events dropped." error and incrementing the `component_discarded_events_total`
+    /// internal metric. By setting this option to a value less than the Agent's timeout, Vector
+    /// will instead respond to the Agent with a HTTP 503 Service Unavailable error, emit a warning,
+    /// and increment the `component_timed_out_events_total` internal metric instead.
+    #[serde_as(as = "Option<serde_with::DurationSecondsWithFrac<f64>>")]
+    send_timeout_secs: Option<f64>,
 }
 
 impl GenerateConfig for DatadogAgentConfig {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self {
             address: "0.0.0.0:8080".parse().unwrap(),
             tls: None,
             store_api_key: true,
@@ -155,10 +175,13 @@ impl GenerateConfig for DatadogAgentConfig {
             disable_logs: false,
             disable_metrics: false,
             disable_traces: false,
+            disable_llmobs: false,
             multiple_outputs: false,
             parse_ddtags: false,
+            split_metric_namespace: true,
             log_namespace: Some(false),
             keepalive: KeepaliveConfig::default(),
+            send_timeout_secs: None,
         })
         .unwrap()
     }
@@ -180,7 +203,7 @@ impl SourceConfig for DatadogAgentConfig {
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
                 .build()?;
 
-        let tls = MaybeTlsSettings::from_config(&self.tls, true)?;
+        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
         let source = DatadogAgentSource::new(
             self.store_api_key,
             decoder,
@@ -188,10 +211,18 @@ impl SourceConfig for DatadogAgentConfig {
             logs_schema_definition,
             log_namespace,
             self.parse_ddtags,
+            self.split_metric_namespace,
         );
-        let listener = tls.bind(&self.address).await?;
-        let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
-        let filters = source.build_warp_filters(cx.out, acknowledgements, self)?;
+        let listener = tls
+            .bind(&self.address)
+            .await?
+            .with_keepalive(self.keepalive.tcp_keepalive);
+        let handler = RequestHandler {
+            acknowledgements: cx.do_acknowledgements(self.acknowledgements),
+            multiple_outputs: self.multiple_outputs,
+            out: cx.out,
+        };
+        let filters = source.build_warp_filters(handler, self)?;
         let shutdown = cx.shutdown;
         let keepalive_settings = self.keepalive.clone();
 
@@ -227,14 +258,16 @@ impl SourceConfig for DatadogAgentConfig {
                 .serve(make_svc)
                 .with_graceful_shutdown(shutdown.map(|_| ()))
                 .await
-                .map_err(|err| {
-                    error!("An error occurred: {:?}.", err);
-                })?;
+                .inspect_err(|err| error!("An error occurred: {err:?}."))?;
 
             Ok(())
         }))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let definition = self
             .decoding
@@ -290,23 +323,74 @@ impl SourceConfig for DatadogAgentConfig {
             )
             .with_standard_vector_source_metadata();
 
+        let log_namespace = global_log_namespace.merge(self.log_namespace);
+        let llmobs_definition = schema::Definition::new_with_default_metadata(
+            Kind::object(
+                Collection::empty()
+                    .with_known("span_id", Kind::bytes())
+                    .with_known("trace_id", Kind::bytes())
+                    .with_known("parent_id", Kind::bytes().or_undefined())
+                    .with_known("name", Kind::bytes().or_undefined())
+                    .with_known("session_id", Kind::bytes().or_undefined())
+                    .with_known("service", Kind::bytes().or_undefined())
+                    .with_known("start_ns", Kind::integer().or_undefined())
+                    .with_known("duration", Kind::integer().or_undefined())
+                    .with_known("status", Kind::bytes().or_undefined())
+                    .with_known("status_message", Kind::bytes().or_undefined())
+                    .with_known("ml_app", Kind::bytes().or_undefined())
+                    .with_known("meta", Kind::object(Collection::any()).or_undefined())
+                    .with_known("metrics", Kind::object(Collection::any()).or_undefined())
+                    .with_known(
+                        "tags",
+                        Kind::array(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
+                    )
+                    .with_known("span_links", Kind::any().or_undefined())
+                    .with_known("config", Kind::any().or_undefined())
+                    .with_known("collection_errors", Kind::any().or_undefined())
+                    .with_known(
+                        "_dd",
+                        Kind::object(
+                            Collection::empty()
+                                .with_known("tracer_version", Kind::bytes().or_undefined()),
+                        )
+                        .or_undefined(),
+                    ),
+            ),
+            [log_namespace],
+        )
+        .with_source_metadata(
+            Self::NAME,
+            Some(LegacyKey::InsertIfEmpty(owned_value_path!("timestamp"))),
+            &owned_value_path!("timestamp"),
+            Kind::timestamp(),
+            Some(meaning::TIMESTAMP),
+        )
+        .with_standard_vector_source_metadata();
+
         let mut output = Vec::with_capacity(1);
 
         if self.multiple_outputs {
             if !self.disable_logs {
-                output.push(SourceOutput::new_maybe_logs(DataType::Log, definition).with_port(LOGS))
+                output
+                    .push(SourceOutput::new_maybe_logs(DataType::Log, definition).with_port(LOGS));
             }
             if !self.disable_metrics {
-                output.push(SourceOutput::new_metrics().with_port(METRICS))
+                output.push(SourceOutput::new_metrics().with_port(METRICS));
             }
             if !self.disable_traces {
-                output.push(SourceOutput::new_traces().with_port(TRACES))
+                output.push(SourceOutput::new_traces().with_port(TRACES));
+            }
+            if !self.disable_llmobs {
+                output.push(
+                    SourceOutput::new_maybe_logs(DataType::Log, llmobs_definition)
+                        .with_port(LLMOBS),
+                );
             }
         } else {
             output.push(SourceOutput::new_maybe_logs(
                 DataType::all_bits(),
                 definition,
-            ))
+            ));
         }
         output
     }
@@ -317,6 +401,10 @@ impl SourceConfig for DatadogAgentConfig {
 
     fn can_acknowledge(&self) -> bool {
         true
+    }
+
+    fn send_timeout(&self) -> Option<Duration> {
+        self.send_timeout_secs.map(Duration::from_secs_f64)
     }
 }
 
@@ -344,6 +432,7 @@ pub(crate) struct DatadogAgentSource {
     logs_schema_definition: Option<Arc<schema::Definition>>,
     events_received: Registered<EventsReceived>,
     parse_ddtags: bool,
+    split_metric_namespace: bool,
 }
 
 #[derive(Clone)]
@@ -353,6 +442,7 @@ pub struct ApiKeyExtractor {
 }
 
 impl ApiKeyExtractor {
+    #[must_use]
     pub fn extract(
         &self,
         path: &str,
@@ -381,6 +471,7 @@ impl DatadogAgentSource {
         logs_schema_definition: Option<schema::Definition>,
         log_namespace: LogNamespace,
         parse_ddtags: bool,
+        split_metric_namespace: bool,
     ) -> Self {
         Self {
             api_key_extractor: ApiKeyExtractor {
@@ -402,51 +493,46 @@ impl DatadogAgentSource {
             log_namespace,
             events_received: register!(EventsReceived),
             parse_ddtags,
+            split_metric_namespace,
         }
     }
 
     fn build_warp_filters(
         &self,
-        out: SourceSender,
-        acknowledgements: bool,
+        handler: RequestHandler,
         config: &DatadogAgentConfig,
     ) -> crate::Result<BoxedFilter<(Response,)>> {
-        let mut filters = (!config.disable_logs).then(|| {
-            logs::build_warp_filter(
-                acknowledgements,
-                config.multiple_outputs,
-                out.clone(),
-                self.clone(),
-            )
-        });
+        let mut filters =
+            (!config.disable_logs).then(|| logs::build_warp_filter(handler.clone(), self.clone()));
 
         if !config.disable_traces {
-            let trace_filter = traces::build_warp_filter(
-                acknowledgements,
-                config.multiple_outputs,
-                out.clone(),
-                self.clone(),
-            );
+            let trace_filter = traces::build_warp_filter(handler.clone(), self.clone());
             filters = filters
                 .map(|f| f.or(trace_filter.clone()).unify().boxed())
                 .or(Some(trace_filter));
         }
 
         if !config.disable_metrics {
-            let metrics_filter = metrics::build_warp_filter(
-                acknowledgements,
-                config.multiple_outputs,
-                out,
-                self.clone(),
-            );
+            let metrics_filter = metrics::build_warp_filter(handler.clone(), self.clone());
             filters = filters
                 .map(|f| f.or(metrics_filter.clone()).unify().boxed())
                 .or(Some(metrics_filter));
         }
 
+        if !config.disable_llmobs {
+            let llmobs_filter = llmobs::build_warp_filter(handler, self.clone());
+            filters = filters
+                .map(|f| f.or(llmobs_filter.clone()).unify().boxed())
+                .or(Some(llmobs_filter));
+        }
+
         filters.ok_or_else(|| "At least one of the supported data type shall be enabled".into())
     }
 
+    #[allow(
+        clippy::ref_option,
+        reason = "Changing this shared optional metadata signature is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
     pub(crate) fn decode(
         &self,
         header: &Option<String>,
@@ -457,31 +543,34 @@ impl DatadogAgentSource {
             for encoding in encodings.rsplit(',').map(str::trim) {
                 body = match encoding {
                     "identity" => body,
-                    "gzip" | "x-gzip" => {
-                        let mut decoded = Vec::new();
-                        MultiGzDecoder::new(body.reader())
-                            .read_to_end(&mut decoded)
-                            .map_err(|error| handle_decode_error(encoding, error))?;
-                        decoded.into()
-                    }
-                    "zstd" => {
-                        let mut decoded = Vec::new();
-                        zstd::stream::copy_decode(body.reader(), &mut decoded)
-                            .map_err(|error| handle_decode_error(encoding, error))?;
-                        decoded.into()
-                    }
-                    "deflate" | "x-deflate" => {
-                        let mut decoded = Vec::new();
-                        ZlibDecoder::new(body.reader())
-                            .read_to_end(&mut decoded)
-                            .map_err(|error| handle_decode_error(encoding, error))?;
-                        decoded.into()
-                    }
+                    // Cap each decompressed payload so a compression bomb cannot drive
+                    // unbounded allocation on this unauthenticated HTTP listener.
+                    "gzip" | "x-gzip" => CappedDecoder::gzip(body.reader())
+                        .decompress()
+                        .map_err(|error| {
+                            emit_decompress_error(encoding, error, max_decompressed_size_bytes())
+                        })?
+                        .into(),
+                    "zstd" => CappedDecoder::zstd_http(body.reader())
+                        .map_err(|error| {
+                            emit_decompress_error(encoding, error, max_decompressed_size_bytes())
+                        })?
+                        .decompress()
+                        .map_err(|error| {
+                            emit_decompress_error(encoding, error, max_decompressed_size_bytes())
+                        })?
+                        .into(),
+                    "deflate" | "x-deflate" => CappedDecoder::zlib(body.reader())
+                        .decompress()
+                        .map_err(|error| {
+                            emit_decompress_error(encoding, error, max_decompressed_size_bytes())
+                        })?
+                        .into(),
                     encoding => {
                         return Err(ErrorMessage::new(
                             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                            format!("Unsupported encoding {}", encoding),
-                        ))
+                            format!("Unsupported encoding {encoding}"),
+                        ));
                     }
                 }
             }
@@ -495,54 +584,68 @@ impl DatadogAgentSource {
     }
 }
 
-pub(crate) async fn handle_request(
-    events: Result<Vec<Event>, ErrorMessage>,
+#[derive(Clone)]
+struct RequestHandler {
     acknowledgements: bool,
-    mut out: SourceSender,
-    output: Option<&str>,
-) -> Result<Response, Rejection> {
-    match events {
-        Ok(mut events) => {
-            let receiver = BatchNotifier::maybe_apply_to(acknowledgements, &mut events);
-            let count = events.len();
-
-            if let Some(name) = output {
-                out.send_batch_named(name, events).await
-            } else {
-                out.send_batch(events).await
-            }
-            .map_err(|_| {
-                emit!(StreamClosedError { count });
-                warp::reject::custom(ApiError::ServerShutdown)
-            })?;
-            match receiver {
-                None => Ok(warp::reply().into_response()),
-                Some(receiver) => match receiver.await {
-                    BatchStatus::Delivered => Ok(warp::reply().into_response()),
-                    BatchStatus::Errored => Err(warp::reject::custom(ErrorMessage::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Error delivering contents to sink".into(),
-                    ))),
-                    BatchStatus::Rejected => Err(warp::reject::custom(ErrorMessage::new(
-                        StatusCode::BAD_REQUEST,
-                        "Contents failed to deliver to sink".into(),
-                    ))),
-                },
-            }
-        }
-        Err(err) => Err(warp::reject::custom(err)),
-    }
+    multiple_outputs: bool,
+    out: SourceSender,
 }
 
-fn handle_decode_error(encoding: &str, error: impl std::error::Error) -> ErrorMessage {
-    emit!(HttpDecompressError {
-        encoding,
-        error: &error
-    });
-    ErrorMessage::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        format!("Failed decompressing payload with {} decoder.", encoding),
-    )
+impl RequestHandler {
+    async fn handle_request(
+        mut self,
+        events: Result<Vec<Event>, ErrorMessage>,
+        output: &'static str,
+    ) -> Result<Response, Rejection> {
+        match events {
+            Ok(events) => self.handle_events(events, output).await,
+            Err(err) => Err(warp::reject::custom(err)),
+        }
+    }
+
+    async fn handle_events(
+        &mut self,
+        mut events: Vec<Event>,
+        output: &'static str,
+    ) -> Result<Response, Rejection> {
+        let receiver = BatchNotifier::maybe_apply_to(self.acknowledgements, &mut events);
+        let count = events.len();
+        let output = self.multiple_outputs.then_some(output);
+
+        let result = if let Some(name) = output {
+            self.out.send_batch_named(name, events).await
+        } else {
+            self.out.send_batch(events).await
+        };
+        match result {
+            Ok(()) => {}
+            Err(SendError::Closed) => {
+                emit!(StreamClosedError { count });
+                return Err(warp::reject::custom(ApiError::ServerShutdown));
+            }
+            Err(SendError::Timeout) => {
+                return Ok(warp::reply::with_status(
+                    "Service unavailable",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+                .into_response());
+            }
+        }
+        match receiver {
+            None => Ok(warp::reply().into_response()),
+            Some(receiver) => match receiver.await {
+                BatchStatus::Delivered => Ok(warp::reply().into_response()),
+                BatchStatus::Errored => Err(warp::reject::custom(ErrorMessage::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error delivering contents to sink".into(),
+                ))),
+                BatchStatus::Rejected => Err(warp::reject::custom(ErrorMessage::new(
+                    StatusCode::BAD_REQUEST,
+                    "Contents failed to deliver to sink".into(),
+                ))),
+            },
+        }
+    }
 }
 
 // https://github.com/DataDog/datadog-agent/blob/a33248c2bc125920a9577af1e16f12298875a4ad/pkg/logs/processor/json.go#L23-L49

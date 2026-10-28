@@ -2,11 +2,12 @@ mod renderer;
 
 use std::collections::HashMap;
 
-use crate::renderer::SchemaRenderer;
 use anyhow::{Context, Result};
 use tracing::debug;
 use vector_config::schema::parser::{component::ComponentSchema, query::SchemaQuerier};
 use vector_config_common::constants::{self, ComponentType};
+
+use crate::renderer::SchemaRenderer;
 
 fn main() -> Result<()> {
     let querier = SchemaQuerier::from_schema("/tmp/vector-config-schema.json")
@@ -21,13 +22,8 @@ fn main() -> Result<()> {
         // Find the base component schema for the component type itself, which is analogous to
         // `SourceOuter`, `SinkOuter`, etc. We render the schema for that separately as it's meant
         // to be common across components of the same type, etc.
-        let base_component_schema = querier
-            .query()
-            .with_custom_attribute_kv(
-                constants::DOCS_META_COMPONENT_BASE_TYPE,
-                base_component_type,
-            )
-            .run_single()?;
+        let base_component_schema =
+            querier.root_map_value_schema(&format!("{}s", base_component_type.as_str()))?;
 
         debug!(
             "Got base component schema for component type '{}'.",
@@ -68,11 +64,10 @@ fn main() -> Result<()> {
             let component_name = component_schema.component_name().to_string();
             let component_schema_renderer = SchemaRenderer::new(&querier, component_schema);
             let rendered_component_schema = component_schema_renderer.render().context(format!(
-                "Failed to render the '{}' component schema.",
-                component_name
+                "Failed to render the '{component_name}' component schema."
             ))?;
             rendered_component_schemas.insert(
-                format!("{}s/base/{}", base_component_type.as_str(), component_name),
+                format!("{}s/base/{component_name}", base_component_type.as_str()),
                 rendered_component_schema,
             );
         }

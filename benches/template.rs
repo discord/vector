@@ -1,16 +1,19 @@
 use std::convert::TryFrom;
 
 use chrono::Utc;
-use criterion::{criterion_group, BatchSize, Criterion};
-use vector::{config::log_schema, event::Event, event::LogEvent};
+use criterion::{BatchSize, Criterion, criterion_group};
+use vector::{
+    config::log_schema,
+    event::{Event, LogEvent},
+};
 
 fn bench_elasticsearch_index(c: &mut Criterion) {
-    use vector::template::Template;
+    use vector::template::UnconfinedTemplate;
 
     let mut group = c.benchmark_group("template");
 
     group.bench_function("dynamic", |b| {
-        let index = Template::try_from("index-%Y.%m.%d").unwrap();
+        let index = UnconfinedTemplate::try_from("index-%Y.%m.%d").unwrap();
         let mut event = Event::Log(LogEvent::from("hello world"));
         event.as_mut_log().insert(
             log_schema().timestamp_key_target_path().unwrap(),
@@ -21,11 +24,11 @@ fn bench_elasticsearch_index(c: &mut Criterion) {
             || event.clone(),
             |event| index.render(&event),
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.bench_function("static", |b| {
-        let index = Template::try_from("index").unwrap();
+        let index = UnconfinedTemplate::try_from("index").unwrap();
         let mut event = Event::Log(LogEvent::from("hello world"));
         event.as_mut_log().insert(
             log_schema().timestamp_key_target_path().unwrap(),
@@ -36,7 +39,7 @@ fn bench_elasticsearch_index(c: &mut Criterion) {
             || event.clone(),
             |event| index.render(&event),
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.finish();

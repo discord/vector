@@ -3,20 +3,19 @@ use std::fmt;
 use vector_lib::lookup::lookup_v2::ConfigValuePath;
 use vrl::path::PathPrefix;
 
+use super::{
+    ElasticsearchCommon, ElasticsearchConfig, VersionType,
+    encoder::{DocumentMetadata, DocumentVersion, DocumentVersionType},
+};
 use crate::{
     sinks::{
         elasticsearch::{
-            encoder::ProcessedEvent, request_builder::ElasticsearchRequestBuilder,
-            service::ElasticsearchRequest, BulkAction, ElasticsearchCommonMode,
+            BulkAction, ElasticsearchCommonMode, encoder::ProcessedEvent,
+            request_builder::ElasticsearchRequestBuilder, service::ElasticsearchRequest,
         },
         prelude::*,
     },
     transforms::metric_to_log::MetricToLog,
-};
-
-use super::{
-    encoder::{DocumentMetadata, DocumentVersion, DocumentVersionType},
-    ElasticsearchCommon, ElasticsearchConfig, VersionType,
 };
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -40,10 +39,9 @@ impl<S> ElasticsearchSink<S> {
         common: &ElasticsearchCommon,
         config: &ElasticsearchConfig,
         service: S,
-    ) -> crate::Result<Self> {
-        let batch_settings = config.batch.into_batcher_settings()?;
-
-        Ok(ElasticsearchSink {
+        batch_settings: BatcherSettings,
+    ) -> Self {
+        ElasticsearchSink {
             batch_settings,
             request_builder: common.request_builder.clone(),
             transformer: config.encoding.clone(),
@@ -51,7 +49,7 @@ impl<S> ElasticsearchSink<S> {
             metric_to_log: common.metric_to_log.clone(),
             mode: common.mode.clone(),
             id_key_field: config.id_key.clone(),
-        })
+        }
     }
 }
 
@@ -62,6 +60,10 @@ where
     S::Response: DriverResponse + Send + 'static,
     S::Error: fmt::Debug + Into<crate::Error> + Send,
 {
+    /// Sends input events through the Elasticsearch service.
+    ///
+    /// # Errors
+    /// Returns an error if the service fails while waiting to become ready.
     pub async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let mode = self.mode;
         let id_key_field = self.id_key_field.as_ref();
@@ -118,20 +120,15 @@ pub(super) fn process_log(
     if let Some(cfg) = mode.as_data_stream_config() {
         cfg.sync_fields(&mut log);
         cfg.remap_timestamp(&mut log);
-    };
-    let id = if let Some(Value::Bytes(key)) =
-        id_key_field.and_then(|key| log.remove((PathPrefix::Event, key)))
-    {
-        Some(String::from_utf8_lossy(&key).into_owned())
-    } else {
-        None
-    };
-    let document_metadata = match (id.clone(), mode.version_type(), mode.version(&log)) {
+    }
+
+    let id = id_key_field
+        .and_then(|key| log.remove((PathPrefix::Event, key)))
+        .and_then(|id| id.to_str_lossy().map(Into::into));
+    let document_metadata = match (id, mode.version_type(), mode.version(&log)) {
         (None, _, _) => DocumentMetadata::WithoutId,
-        (Some(id), None, None) | (Some(id), None, Some(_)) | (Some(id), Some(_), None) => {
-            DocumentMetadata::Id(id)
-        }
-        (Some(id), Some(version_type), Some(version)) => match version_type {
+        (Some(id), _, None) => DocumentMetadata::Id(id),
+        (Some(id), version_type, Some(version)) => match version_type {
             VersionType::Internal => DocumentMetadata::Id(id),
             VersionType::External => DocumentMetadata::IdAndVersion(
                 id,

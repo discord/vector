@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_s3::{
+    Client as S3Client,
     operation::put_object::PutObjectError,
     types::{ObjectCannedAcl, ServerSideEncryption, StorageClass},
-    Client as S3Client,
 };
 use aws_smithy_runtime_api::{
     client::{orchestrator::HttpResponse, result::SdkError},
@@ -13,13 +13,13 @@ use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
 
-use super::service::{S3Response, S3Service};
+use super::service::{S3Request, S3Response, S3Service};
 use crate::{
-    aws::{create_client, is_retriable_error, AwsAuthentication, RegionOrEndpoint},
+    aws::{AwsAuthentication, RegionOrEndpoint, create_client, is_retriable_error},
     common::s3::S3ClientBuilder,
     config::ProxyConfig,
     http::status,
-    sinks::{util::retries::RetryLogic, Healthcheck},
+    sinks::{Healthcheck, util::retries::RetryLogic},
     tls::TlsConfig,
 };
 
@@ -141,12 +141,11 @@ fn example_tags() -> HashMap<String, String> {
 ///
 /// [aws_docs]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative, PartialEq, Eq)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum S3StorageClass {
     /// Standard Redundancy.
-    #[derivative(Default)]
+    #[default]
     Standard,
 
     /// Reduced Redundancy.
@@ -167,6 +166,9 @@ pub enum S3StorageClass {
     /// Glacier Flexible Retrieval.
     Glacier,
 
+    /// Glacier Instant Retrieval.
+    GlacierIr,
+
     /// Glacier Deep Archive.
     DeepArchive,
 }
@@ -181,6 +183,7 @@ impl From<S3StorageClass> for StorageClass {
             S3StorageClass::ExpressOnezone => Self::ExpressOnezone,
             S3StorageClass::OnezoneIa => Self::OnezoneIa,
             S3StorageClass::Glacier => Self::Glacier,
+            S3StorageClass::GlacierIr => Self::GlacierIr,
             S3StorageClass::DeepArchive => Self::DeepArchive,
         }
     }
@@ -224,8 +227,7 @@ impl From<S3ServerSideEncryption> for ServerSideEncryption {
 ///
 /// [canned_acl]: https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Derivative)]
-#[derivative(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum S3CannedAcl {
     /// Bucket/object are private.
@@ -234,7 +236,7 @@ pub enum S3CannedAcl {
     /// access.
     ///
     /// This is the default.
-    #[derivative(Default)]
+    #[default]
     Private,
 
     /// Bucket/object can be read publicly.
@@ -308,15 +310,80 @@ impl From<S3CannedAcl> for ObjectCannedAcl {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct S3RetryLogic;
+fn is_retriable_response(res: &HttpResponse, errors_to_retry: Option<Vec<u16>>) -> bool {
+    let status_code = res.status();
 
-impl RetryLogic for S3RetryLogic {
+    match errors_to_retry {
+        Some(error_codes) => error_codes.contains(&status_code.as_u16()),
+        None => false,
+    }
+}
+
+fn should_retry_error(
+    errors_to_retry: Option<Vec<u16>>,
+    error: &SdkError<PutObjectError, HttpResponse>,
+) -> bool {
+    match error {
+        SdkError::ResponseError(err) => is_retriable_response(err.raw(), errors_to_retry),
+        SdkError::ServiceError(err) => is_retriable_response(err.raw(), errors_to_retry),
+        _ => false,
+    }
+}
+
+/// Retry strategy for S3 service calls.
+///
+/// Specifies a retry policy for S3 service calls.
+///
+/// For more information about error responses, see [Client Error Responses][error_responses].
+///
+/// [error_responses]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status#client_error_responses
+#[configurable_component]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[configurable(metadata(docs::enum_tag_description = "The retry strategy enum."))]
+pub enum RetryStrategy {
+    /// Don't retry any errors
+    None,
+
+    /// Default strategy. The following error types will be retried:
+    /// - `TimeoutError`
+    /// - `DispatchFailure`
+    /// - `ResponseError` or `ServiceError` when:
+    ///   - HTTP status is 5xx
+    ///   - Status is 429 (Too Many Requests)
+    ///   - `x-amz-retry-after` header is present
+    ///   - HTTP status is 4xx and response body contains one of:
+    ///     - `"RequestTimeout"`
+    ///     - `"RequestExpired"`
+    ///     - `"ThrottlingException"`
+    /// - Fallback: Any unknown error variant
+    #[default]
+    Default,
+
+    /// Retry on *all* errors
+    All,
+
+    /// Custom retry strategy
+    Custom {
+        /// Retry on these specific HTTP status codes
+        status_codes: Vec<u16>,
+    },
+}
+
+impl RetryLogic for RetryStrategy {
     type Error = SdkError<PutObjectError, HttpResponse>;
+    type Request = S3Request;
     type Response = S3Response;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
-        is_retriable_error(error)
+        match self {
+            RetryStrategy::None => false,
+            RetryStrategy::Default => is_retriable_error(error),
+            RetryStrategy::All => true,
+            RetryStrategy::Custom { status_codes } => {
+                is_retriable_error(error) || should_retry_error(Some(status_codes.clone()), error)
+            }
+        }
     }
 }
 
@@ -330,7 +397,8 @@ pub enum HealthcheckError {
     UnknownStatus { status: StatusCode },
 }
 
-pub fn build_healthcheck(bucket: String, client: S3Client) -> crate::Result<Healthcheck> {
+#[must_use]
+pub fn build_healthcheck(bucket: String, client: S3Client) -> Healthcheck {
     let healthcheck = async move {
         let req = client
             .head_bucket()
@@ -355,20 +423,36 @@ pub fn build_healthcheck(bucket: String, client: S3Client) -> crate::Result<Heal
         }
     };
 
-    Ok(healthcheck.boxed())
+    healthcheck.boxed()
 }
 
+/// Creates an S3 service.
+///
+/// # Errors
+///
+/// Returns an error if the S3 client cannot be created.
 pub async fn create_service(
     region: &RegionOrEndpoint,
     auth: &AwsAuthentication,
     proxy: &ProxyConfig,
-    tls_options: &Option<TlsConfig>,
+    tls_options: Option<&TlsConfig>,
+    force_path_style: impl Into<bool>,
 ) -> crate::Result<S3Service> {
     let endpoint = region.endpoint();
     let region = region.region();
-    let client =
-        create_client::<S3ClientBuilder>(auth, region.clone(), endpoint, proxy, tls_options, &None)
-            .await?;
+    let force_path_style_value: bool = force_path_style.into();
+    let client = create_client::<S3ClientBuilder>(
+        &S3ClientBuilder {
+            force_path_style: Some(force_path_style_value),
+        },
+        auth,
+        region.clone(),
+        endpoint,
+        proxy,
+        tls_options,
+        None,
+    )
+    .await?;
     Ok(S3Service::new(client))
 }
 
@@ -382,6 +466,7 @@ mod tests {
         for &(name, storage_class) in &[
             ("DEEP_ARCHIVE", S3StorageClass::DeepArchive),
             ("GLACIER", S3StorageClass::Glacier),
+            ("GLACIER_IR", S3StorageClass::GlacierIr),
             ("INTELLIGENT_TIERING", S3StorageClass::IntelligentTiering),
             ("EXPRESS_ONEZONE", S3StorageClass::ExpressOnezone),
             ("ONEZONE_IA", S3StorageClass::OnezoneIa),
@@ -390,10 +475,8 @@ mod tests {
             ("STANDARD_IA", S3StorageClass::StandardIa),
         ] {
             assert_eq!(name, to_string(storage_class));
-            let result: S3StorageClass = serde_json::from_str(&format!("{:?}", name))
-                .unwrap_or_else(|error| {
-                    panic!("Unparsable storage class name {:?}: {}", name, error)
-                });
+            let result: S3StorageClass = serde_json::from_str(&format!("{name:?}"))
+                .unwrap_or_else(|error| panic!("Unparsable storage class name {name:?}: {error}"));
             assert_eq!(result, storage_class);
         }
     }

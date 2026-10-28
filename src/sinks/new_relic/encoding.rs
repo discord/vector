@@ -1,8 +1,10 @@
 use std::{io, sync::Arc};
 
 use serde::Serialize;
-use vector_lib::request_metadata::GroupedCountByteSize;
-use vector_lib::{config::telemetry, event::Event, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf, config::telemetry, event::Event,
+    request_metadata::GroupedCountByteSize,
+};
 
 use super::{
     EventsApiModel, LogsApiModel, MetricsApiModel, NewRelicApi, NewRelicApiModel,
@@ -10,7 +12,7 @@ use super::{
 };
 use crate::sinks::{
     prelude::*,
-    util::encoding::{as_tracked_write, Encoder},
+    util::encoding::{Encoder, as_tracked_write},
 };
 
 pub struct NewRelicEncoder {
@@ -26,7 +28,7 @@ impl Encoder<Vec<Event>> for NewRelicEncoder {
     ) -> io::Result<(usize, GroupedCountByteSize)> {
         let mut byte_size = telemetry().create_request_count_byte_size();
 
-        for event in input.iter_mut() {
+        for event in &mut input {
             self.transformer.transform(event);
             byte_size.add_event(event, event.estimated_json_encoded_size_of());
         }
@@ -59,8 +61,7 @@ pub fn to_json<T: Serialize>(model: &T) -> Result<Vec<u8>, NewRelicSinkError> {
             Ok(json)
         }
         Err(error) => Err(NewRelicSinkError::new(&format!(
-            "Failed generating JSON: {}",
-            error
+            "Failed generating JSON: {error}"
         ))),
     }
 }

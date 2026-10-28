@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use criterion::{
-    criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion, SamplingMode,
+    BatchSize, BenchmarkGroup, Criterion, SamplingMode, criterion_group, measurement::WallTime,
 };
 use lookup::event_path;
 use vector_core::event::LogEvent;
@@ -26,7 +26,7 @@ fn rename_key_flat(c: &mut Criterion) {
                 log_event.rename_key(event_path!("one"), event_path!("1"));
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 
     group.bench_function("rename_flat_key (key is NOT present)", move |b| {
@@ -36,7 +36,7 @@ fn rename_key_flat(c: &mut Criterion) {
                 log_event.rename_key(event_path!("four"), event_path!("4"));
             },
             BatchSize::SmallInput,
-        )
+        );
     });
 }
 
@@ -44,7 +44,7 @@ criterion_group!(
     name = benches;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(120))
+        .measurement_time(Duration::from_mins(2))
         // degree of noise to ignore in measurements, here 1%
         .noise_threshold(0.01)
         // likelihood of noise registering as difference, here 5%

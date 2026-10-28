@@ -1,27 +1,34 @@
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use headers::HeaderName;
 use http::{
-    header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     HeaderValue, Request, Uri,
+    header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
 };
-use hyper::Body;
-use indexmap::IndexMap;
+use hyper::{Body, client::connect::Connect};
 use tower::Service;
 use tracing::Instrument;
-use vector_lib::event::{EventFinalizers, EventStatus, Finalizable};
-use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
-use vector_lib::stream::DriverResponse;
+use vector_lib::{
+    event::{EventFinalizers, EventStatus, Finalizable},
+    request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+    stream::DriverResponse,
+};
 
 use crate::{
-    http::HttpClient,
-    sinks::util::{retries::RetryLogic, Compression},
-    sinks::{datadog::DatadogApiError, util::http::validate_headers},
+    http::{HttpClient, HttpProxyConnector},
+    sinks::{
+        datadog::DatadogApiError,
+        util::{
+            Compression,
+            http::{OrderedHeaderName, validate_headers},
+            retries::RetryLogic,
+        },
+    },
 };
 
 #[derive(Debug, Default, Clone)]
@@ -29,6 +36,7 @@ pub struct LogApiRetry;
 
 impl RetryLogic for LogApiRetry {
     type Error = DatadogApiError;
+    type Request = LogApiRequest;
     type Response = LogApiResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
@@ -89,29 +97,42 @@ impl DriverResponse for LogApiResponse {
 /// composed within a Tower "stack", such that we can easily and transparently
 /// provide retries, concurrency limits, rate limits, and more.
 #[derive(Debug, Clone)]
-pub struct LogApiService {
-    client: HttpClient,
+pub struct LogApiService<C = HttpProxyConnector> {
+    client: HttpClient<Body, C>,
     uri: Uri,
-    user_provided_headers: IndexMap<HeaderName, HeaderValue>,
-    dd_evp_headers: IndexMap<HeaderName, HeaderValue>,
+    user_provided_headers: BTreeMap<OrderedHeaderName, HeaderValue>,
+    dd_evp_headers: BTreeMap<OrderedHeaderName, HeaderValue>,
 }
 
-impl LogApiService {
+impl<C> LogApiService<C>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    /// Creates a logs API service with validated user and Datadog origin headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if user-provided or Datadog origin headers are invalid.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve the constructor's public signature and header ownership."
+    )]
     pub fn new(
-        client: HttpClient,
+        client: HttpClient<Body, C>,
         uri: Uri,
-        headers: IndexMap<String, String>,
+        headers: BTreeMap<String, String>,
         dd_evp_origin: String,
     ) -> crate::Result<Self> {
         let user_provided_headers = validate_headers(&headers)?;
 
-        let dd_evp_headers = &[
+        let dd_evp_headers: BTreeMap<String, String> = [
             ("DD-EVP-ORIGIN".to_string(), dd_evp_origin),
             ("DD-EVP-ORIGIN-VERSION".to_string(), crate::get_version()),
         ]
         .into_iter()
         .collect();
-        let dd_evp_headers = validate_headers(dd_evp_headers)?;
+        let dd_evp_headers = validate_headers(&dd_evp_headers)?;
 
         Ok(Self {
             client,
@@ -122,7 +143,10 @@ impl LogApiService {
     }
 }
 
-impl Service<LogApiRequest> for LogApiService {
+impl<C> Service<LogApiRequest> for LogApiService<C>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     type Response = LogApiResponse;
     type Error = DatadogApiError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
@@ -154,11 +178,11 @@ impl Service<LogApiRequest> for LogApiService {
         if let Some(headers) = http_request.headers_mut() {
             for (name, value) in &self.user_provided_headers {
                 // Replace rather than append to any existing header values
-                headers.insert(name, value.clone());
+                headers.insert(name.inner(), value.clone());
             }
             // Set DD EVP headers last so that they cannot be overridden.
             for (name, value) in &self.dd_evp_headers {
-                headers.insert(name, value.clone());
+                headers.insert(name.inner(), value.clone());
             }
         }
 

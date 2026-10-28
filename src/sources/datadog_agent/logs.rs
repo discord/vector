@@ -4,31 +4,27 @@ use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Utc;
 use http::StatusCode;
 use tokio_util::codec::Decoder;
-use vector_lib::codecs::StreamDecodingError;
-use vector_lib::internal_event::{CountByteSize, InternalEventHandle as _};
-use vector_lib::json_size::JsonSize;
-use vector_lib::lookup::path;
-use vector_lib::{config::LegacyKey, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    codecs::StreamDecodingError,
+    config::LegacyKey,
+    internal_event::{CountByteSize, InternalEventHandle as _},
+    json_size::JsonSize,
+    lookup::path,
+};
 use vrl::core::Value;
-use warp::{filters::BoxedFilter, path as warp_path, path::FullPath, reply::Response, Filter};
+use warp::{Filter, filters::BoxedFilter, path as warp_path, path::FullPath, reply::Response};
 
-use crate::common::datadog::DDTAGS;
+use super::{ApiKeyQueryParams, DatadogAgentConfig, DatadogAgentSource, LogMsg, RequestHandler};
 use crate::{
+    common::{datadog::DDTAGS, http::ErrorMessage},
     event::Event,
     internal_events::DatadogAgentJsonParseError,
-    sources::{
-        datadog_agent::{
-            handle_request, ApiKeyQueryParams, DatadogAgentConfig, DatadogAgentSource, LogMsg,
-        },
-        util::ErrorMessage,
-    },
-    SourceSender,
+    sources::util::http::capped_body,
 };
 
-pub(crate) fn build_warp_filter(
-    acknowledgements: bool,
-    multiple_outputs: bool,
-    out: SourceSender,
+pub(super) fn build_warp_filter(
+    handler: RequestHandler,
     source: DatadogAgentSource,
 ) -> BoxedFilter<(Response,)> {
     warp::post()
@@ -37,7 +33,7 @@ pub(crate) fn build_warp_filter(
         .and(warp::header::optional::<String>("content-encoding"))
         .and(warp::header::optional::<String>("dd-api-key"))
         .and(warp::query::<ApiKeyQueryParams>())
-        .and(warp::body::bytes())
+        .and(capped_body())
         .and_then(
             move |_,
                   path: FullPath,
@@ -58,14 +54,20 @@ pub(crate) fn build_warp_filter(
                             &source,
                         )
                     });
-
-                let output = multiple_outputs.then_some(super::LOGS);
-                handle_request(events, acknowledgements, out.clone(), output)
+                handler.clone().handle_request(events, super::LOGS)
             },
         )
         .boxed()
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Request handlers own payload and token values at this boundary."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+)]
 pub(crate) fn decode_log_body(
     body: Bytes,
     api_key: Option<Arc<str>>,
@@ -74,10 +76,7 @@ pub(crate) fn decode_log_body(
     if body.is_empty() || body.as_ref() == b"{}" {
         // The datadog agent may send an empty payload as a keep alive
         // https://github.com/DataDog/datadog-agent/blob/5a6c5dd75a2233fbf954e38ddcc1484df4c21a35/pkg/logs/client/http/destination.go#L52
-        debug!(
-            message = "Empty payload ignored.",
-            internal_log_rate_limit = true
-        );
+        debug!(message = "Empty payload ignored.");
         return Ok(Vec::new());
     }
 
@@ -86,12 +85,12 @@ pub(crate) fn decode_log_body(
 
         ErrorMessage::new(
             StatusCode::BAD_REQUEST,
-            format!("Error parsing JSON: {:?}", error),
+            format!("Error parsing JSON: {error:?}"),
         )
     })?;
 
     let now = Utc::now();
-    let mut decoded = Vec::new();
+    let mut decoded_events = Vec::new();
     let mut event_bytes_received = JsonSize::zero();
 
     for LogMsg {
@@ -188,12 +187,12 @@ pub(crate) fn decode_log_body(
                                 .set_schema_definition(logs_schema_definition);
                         }
 
-                        decoded.push(event);
+                        decoded_events.push(event);
                     }
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    // Error is logged by `crate::codecs::Decoder`, no further
+                    // Error is logged by `vector_lib::codecs::Decoder`, no further
                     // handling is needed here.
                     if !error.can_continue() {
                         break;
@@ -205,9 +204,9 @@ pub(crate) fn decode_log_body(
 
     source
         .events_received
-        .emit(CountByteSize(decoded.len(), event_bytes_received));
+        .emit(CountByteSize(decoded_events.len(), event_bytes_received));
 
-    Ok(decoded)
+    Ok(decoded_events)
 }
 
 // ddtags input is a string containing a list of tags which
@@ -227,11 +226,13 @@ fn parse_ddtags(ddtags_raw: &Bytes) -> Value {
     let ddtags: Vec<Value> = ddtags_str
         .split(',')
         .filter(|kv| !kv.is_empty())
-        .map(|kv| Value::Bytes(Bytes::from(kv.trim().to_string())))
+        .map(|kv| Value::from(kv.trim()))
         .collect();
 
     if ddtags.is_empty() && !ddtags_str.is_empty() {
-        warn!(message = "`parse_ddtags` set to true and Agent log contains non-empty ddtags string, but no tag-value pairs were parsed.")
+        warn!(
+            message = "`parse_ddtags` set to true and Agent log contains non-empty ddtags string, but no tag-value pairs were parsed."
+        );
     }
 
     ddtags.into()
@@ -239,13 +240,14 @@ fn parse_ddtags(ddtags_raw: &Bytes) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use similar_asserts::assert_eq;
     use vrl::value;
 
+    use super::*;
+
     #[test]
     fn ddtags_parse_empty() {
-        let raw = Bytes::from(String::from(""));
+        let raw = Bytes::from(String::new());
         let val = parse_ddtags(&raw);
 
         assert_eq!(val, value!([]));

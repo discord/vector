@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{stdin, BufReader},
+    io::{BufReader, stdin},
 };
 
 use serde::{Deserialize, Serialize};
@@ -23,9 +23,11 @@ struct ExecResponse {
 async fn main() {
     let stdin = BufReader::new(stdin());
     let query: ExecQuery = serde_json::from_reader(stdin).unwrap();
-    if query.version != "1.0" {
-        panic!("unsupported version: {}", query.version);
-    }
+    assert!(
+        query.version == "1.0",
+        "unsupported version: {}",
+        query.version
+    );
     let response = query
         .secrets
         .into_iter()
@@ -33,7 +35,7 @@ async fn main() {
             (
                 secret.clone(),
                 ExecResponse {
-                    value: format!("{}.retrieved", secret),
+                    value: format!("{secret}.retrieved"),
                     error: None,
                 },
             )

@@ -2,15 +2,24 @@
     feature = "sources-apache_metrics",
     feature = "sources-aws_ecs_metrics",
     feature = "sources-aws_kinesis_firehose",
-    feature = "sources-http-client",
     feature = "sources-utils-http",
 ))]
 pub(crate) fn http_error_code(code: u16) -> String {
-    format!("http_response_{}", code)
+    format!("http_response_{code}")
 }
 
+#[cfg(any(
+    feature = "sources-aws_kinesis_firehose",
+    feature = "sources-exec",
+    feature = "sources-heroku_logs",
+))]
 pub(crate) fn io_error_code(error: &std::io::Error) -> &'static str {
-    use std::io::ErrorKind::*;
+    use std::io::ErrorKind::{
+        AddrInUse, AddrNotAvailable, AlreadyExists, BrokenPipe, ConnectionAborted,
+        ConnectionRefused, ConnectionReset, Interrupted, InvalidData, InvalidInput, NotConnected,
+        NotFound, Other, OutOfMemory, PermissionDenied, TimedOut, UnexpectedEof, Unsupported,
+        WouldBlock, WriteZero,
+    };
 
     // there are many more gated behind https://github.com/rust-lang/rust/issues/86442
     match error.kind() {

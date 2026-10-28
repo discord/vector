@@ -7,25 +7,32 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
-use futures_util::{stream::Map, Stream, StreamExt};
+use futures_util::{Stream, StreamExt, stream::Map};
 use pin_project::pin_project;
 use tower::Service;
 use tracing::Span;
-use vector_lib::stream::{
-    batcher::{config::BatchConfig, Batcher},
-    ConcurrentMap, Driver, DriverResponse, ExpirationQueue, PartitionedBatcher,
-};
 use vector_lib::{
+    ByteSizeOf,
     event::{Finalizable, Metric},
     partition::Partitioner,
-    ByteSizeOf,
+    stream::{
+        ConcurrentMap, Driver, DriverResponse, ExpirationQueue, PartitionedBatcher,
+        batcher::{Batcher, config::BatchConfig},
+    },
 };
 
 use super::{
-    buffer::metrics::MetricNormalize, IncrementalRequestBuilder, Normalizer, RequestBuilder,
+    IncrementalRequestBuilder, Normalizer, RequestBuilder, buffer::metrics::MetricNormalize,
 };
+
+fn metric_ttl(maybe_ttl_secs: Option<f64>) -> Option<Duration> {
+    maybe_ttl_secs
+        .and_then(|ttl| Duration::try_from_secs_f64(ttl).ok())
+        .filter(|ttl| !ttl.is_zero())
+}
 
 impl<T: ?Sized> SinkBuilderExt for T where T: Stream {}
 
@@ -45,9 +52,13 @@ pub trait SinkBuilderExt: Stream {
     /// The stream will yield batches of events, with their partition key, when either a batch fills
     /// up or times out. [`Partitioner`] operates on a per-event basis, and has access to the event
     /// itself, and so can access any and all fields of an event.
+    ///
+    /// The `settings` closure receives the partition key for each new partition, allowing callers
+    /// to vary the batch configuration (e.g. byte size limit) per partition.
     fn batched_partitioned<P, C, F, B>(
         self,
         partitioner: P,
+        timeout: Duration,
         settings: F,
     ) -> PartitionedBatcher<Self, P, ExpirationQueue<P::Key>, C, F, B>
     where
@@ -56,9 +67,9 @@ pub trait SinkBuilderExt: Stream {
         P::Key: Eq + Hash + Clone,
         P::Item: ByteSizeOf,
         C: BatchConfig<P::Item>,
-        F: Fn() -> C + Send,
+        F: Fn(&P::Key) -> C + Send,
     {
-        PartitionedBatcher::new(self, partitioner, settings)
+        PartitionedBatcher::new(self, partitioner, timeout, settings)
     }
 
     /// Batches the stream based on the given batch settings and item size calculator.
@@ -220,6 +231,18 @@ pub trait SinkBuilderExt: Stream {
         Normalizer::new(self, N::default())
     }
 
+    /// Normalizes a stream of [`Metric`] events with a normalizer and an optional TTL.
+    fn normalized_with_ttl<N>(self, maybe_ttl_secs: Option<f64>) -> Normalizer<Self, N>
+    where
+        Self: Stream<Item = Metric> + Unpin + Sized,
+        N: MetricNormalize + Default,
+    {
+        match metric_ttl(maybe_ttl_secs) {
+            None => Normalizer::new(self, N::default()),
+            Some(ttl) => Normalizer::new_with_ttl(self, N::default(), ttl),
+        }
+    }
+
     /// Creates a [`Driver`] that uses the configured event stream as the input to the given
     /// service.
     ///
@@ -256,5 +279,24 @@ where
         this.st
             .poll_next(cx)
             .map(|maybe| maybe.map(|result| result.unwrap()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_ttl_preserves_fractional_seconds() {
+        assert_eq!(metric_ttl(Some(0.5)), Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn metric_ttl_ignores_invalid_or_zero_durations() {
+        assert_eq!(metric_ttl(None), None);
+        assert_eq!(metric_ttl(Some(0.0)), None);
+        assert_eq!(metric_ttl(Some(-1.0)), None);
+        assert_eq!(metric_ttl(Some(f64::NAN)), None);
+        assert_eq!(metric_ttl(Some(f64::INFINITY)), None);
     }
 }

@@ -14,7 +14,6 @@ Vector team member will find this document useful.
   - [Git Commits](#git-commits)
     - [Style](#style)
   - [GitHub Pull Requests](#github-pull-requests)
-    - [Title](#title)
     - [Reviews & Approvals](#reviews--approvals)
     - [Merge Style](#merge-style)
   - [CI](#ci)
@@ -39,13 +38,14 @@ Vector team member will find this document useful.
 2. **You've read Vector's [docs](https://vector.dev/docs/).**
 3. **You know about the [Vector community](https://vector.dev/community/).
    Please use this for help.**
+4. **You've read our [AI Policy](AI_POLICY.md)** if you plan to use AI tools
+   in your contribution.
 
 ## Your First Contribution
 
-1. Ensure your change has an issue! Find an
+1. For large PRs or for breaking changes, ensure your change has an issue! Find an
    [existing issue][urls.existing_issues] or [open a new issue][urls.new_issue].
    - This is where you can get a feel if the change will be accepted or not.
-     Changes that are questionable will have a `needs: approval` label.
 2. Once approved, [fork the Vector repository][urls.fork_repo] in your own
    GitHub account (only applicable to outside contributors).
 3. [Create a new Git branch][urls.create_branch].
@@ -88,7 +88,7 @@ To merge a new source, sink, or transform, the pull request is required to:
 - [ ] Add tests, especially integration tests if your contribution connects to an external service.
 - [ ] Add instrumentation so folks using your integration can get insight into how it's working and performing. You can
 see some [example of instrumentation in existing integrations](https://github.com/vectordotdev/vector/tree/master/src/internal_events).
-- [ ] Add documentation. You can see [examples in the `docs` directory](https://github.com/vectordotdev/vector/blob/master/docs).
+- [ ] Add documentation. You need to generate and create documentation files for your component. See the [component documentation guide](docs/DOCUMENTING.md#adding-documentation-for-new-components) for detailed instructions.
 
 When adding new integration tests, the following changes are needed in the GitHub Workflows:
 
@@ -117,32 +117,61 @@ Please ensure your commits are small and focused; they should tell a story of
 your change. This helps reviewers to follow your changes, especially for more
 complex changes.
 
+#### Pre-push
+
+To reduce iterations you can create do the following:
+
+```shell
+touch .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+```
+
+You can use the following as a starting point:
+
+```shell
+#!/bin/sh
+set -e
+
+echo "Format code"
+
+make fmt
+
+echo "Running pre-push checks..."
+
+# We recommend always running all the following checks.
+make check-licenses
+make check-fmt
+make check-clippy
+make check-generated-docs
+
+# Lint GitHub Actions workflows.
+make check-actionlint
+
+# Some other checks that in our experience rarely fail on PRs.
+make check-deny
+make check-docs
+make check-examples
+make check-scripts
+make check-changelog-fragments
+
+# Spell-check the codebase (fast, requires typos-cli: cargo install typos-cli)
+typos
+
+# The following check is very slow.
+# make check-component-features
+```
+
+Please note that `make check-all` covers all checks, but it is slow and may runs checks not
+relevant to your PR. This command is defined in the
+[Makefile](https://github.com/vectordotdev/vector/blob/1ef01aeeef592c21d32ba4d663e199f0608f615b/Makefile#L450-L454).
+
 ### GitHub Pull Requests
 
+Please see [Community response expectations](COMMUNITY_RESPONSE_EXPECTATIONS.md)
+for information about how maintainers prioritize pull requests, issues, and
+discussions.
+
 Once your changes are ready you must submit your branch as a [pull request](https://github.com/vectordotdev/vector/pulls).
-
-#### Title
-
-The pull request title must follow the format outlined in the [conventional commits spec](https://www.conventionalcommits.org).
-[Conventional commits](https://www.conventionalcommits.org) is a standardized
-format for commit messages. Vector only requires this format for commits on
-the `master` branch. And because Vector squashes commits before merging
-branches, this means that only the pull request title must conform to this
-format. Vector performs a pull request check to verify the pull request title
-in case you forget.
-
-A list of allowed sub-categories is defined
-[here](https://github.com/vectordotdev/vector/blob/master/.github/semantic.yml#L21).
-
-The following are all good examples of pull request titles:
-
-```text
-feat(new sink): new `xyz` sink
-feat(tcp source): add foo bar baz feature
-fix(tcp source): fix foo bar baz bug
-chore: improve build process
-docs: fix typos
-```
 
 #### Reviews & Approvals
 
@@ -241,7 +270,7 @@ first to ensure they pass.
 
 ```sh
 # Run the Clippy linter to catch common mistakes.
-cargo vdev check rust --clippy
+cargo vdev check rust --fix
 # Ensure all code is properly formatted. Code can be run through `rustfmt` using `cargo fmt` to ensure it is properly formatted.
 cargo vdev check fmt
 # Ensure the internal metrics that Vector emits conform to standards.
@@ -250,22 +279,28 @@ cargo vdev check events
 cargo vdev check licenses
 # Vector's documentation for each component is generated from the comments attached to the Component structs and members.
 # Running this ensures that the generated docs are up to date.
-make check-component-docs
-# Generate the code documentation for the Vector project.
-# Run this to ensure the docs can be generated without errors (warnings are acceptable at the minute).
-cd rust-doc && make docs
+make check-generated-docs
+```
+
+### Updating licences
+
+```sh
+cargo install dd-rust-license-tool --locked
+make build-licenses
+git commit -am "updated LICENSE-3rdparty.csv"
+git push
 ```
 
 ### Deprecations
 
-When deprecating functionality in Vector, see [DEPRECATION.md](docs/DEPRECATION.md).
+When deprecating functionality in Vector, see [DEPRECATION_POLICY.md](docs/DEPRECATION_POLICY.md).
 
 ### Dependencies
 
 When adding, modifying, or removing a dependency in Vector you may find that you need to update the
 inventory of third-party licenses maintained in `LICENSE-3rdparty.csv`. This file is generated using
 [dd-rust-license-tool](https://github.com/DataDog/rust-license-tool.git) and can be updated using
-`cargo vdev build licenses`.
+`make build-licenses`.
 
 ## Next steps
 
@@ -274,7 +309,7 @@ documents:
 
 1. **[DEVELOPING.md](docs/DEVELOPING.md)** - Everything necessary to develop
 2. **[DOCUMENTING.md](docs/DOCUMENTING.md)** - Preparing your change for Vector users
-3. **[DEPRECATION.md](docs/DEPRECATION.md)** - Deprecating functionality in Vector
+3. **[DEPRECATION_POLICY.md](docs/DEPRECATION_POLICY.md)** - Deprecating functionality in Vector
 
 ## Legal
 
@@ -287,7 +322,7 @@ Vector requires all contributors to sign the Contributor License Agreement
 (CLA). This gives Vector the right to use your contribution as well as ensuring
 that you own your contributions and can use them for other purposes.
 
-The full text of the CLA can be found at [https://cla.datadoghq.com/vectordotdev/vector](https://cla.datadoghq.com/vectordotdev/vector).
+The [full text of the CLA](https://gist.github.com/bits-bot/55bdc97a4fdad52d97feb4d6c3d1d618) is available on GitHub.
 
 ### Granted rights and copyright assignment
 

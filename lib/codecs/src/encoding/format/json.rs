@@ -1,28 +1,40 @@
 use bytes::{BufMut, BytesMut};
 use tokio_util::codec::Encoder;
+use vector_config_macros::configurable_component;
 use vector_core::{config::DataType, event::Event, schema};
 
 use crate::MetricTagValues;
 
 /// Config used to build a `JsonSerializer`.
-#[crate::configurable_component]
+#[configurable_component]
 #[derive(Debug, Clone, Default)]
 pub struct JsonSerializerConfig {
     /// Controls how metric tag values are encoded.
     ///
     /// When set to `single`, only the last non-bare value of tags are displayed with the
-    /// metric.  When set to `full`, all metric tags are exposed as separate assignments.
+    /// metric. When set to `full`, all metric tags are exposed as separate assignments.
+    /// When set to `auto`, tag values are encoded using their underlying shape.
     #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub metric_tag_values: MetricTagValues,
 
     /// Options for the JsonSerializer.
     #[serde(default, rename = "json")]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::doc_markdown,
+        reason = "Preserve generated configuration documentation during the lint rollout."
+    )]
     pub options: JsonSerializerOptions,
 }
 
 /// Options for the JsonSerializer.
-#[crate::configurable_component]
+#[configurable_component]
 #[derive(Debug, Clone, Default)]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(
+    clippy::doc_markdown,
+    reason = "Preserve generated configuration documentation during the lint rollout."
+)]
 pub struct JsonSerializerOptions {
     /// Whether to use pretty JSON formatting.
     #[serde(default)]
@@ -31,6 +43,7 @@ pub struct JsonSerializerOptions {
 
 impl JsonSerializerConfig {
     /// Creates a new `JsonSerializerConfig`.
+    #[must_use]
     pub const fn new(metric_tag_values: MetricTagValues, options: JsonSerializerOptions) -> Self {
         Self {
             metric_tag_values,
@@ -39,16 +52,19 @@ impl JsonSerializerConfig {
     }
 
     /// Build the `JsonSerializer` from this configuration.
+    #[must_use]
     pub fn build(&self) -> JsonSerializer {
         JsonSerializer::new(self.metric_tag_values, self.options.clone())
     }
 
     /// The data type of events that are accepted by `JsonSerializer`.
+    #[must_use]
     pub fn input_type(&self) -> DataType {
         DataType::all_bits()
     }
 
     /// The schema required by the serializer.
+    #[must_use]
     pub fn schema_requirement(&self) -> schema::Requirement {
         // While technically we support `Value` variants that can't be losslessly serialized to
         // JSON, we don't want to enforce that limitation to users yet.
@@ -65,6 +81,7 @@ pub struct JsonSerializer {
 
 impl JsonSerializer {
     /// Creates a new `JsonSerializer`.
+    #[must_use]
     pub const fn new(metric_tag_values: MetricTagValues, options: JsonSerializerOptions) -> Self {
         Self {
             metric_tag_values,
@@ -73,6 +90,11 @@ impl JsonSerializer {
     }
 
     /// Encode event and represent it as JSON value.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "The codec API error documentation needs a separate audit."
+    )]
     pub fn to_json_value(&self, event: Event) -> Result<serde_json::Value, vector_common::Error> {
         match event {
             Event::Log(log) => serde_json::to_value(&log),
@@ -119,8 +141,10 @@ impl Encoder<Event> for JsonSerializer {
 mod tests {
     use bytes::{Bytes, BytesMut};
     use chrono::{TimeZone, Timelike, Utc};
-    use vector_core::event::{LogEvent, Metric, MetricKind, MetricValue, StatisticKind, Value};
-    use vector_core::metric_tags;
+    use vector_core::{
+        event::{LogEvent, Metric, MetricKind, MetricValue, StatisticKind, Value},
+        metric_tags,
+    };
     use vrl::btreemap;
 
     use super::*;
@@ -266,6 +290,11 @@ mod tests {
         )
     }
 
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Keep the existing owned-argument API during the lint rollout."
+    )]
     fn serialize(config: JsonSerializerConfig, input: Event) -> Bytes {
         let mut buffer = BytesMut::new();
         config.build().encode(input, &mut buffer).unwrap();
@@ -273,13 +302,15 @@ mod tests {
     }
 
     mod pretty_json {
-
-        use super::*;
         use bytes::{Bytes, BytesMut};
         use chrono::{TimeZone, Timelike, Utc};
-        use vector_core::event::{LogEvent, Metric, MetricKind, MetricValue, StatisticKind, Value};
-        use vector_core::metric_tags;
+        use vector_core::{
+            event::{LogEvent, Metric, MetricKind, MetricValue, StatisticKind, Value},
+            metric_tags,
+        };
         use vrl::btreemap;
+
+        use super::*;
 
         fn get_pretty_json_config() -> JsonSerializerConfig {
             JsonSerializerConfig {
@@ -463,6 +494,11 @@ mod tests {
                 )),
             )
         }
+        // https://github.com/vectordotdev/vector/issues/23659
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "Keep the existing owned-argument API during the lint rollout."
+        )]
         fn serialize(config: JsonSerializerConfig, input: Event) -> Bytes {
             let mut buffer = BytesMut::new();
             config.build().encode(input, &mut buffer).unwrap();

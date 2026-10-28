@@ -1,6 +1,9 @@
 use vector_lib::{event::Event, partition::Partitioner};
 
-use crate::{internal_events::TemplateRenderingError, template::Template};
+use crate::{
+    internal_events::TemplateRenderingError, sinks::util::partitioner::render_key_with_fallback,
+    template::ConfinedTemplate,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct S3PartitionKey {
@@ -9,14 +12,28 @@ pub struct S3PartitionKey {
 }
 
 /// Partitions items based on the generated key for the given event.
-pub struct S3KeyPartitioner(Template, Option<Template>);
+///
+/// If the template was built with a confinement check (via
+/// [`Template::confine`][crate::template::Template::confine]),
+/// keys that escape the base prefix are dropped as intentional security discards.
+pub struct S3KeyPartitioner {
+    key_prefix_template: ConfinedTemplate,
+    ssekms_key_id_template: Option<ConfinedTemplate>,
+    dead_letter_key_prefix: Option<String>,
+}
 
 impl S3KeyPartitioner {
+    #[must_use]
     pub const fn new(
-        key_prefix_template: Template,
-        ssekms_key_id_template: Option<Template>,
+        key_prefix_template: ConfinedTemplate,
+        ssekms_key_id_template: Option<ConfinedTemplate>,
+        dead_letter_key_prefix: Option<String>,
     ) -> Self {
-        Self(key_prefix_template, ssekms_key_id_template)
+        Self {
+            key_prefix_template,
+            ssekms_key_id_template,
+            dead_letter_key_prefix,
+        }
     }
 }
 
@@ -25,22 +42,17 @@ impl Partitioner for S3KeyPartitioner {
     type Key = Option<S3PartitionKey>;
 
     fn partition(&self, item: &Self::Item) -> Self::Key {
-        let key_prefix = self
-            .0
-            .render_string(item)
-            .map_err(|error| {
-                emit!(TemplateRenderingError {
-                    error,
-                    field: Some("key_prefix"),
-                    drop_event: true,
-                });
-            })
-            .ok()?;
+        let key_prefix = render_key_with_fallback(
+            &self.key_prefix_template,
+            item,
+            self.dead_letter_key_prefix.as_deref(),
+        )?;
+
         let ssekms_key_id = self
-            .1
+            .ssekms_key_id_template
             .as_ref()
-            .map(|ssekms_key_id| {
-                ssekms_key_id.render_string(item).map_err(|error| {
+            .map(|t| {
+                t.render_string(item).map_err(|error| {
                     emit!(TemplateRenderingError {
                         error,
                         field: Some("ssekms_key_id"),
@@ -50,6 +62,7 @@ impl Partitioner for S3KeyPartitioner {
             })
             .transpose()
             .ok()?;
+
         Some(S3PartitionKey {
             key_prefix,
             ssekms_key_id,

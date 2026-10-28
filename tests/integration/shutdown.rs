@@ -1,6 +1,5 @@
 use std::{
-    fs::create_dir,
-    fs::read_dir,
+    fs::{create_dir, read_dir},
     io::Write,
     net::SocketAddr,
     path::PathBuf,
@@ -11,12 +10,12 @@ use std::{
 
 use assert_cmd::prelude::*;
 use nix::{
-    sys::signal::{kill, Signal},
+    sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use similar_asserts::assert_eq;
-use vector::test_util::{next_addr, temp_file};
+use vector::test_util::{addr::next_addr, temp_file};
 
 use crate::{create_directory, create_file, overwrite_file};
 
@@ -24,7 +23,7 @@ const STARTUP_TIME: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIME: Duration = Duration::from_secs(4);
 const RELOAD_TIME: Duration = Duration::from_secs(5);
 
-const STDIO_CONFIG: &'static str = r#"
+const STDIO_CONFIG: &str = r#"
     data_dir = "${VECTOR_DATA_DIR}"
 
     [sources.in_console]
@@ -36,7 +35,7 @@ const STDIO_CONFIG: &'static str = r#"
         encoding.codec = "text"
 "#;
 
-const PROMETHEUS_SINK_CONFIG: &'static str = r#"
+const PROMETHEUS_SINK_CONFIG: &str = r#"
     data_dir = "${VECTOR_DATA_DIR}"
 
     [sources.in]
@@ -63,13 +62,12 @@ fn source_config(source: &str) -> String {
 data_dir = "${{VECTOR_DATA_DIR}}"
 
 [sources.in]
-{}
+{source}
 
 [sinks.out]
     inputs = ["in"]
     type = "blackhole"
-"#,
-        source
+"#
     )
 }
 
@@ -78,7 +76,7 @@ fn source_vector(source: &str) -> Command {
 }
 
 fn vector(config: &str) -> Command {
-    vector_with(create_file(config), next_addr(), false)
+    vector_with(create_file(config), next_addr().1, false)
 }
 
 fn vector_with(config_path: PathBuf, address: SocketAddr, quiet: bool) -> Command {
@@ -86,6 +84,7 @@ fn vector_with(config_path: PathBuf, address: SocketAddr, quiet: bool) -> Comman
     cmd.arg("-c")
         .arg(config_path)
         .arg(if quiet { "--quiet" } else { "-v" })
+        .arg("--dangerously-allow-env-var-interpolation")
         .env("VECTOR_DATA_DIR", create_directory())
         .env("VECTOR_TEST_UNIX_PATH", temp_file())
         .env("VECTOR_TEST_ADDRESS", address.to_string());
@@ -98,6 +97,7 @@ fn test_timely_shutdown(cmd: Command) {
 }
 
 /// Returns stdout output
+#[allow(clippy::print_stdout)]
 fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce(&mut Child)) {
     let mut vector = cmd
         .stdin(std::process::Stdio::piped())
@@ -115,7 +115,7 @@ fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce(&mut Child))
     sub(&mut vector);
 
     // Signal shutdown
-    kill(Pid::from_raw(vector.id() as i32), Signal::SIGTERM).unwrap();
+    kill(Pid::from_raw(vector.id().cast_signed()), Signal::SIGTERM).unwrap();
 
     // Time shutdown.
     let now = Instant::now();
@@ -126,7 +126,7 @@ fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce(&mut Child))
     // Check output
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        println!("{}", stdout);
+        println!("{stdout}");
         panic!("Vector didn't exit successfully. Status: {}", output.status);
     }
 
@@ -141,6 +141,7 @@ fn test_timely_shutdown_with_sub(mut cmd: Command, sub: impl FnOnce(&mut Child))
 fn auto_shutdown() {
     let mut cmd = assert_cmd::Command::cargo_bin("vector").unwrap();
     cmd.arg("--quiet")
+        .arg("--dangerously-allow-env-var-interpolation")
         .arg("-c")
         .arg(create_file(STDIO_CONFIG))
         .env("VECTOR_DATA_DIR", create_directory());
@@ -158,6 +159,7 @@ fn log_schema() {
     // Vector command
     let mut cmd = Command::cargo_bin("vector").unwrap();
     cmd.arg("--quiet")
+        .arg("--dangerously-allow-env-var-interpolation")
         .arg("-c")
         .arg(create_file(
             r#"
@@ -244,14 +246,15 @@ fn log_schema_multiple_config_files() {
 
     overwrite_file(
         input_file.clone(),
-        r#"42
-    "#,
+        r"42
+    ",
     );
 
     cmd.arg("--quiet")
+        .arg("--dangerously-allow-env-var-interpolation")
         .env("VECTOR_CONFIG_DIR", config_dir)
         .env("VECTOR_DATA_DIR", create_directory())
-        .env("VECTOR_TEST_INPUT_FILE", input_file.clone());
+        .env("VECTOR_TEST_INPUT_FILE", input_file);
 
     // Run vector
     let vector = cmd.stdout(std::process::Stdio::piped()).spawn().unwrap();
@@ -260,7 +263,7 @@ fn log_schema_multiple_config_files() {
     sleep(STARTUP_TIME);
 
     // Signal shutdown
-    kill(Pid::from_raw(vector.id() as i32), Signal::SIGTERM).unwrap();
+    kill(Pid::from_raw(vector.id().cast_signed()), Signal::SIGTERM).unwrap();
 
     // Wait for shutdown
     let output = vector.wait_with_output().unwrap();
@@ -269,7 +272,14 @@ fn log_schema_multiple_config_files() {
     // Output
     let event: Value = serde_json::from_slice(output.stdout.as_slice()).unwrap();
     assert_eq!(event["message"], json!("42"));
-    assert_eq!(event["test_host"], json!("runner"));
+    if std::env::var("CI").as_deref() == Ok("true") {
+        assert_eq!(event["test_host"], json!("runner"));
+    } else {
+        assert!(
+            event["test_host"].is_string(),
+            "expected test_host to be a string"
+        );
+    }
 }
 
 #[test]
@@ -290,7 +300,8 @@ fn configuration_path_recomputed() {
     );
 
     // Vector command
-    let mut cmd = vector_with(dir.join("*"), next_addr(), true);
+    let (_guard, address) = next_addr();
+    let mut cmd = vector_with(dir.join("*"), address, true);
 
     // Run vector
     let mut vector = cmd
@@ -305,12 +316,12 @@ fn configuration_path_recomputed() {
     // Second configuration file
     overwrite_file(dir.join("conf2.toml"), STDIO_CONFIG);
     // Clean the first file so to have only the console source.
-    overwrite_file(dir.join("conf1.toml"), &"");
+    overwrite_file(dir.join("conf1.toml"), "");
 
     // Signal reload
-    kill(Pid::from_raw(vector.id() as i32), Signal::SIGHUP).unwrap();
+    kill(Pid::from_raw(vector.id().cast_signed()), Signal::SIGHUP).unwrap();
 
-    // Message to assert, sended to console source and picked up from
+    // Message to assert, sent to console source and picked up from
     // console sink, both added in the second configuration file.
     vector
         .stdin
@@ -397,7 +408,7 @@ fn timely_shutdown_demo_logs() {
 fn timely_shutdown_http() {
     test_timely_shutdown(source_vector(
         r#"
-    type = "http"
+    type = "http_server"
     address = "${VECTOR_TEST_ADDRESS}"
     decoding.codec = "bytes""#,
     ));
@@ -428,7 +439,7 @@ fn timely_shutdown_journald() {
 
 #[test]
 fn timely_shutdown_prometheus() {
-    let address = next_addr();
+    let (_guard, address) = next_addr();
     test_timely_shutdown_with_sub(
         vector_with(create_file(PROMETHEUS_SINK_CONFIG), address, false),
         |_| {
@@ -613,7 +624,8 @@ fn timely_reload_shutdown() {
         .as_str(),
     );
 
-    let mut cmd = vector_with(path.clone(), next_addr(), false);
+    let (_guard, address) = next_addr();
+    let mut cmd = vector_with(path.clone(), address, false);
     cmd.arg("-w");
 
     test_timely_shutdown_with_sub(cmd, |vector| {
@@ -680,7 +692,7 @@ async fn health_503_during_shutdown() {
     assert_eq!(None, vector.try_wait().unwrap(), "Vector exited too early.");
 
     // Signal shutdown
-    kill(Pid::from_raw(vector.id() as i32), Signal::SIGTERM).unwrap();
+    kill(Pid::from_raw(vector.id().cast_signed()), Signal::SIGTERM).unwrap();
 
     // Give vector time to begin shutting down.
     sleep(Duration::from_secs(1));
@@ -689,5 +701,5 @@ async fn health_503_during_shutdown() {
 
     assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
 
-    kill(Pid::from_raw(vector.id() as i32), Signal::SIGKILL).unwrap();
+    kill(Pid::from_raw(vector.id().cast_signed()), Signal::SIGKILL).unwrap();
 }

@@ -1,4 +1,4 @@
-FROM docker.io/debian:bookworm-slim AS builder
+FROM docker.io/debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS builder
 
 WORKDIR /vector
 
@@ -7,11 +7,16 @@ RUN dpkg -i vector_*_"$(dpkg --print-architecture)".deb
 
 RUN mkdir -p /var/lib/vector
 
-FROM docker.io/debian:bookworm-slim
+FROM docker.io/debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+
+# https://github.com/opencontainers/image-spec/blob/main/annotations.md
+LABEL org.opencontainers.image.url="https://vector.dev"
+LABEL org.opencontainers.image.source="https://github.com/vectordotdev/vector"
+LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
 
 # we want the latest versions of these
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata systemd && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata systemd libsasl2-2 && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/bin/vector /usr/bin/vector
 COPY --from=builder /usr/share/vector /usr/share/vector

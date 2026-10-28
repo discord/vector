@@ -1,13 +1,12 @@
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
 use vector_lib::{
     config::{DataType, Input, TransformOutput},
+    configurable::configurable_component,
     event::{
-        metric::{MetricData, Sample},
         Event, MetricValue,
+        metric::{MetricData, Sample},
     },
     schema,
     transform::{FunctionTransform, OutputBuffer, Transform},
@@ -30,6 +29,7 @@ pub struct BasicTransformConfig {
 impl_generate_config_from_default!(BasicTransformConfig);
 
 impl BasicTransformConfig {
+    #[must_use]
     pub const fn new(suffix: String, increase: f64) -> Self {
         Self { suffix, increase }
     }
@@ -51,9 +51,8 @@ impl TransformConfig for BasicTransformConfig {
 
     fn outputs(
         &self,
-        _: vector_lib::enrichment::TableRegistry,
+        _: &TransformContext,
         definitions: &[(OutputId, schema::Definition)],
-        _: LogNamespace,
     ) -> Vec<TransformOutput> {
         vec![TransformOutput::new(
             DataType::all_bits(),
@@ -98,9 +97,9 @@ impl FunctionTransform for BasicTransform {
                             statistic: *statistic,
                         })
                     }
-                    MetricValue::AggregatedHistogram { .. } => None,
-                    MetricValue::AggregatedSummary { .. } => None,
-                    MetricValue::Sketch { .. } => None,
+                    MetricValue::AggregatedHistogram { .. }
+                    | MetricValue::AggregatedSummary { .. }
+                    | MetricValue::Sketch { .. } => None,
                     MetricValue::Set { .. } => {
                         let mut values = BTreeSet::new();
                         values.insert(self.suffix.clone());
@@ -126,7 +125,7 @@ impl FunctionTransform for BasicTransform {
                     trace.insert(message_key, Value::from(v));
                 }
             }
-        };
+        }
         output.push(event);
     }
 }

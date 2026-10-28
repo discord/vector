@@ -84,6 +84,7 @@ under entities and also used to define global Vector behavior.
   following abbreviations for time units: `_secs`, `_ms`, `_ns`.
 - SHOULD consistent with units within the same scope. (e.g., don't mix seconds and milliseconds)
 - MUST NOT repeat the name space in the option name (e.g., `fingerprint.bytes` instead of `fingerprint.fingerprint_bytes`)
+- MUST NOT end with `_config` suffix. Historically, we have avoided appending this suffix, so please follow the same pattern for consistency. Note that this also applies to config fields that contain nested fields.
 
 ### Types
 
@@ -113,17 +114,21 @@ Options MUST NOT support polymorphism:
 
 For example:
 
-```toml
-buffer.type = "memory"
-buffer.memory.max_events = 10_000
+```yaml
+buffer:
+  type: "memory"
+  memory:
+    max_events: 10000
 ```
 
 The above configures a Vector memory buffer which can be switched to disk as
 well:
 
-```toml
-buffer.type = "disk"
-buffer.disk.max_bytes = 1_000_000_000
+```yaml
+buffer:
+  type: "disk"
+  disk:
+    max_bytes: 1000000000
 ```
 
 [component specification]: component.md

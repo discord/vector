@@ -3,7 +3,7 @@
 #![deny(missing_docs)]
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     hash::Hash,
     pin::Pin,
     task::{Context, Poll},
@@ -72,6 +72,7 @@ pub struct Config {
 impl Config {
     /// Build `Config` from legacy `file` source line aggregator configuration
     /// params.
+    #[must_use]
     pub fn for_legacy(marker: Regex, timeout_ms: u64) -> Self {
         let start_pattern = marker;
         let condition_pattern = start_pattern.clone();
@@ -129,6 +130,7 @@ pub struct Logic<K, C> {
 
 impl<K, C> Logic<K, C> {
     /// Create a new `Logic` using the specified `Config`.
+    #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -183,10 +185,13 @@ where
 
             // If we're in draining mode, short circuit here.
             if let Some(to_drain) = &mut this.draining {
-                if let Some(val) = to_drain.pop() {
-                    return Poll::Ready(Some(val));
-                } else {
-                    return Poll::Ready(None);
+                match to_drain.pop() {
+                    Some(val) => {
+                        return Poll::Ready(Some(val));
+                    }
+                    _ => {
+                        return Poll::Ready(None);
+                    }
                 }
             }
 
@@ -228,7 +233,7 @@ where
 
                     return Poll::Pending;
                 }
-            };
+            }
         }
     }
 }
@@ -298,6 +303,8 @@ where
     K: Hash + Eq + Clone,
 {
     /// Handle line, if we have something to output - return it.
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::match_same_arms, reason = "Keep mode-specific branches")]
     pub fn handle_line(
         &mut self,
         src: K,
@@ -404,10 +411,11 @@ impl<C> Aggregate<C> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use bytes::Bytes;
     use futures::SinkExt;
     use similar_asserts::assert_eq;
-    use std::fmt::Write as _;
 
     use super::*;
 
@@ -619,7 +627,7 @@ mod tests {
         run_and_assert(&lines, config, &expected).await;
     }
 
-    /// https://github.com/vectordotdev/vector/issues/3237
+    /// <https://github.com/vectordotdev/vector/issues/3237>
     #[tokio::test]
     async fn two_lines_emit_with_continue_through() {
         let lines = vec![
@@ -732,8 +740,8 @@ mod tests {
                 10,
             )),
         );
-        let results = line_agg.collect().await;
-        assert_results(results, &expected);
+        let results = line_agg.collect::<Vec<_>>().await;
+        assert_results(&results, &expected);
     }
 
     #[tokio::test]
@@ -749,7 +757,7 @@ mod tests {
             "START msg 1".to_string(), // will be stashed
         ];
         for i in 0..n {
-            lines.push(format!("line {}", i));
+            lines.push(format!("line {i}"));
         }
         let config = Config {
             start_pattern: Regex::new("").unwrap(),
@@ -760,14 +768,14 @@ mod tests {
 
         let mut expected = "START msg 1".to_string();
         for i in 0..n {
-            write!(expected, "\nline {}", i).expect("write to String never fails");
+            write!(expected, "\nline {i}").expect("write to String never fails");
         }
 
         let (mut send, recv) = futures::channel::mpsc::unbounded();
 
         let logic = Logic::new(config);
         let line_agg = LineAgg::new(recv, logic);
-        let results = tokio::spawn(line_agg.collect());
+        let results = tokio::spawn(line_agg.collect::<Vec<_>>());
 
         for (index, line) in lines.iter().enumerate() {
             let data = (
@@ -781,7 +789,7 @@ mod tests {
         drop(send);
 
         assert_results(
-            results.await.unwrap(),
+            &results.await.unwrap(),
             &[(expected.as_str(), 0, Some(lines.len() - 1))],
         );
     }
@@ -805,7 +813,7 @@ mod tests {
 
     /// Compare actual output to expected; expected is a list of the expected strings and context
     fn assert_results(
-        actual: Vec<(Filename, Bytes, usize, Option<usize>)>,
+        actual: &[(Filename, Bytes, usize, Option<usize>)],
         expected: &[(&str, usize, Option<usize>)],
     ) {
         let expected_mapped: Vec<(Filename, Bytes, usize, Option<usize>)> = expected
@@ -834,7 +842,7 @@ mod tests {
         let stream = stream_from_lines(lines);
         let logic = Logic::new(config);
         let line_agg = LineAgg::new(stream, logic);
-        let results = line_agg.collect().await;
-        assert_results(results, expected);
+        let results = line_agg.collect::<Vec<_>>().await;
+        assert_results(&results, expected);
     }
 }

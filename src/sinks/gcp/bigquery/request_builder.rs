@@ -9,8 +9,8 @@ use vector_lib::request_metadata::RequestMetadata;
 use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
 use super::service::BigqueryRequest;
 use crate::event::{Event, EventFinalizers};
-use crate::sinks::util::metadata::RequestMetadataBuilder;
 use crate::sinks::util::IncrementalRequestBuilder;
+use crate::sinks::util::metadata::RequestMetadataBuilder;
 
 // 10MB maximum message size:
 // https://cloud.google.com/bigquery/docs/reference/storage/rpc/google.cloud.bigquery.storage.v1#appendrowsrequest
@@ -295,9 +295,9 @@ fn translate_descriptor_proto(
 #[cfg(test)]
 mod test {
     use bytes::{BufMut, Bytes, BytesMut};
-    use codecs::encoding::{ProtobufSerializerConfig, ProtobufSerializerOptions};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use vector_lib::codecs::encoding::{ProtobufSerializerConfig, ProtobufSerializerOptions};
     use vector_lib::event::{Event, EventMetadata, LogEvent, Value};
 
     use super::BigqueryRequestBuilder;
@@ -312,6 +312,7 @@ mod test {
             protobuf: ProtobufSerializerOptions {
                 desc_file,
                 message_type: "test.Bytes".into(),
+                use_json_names: false,
             },
         }
         .build()

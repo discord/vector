@@ -1,6 +1,9 @@
 #![allow(missing_docs)]
 
-use std::{num::NonZeroU64, path::PathBuf};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+};
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 
@@ -8,10 +11,13 @@ use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use crate::service;
 #[cfg(feature = "api-client")]
 use crate::tap;
-#[cfg(feature = "api-client")]
+#[cfg(feature = "top")]
 use crate::top;
-use crate::{config, convert_config, generate, get_version, graph, list, unit_test, validate};
-use crate::{generate_schema, signal};
+
+use crate::{
+    completion, config, convert_config, generate, generate_schema, get_version, graph, list,
+    signal, unit_test, validate,
+};
 
 #[derive(Parser, Debug)]
 #[command(rename_all = "kebab-case")]
@@ -24,20 +30,25 @@ pub struct Opts {
 }
 
 impl Opts {
+    /// # Errors
+    /// Returns an error if the parsed arguments cannot be converted to options.
     pub fn get_matches() -> Result<Self, clap::Error> {
         let version = get_version();
         let app = Opts::command().version(version);
         Opts::from_arg_matches(&app.get_matches())
     }
 
+    #[must_use]
     pub const fn log_level(&self) -> &'static str {
         let (quiet_level, verbose_level) = match self.sub_command {
-            Some(SubCommand::Validate(_))
-            | Some(SubCommand::Graph(_))
-            | Some(SubCommand::Generate(_))
-            | Some(SubCommand::ConvertConfig(_))
-            | Some(SubCommand::List(_))
-            | Some(SubCommand::Test(_)) => {
+            Some(
+                SubCommand::Validate(_)
+                | SubCommand::Graph(_)
+                | SubCommand::Generate(_)
+                | SubCommand::ConvertConfig(_)
+                | SubCommand::List(_)
+                | SubCommand::Test(_),
+            ) => {
                 if self.root.verbose == 0 {
                     (self.root.quiet + 1, self.root.verbose)
                 } else {
@@ -61,6 +72,8 @@ impl Opts {
 
 #[derive(Parser, Debug)]
 #[command(rename_all = "kebab-case")]
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::struct_excessive_bools, reason = "Independent CLI flags")]
 pub struct RootOpts {
     /// Read configuration from one or more files. Wildcard paths are supported.
     /// File format is detected from the file name.
@@ -126,6 +139,11 @@ pub struct RootOpts {
     #[arg(short, long, env = "VECTOR_THREADS")]
     pub threads: Option<usize>,
 
+    /// Number of events batched per source send and used as the base for source output buffer sizing
+    /// (source output buffer capacity is this value multiplied by the number of worker threads)
+    #[arg(long, env = "VECTOR_CHUNK_SIZE_EVENTS")]
+    pub chunk_size_events: Option<NonZeroUsize>,
+
     /// Enable more detailed internal logging. Repeat to increase level. Overridden by `--quiet`.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -133,6 +151,15 @@ pub struct RootOpts {
     /// Reduce detail of internal logging. Repeat to reduce further. Overrides `--verbose`.
     #[arg(short, long, action = ArgAction::Count)]
     pub quiet: u8,
+
+    /// Allow interpolation of environment variables in configuration files. Enabling this may
+    /// expose environment secrets into your Vector configuration.
+    #[arg(
+        long,
+        env = "VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION",
+        default_value = "false"
+    )]
+    pub dangerously_allow_env_var_interpolation: bool,
 
     /// Set the logging format
     #[arg(long, default_value = "text", env = "VECTOR_LOG_FORMAT")]
@@ -152,7 +179,46 @@ pub struct RootOpts {
     #[arg(short, long, env = "VECTOR_WATCH_CONFIG")]
     pub watch_config: bool,
 
-    /// Set the internal log rate limit
+    /// Method for configuration watching.
+    ///
+    /// By default, `vector` uses recommended watcher for host OS
+    /// - `inotify` for Linux-based systems.
+    /// - `kqueue` for unix/macos
+    /// - `ReadDirectoryChangesWatcher` for windows
+    ///
+    /// The `poll` watcher can be used in cases where `inotify` doesn't work, e.g., when attaching the configuration via NFS.
+    #[arg(
+        long,
+        default_value = "recommended",
+        env = "VECTOR_WATCH_CONFIG_METHOD"
+    )]
+    pub watch_config_method: WatchConfigMethod,
+
+    /// Poll for changes in the configuration file at the given interval.
+    ///
+    /// This setting is only applicable if `Poll` is set in `--watch-config-method`.
+    #[arg(
+        long,
+        env = "VECTOR_WATCH_CONFIG_POLL_INTERVAL_SECONDS",
+        default_value = "30"
+    )]
+    pub watch_config_poll_interval_seconds: NonZeroU64,
+
+    /// Set the internal log rate limit in seconds.
+    ///
+    /// This controls the time window for rate limiting Vector's own internal logs.
+    /// Within each time window, the first occurrence of a log is emitted, the second
+    /// shows a suppression warning, and subsequent occurrences are silent until the
+    /// window expires. When the window expires and the log fires again, a summary of
+    /// the suppressed count is emitted followed by the log itself.
+    ///
+    /// Logs are grouped by their location in the code and the `component_id` field, so logs
+    /// from different components are rate limited independently.
+    ///
+    /// Examples:
+    /// - 1: Very verbose, logs can repeat every second
+    /// - 10 (default): Logs can repeat every 10 seconds
+    /// - 60: Less verbose, logs can repeat every minute
     #[arg(
         short,
         long,
@@ -160,6 +226,16 @@ pub struct RootOpts {
         default_value = "10"
     )]
     pub internal_log_rate_limit: u64,
+
+    /// Apply a rate limit (in seconds) to the broadcast channel that feeds all `internal_logs`
+    /// sources. When set, the first occurrence of a repeated log is emitted, the second shows a
+    /// suppression warning, and subsequent occurrences are silent until the window expires. When
+    /// the window expires and the log fires again, a summary of the suppressed count is emitted
+    /// followed by the log itself. Unset by default so that `internal_logs` consumers receive
+    /// every log event. This limit is independent of `--internal-log-rate-limit`, which only
+    /// applies to stdout/stderr output.
+    #[arg(long, env = "VECTOR_INTERNAL_LOGS_SOURCE_RATE_LIMIT")]
+    pub internal_logs_source_rate_limit: Option<NonZeroU64>,
 
     /// Set the duration in seconds to wait for graceful shutdown after SIGINT or SIGTERM are
     /// received. After the duration has passed, Vector will force shutdown. To never force
@@ -184,12 +260,12 @@ pub struct RootOpts {
     pub no_graceful_shutdown_limit: bool,
 
     /// Set runtime allocation tracing
-    #[cfg(feature = "allocation-tracing")]
+    #[cfg(all(unix, feature = "tikv-jemallocator"))]
     #[arg(long, env = "ALLOCATION_TRACING", default_value = "false")]
     pub allocation_tracing: bool,
 
     /// Set allocation tracing reporting rate in milliseconds.
-    #[cfg(feature = "allocation-tracing")]
+    #[cfg(all(unix, feature = "tikv-jemallocator"))]
     #[arg(
         long,
         env = "ALLOCATION_TRACING_REPORTING_INTERVAL_MS",
@@ -211,10 +287,35 @@ pub struct RootOpts {
     /// `--watch-config`.
     #[arg(long, env = "VECTOR_ALLOW_EMPTY_CONFIG", default_value = "false")]
     pub allow_empty_config: bool,
+
+    /// Maximum number of bytes allowed after decompressing a payload.
+    ///
+    /// Sources that decompress incoming payloads (gzip, deflate, zstd, snappy) enforce this cap to
+    /// prevent a compressed "bomb" from exhausting memory. Payloads whose decompressed size exceeds
+    /// the limit are rejected.
+    ///
+    /// Defaults to 104857600 (100 MiB). Raise this only when sources routinely receive
+    /// legitimately large compressed payloads.
+    #[arg(
+        long,
+        env = "VECTOR_MAX_DECOMPRESSED_SIZE_BYTES",
+        default_value = "104857600"
+    )]
+    pub max_decompressed_size_bytes: usize,
+
+    /// Raise the file descriptor soft limit (`RLIMIT_NOFILE`) to the hard limit at startup.
+    ///
+    /// Many systems default the soft limit to 1024 (Linux) or 256 (macOS), which is too low
+    /// when Vector monitors large numbers of log files. This flag raises the soft limit to
+    /// prevent "Too many open files" errors without requiring manual sysadmin intervention.
+    #[cfg(unix)]
+    #[arg(long, env = "VECTOR_RAISE_FD_LIMIT", default_value = "false")]
+    pub raise_fd_limit: bool,
 }
 
 impl RootOpts {
     /// Return a list of config paths with the associated formats.
+    #[must_use]
     pub fn config_paths_with_formats(&self) -> Vec<config::ConfigPath> {
         config::merge_path_lists(vec![
             (&self.config_paths, None),
@@ -226,17 +327,105 @@ impl RootOpts {
         .chain(
             self.config_dirs
                 .iter()
-                .map(|dir| config::ConfigPath::Dir(dir.to_path_buf())),
+                .map(|dir| config::ConfigPath::Dir(dir.clone())),
         )
         .collect()
     }
 
+    /// # Panics
+    /// Panics if global metrics initialization fails.
     pub fn init_global(&self) {
         if !self.openssl_no_probe {
-            openssl_probe::init_ssl_cert_env_vars();
+            // SAFETY: Initialization runs before worker threads start.
+            unsafe {
+                openssl_probe::init_openssl_env_vars();
+            }
         }
 
         crate::metrics::init_global().expect("metrics initialization failed");
+    }
+}
+
+/// Raise the soft file descriptor limit (`RLIMIT_NOFILE`) as high as the OS allows.
+///
+/// Many systems default the soft limit to 1024 (Linux) or 256 (macOS), which is too low
+/// for Vector when it monitors large numbers of log files. Raising it prevents
+/// "Too many open files (os error 24)" errors without requiring manual sysadmin intervention.
+///
+/// On Linux, the soft limit is raised to the hard limit (typically 65536+).
+/// On macOS, the hard limit can be `RLIM_INFINITY`, so we first try the hard limit,
+/// then fall back to the kernel-enforced `kern.maxfilesperproc` (typically 10240).
+#[cfg(unix)]
+pub(crate) fn raise_file_descriptor_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    use tracing::{info, warn};
+
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(limits) => limits,
+        Err(err) => {
+            warn!(message = "Failed to get file descriptor limit.", %err);
+            return;
+        }
+    };
+
+    if soft >= hard {
+        return; // Already at maximum
+    }
+
+    // Try setting soft limit to hard limit (works on Linux, may fail on macOS)
+    if setrlimit(Resource::RLIMIT_NOFILE, hard, hard).is_ok() {
+        info!(
+            message = "Raised file descriptor limit.",
+            from = soft,
+            to = hard,
+        );
+        return;
+    }
+
+    // On macOS, the hard limit can be RLIM_INFINITY which setrlimit rejects.
+    // Fall back to the kernel-enforced kern.maxfilesperproc.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(maxfiles) = macos_maxfilesperproc()
+            && maxfiles > soft
+            && setrlimit(Resource::RLIMIT_NOFILE, maxfiles, hard).is_ok()
+        {
+            info!(
+                message = "Raised file descriptor limit.",
+                from = soft,
+                to = maxfiles,
+            );
+            return;
+        }
+    }
+
+    warn!(
+        message = "Failed to raise file descriptor limit.",
+        current = soft,
+        attempted = hard,
+    );
+}
+
+/// Query the macOS kernel limit on per-process open files.
+#[cfg(target_os = "macos")]
+fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
+    let mut maxfiles: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::size_t;
+    // Safety: sysctlbyname with a valid null-terminated name and correctly sized output buffer.
+    // No safe wrapper exists for this macOS-specific call.
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&raw mut maxfiles).cast::<libc::c_void>(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret == 0 && maxfiles > 0 {
+        libc::rlim_t::try_from(maxfiles).ok()
+    } else {
+        None
     }
 }
 
@@ -259,15 +448,17 @@ pub enum SubCommand {
 
     /// Generate the configuration schema for this version of Vector. (experimental)
     ///
-    /// A JSON Schema document will be written to stdout that represents the valid schema for a
+    /// A JSON Schema document will be generated that represents the valid schema for a
     /// Vector configuration. This schema is based on the "full" configuration, such that for usages
     /// where a configuration is split into multiple files, the schema would apply to those files
     /// only when concatenated together.
-    GenerateSchema,
+    ///
+    /// By default all output is written to stdout. The `output_path` option can be used to redirect to a file.
+    GenerateSchema(generate_schema::Opts),
 
-    /// Output a provided Vector configuration file/dir as a single JSON object, useful for checking in to version control.
+    /// Generate shell completion, then exit.
     #[command(hide = true)]
-    Config(config::Opts),
+    Completion(completion::Opts),
 
     /// List available components, then exit.
     List(list::Opts),
@@ -276,11 +467,11 @@ pub enum SubCommand {
     /// For guidance on how to write unit tests check out <https://vector.dev/guides/level-up/unit-testing/>.
     Test(unit_test::Opts),
 
-    /// Output the topology as visual representation using the DOT language which can be rendered by GraphViz
+    /// Output the topology as visual representation using the DOT language which can be rendered by Graphviz
     Graph(graph::Opts),
 
     /// Display topology and metrics in the console, for a local or remote Vector instance
-    #[cfg(feature = "api-client")]
+    #[cfg(feature = "top")]
     Top(top::Opts),
 
     /// Observe output log events from source or transform components. Logs are sampled at a specified interval.
@@ -296,16 +487,34 @@ pub enum SubCommand {
 }
 
 impl SubCommand {
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "the #[cfg(windows)] arm calls a non-const method"
+    )]
+    #[must_use]
+    pub fn dangerously_allow_env_var_interpolation(&self) -> bool {
+        match self {
+            Self::Graph(g) => g.dangerously_allow_env_var_interpolation,
+            Self::Test(t) => t.dangerously_allow_env_var_interpolation,
+            Self::Validate(v) => v.dangerously_allow_env_var_interpolation,
+            #[cfg(windows)]
+            Self::Service(s) => s.dangerously_allow_env_var_interpolation(),
+            _ => false,
+        }
+    }
+
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(clippy::large_futures, reason = "Boxing needs profiling")]
     pub async fn execute(
         &self,
         mut signals: signal::SignalPair,
         color: bool,
     ) -> exitcode::ExitCode {
         match self {
-            Self::Config(c) => config::cmd(c),
+            Self::Completion(s) => completion::cmd(s),
             Self::ConvertConfig(opts) => convert_config::cmd(opts),
             Self::Generate(g) => generate::cmd(g),
-            Self::GenerateSchema => generate_schema::cmd(),
+            Self::GenerateSchema(opts) => generate_schema::cmd(opts),
             Self::Graph(g) => graph::cmd(g),
             Self::List(l) => list::cmd(l),
             #[cfg(windows)]
@@ -313,14 +522,10 @@ impl SubCommand {
             #[cfg(feature = "api-client")]
             Self::Tap(t) => tap::cmd(t, signals.receiver).await,
             Self::Test(t) => unit_test::cmd(t, &mut signals.handler).await,
-            #[cfg(feature = "api-client")]
+            #[cfg(feature = "top")]
             Self::Top(t) => top::cmd(t).await,
-            Self::Validate(v) => validate::validate(v, color).await,
-            Self::Vrl(s) => {
-                let mut functions = vrl::stdlib::all();
-                functions.extend(vector_vrl_functions::all());
-                vrl::cli::cmd::cmd(s, functions)
-            }
+            Self::Validate(v) => validate::validate(v, &mut signals.handler, color).await,
+            Self::Vrl(s) => vrl::cli::cmd::cmd(s, vector_vrl_functions::all()),
         }
     }
 }
@@ -333,6 +538,11 @@ pub enum Color {
 }
 
 impl Color {
+    #[cfg_attr(
+        windows,
+        expect(clippy::missing_const_for_fn, reason = "Unix checks the terminal")
+    )]
+    #[must_use]
     pub fn use_color(&self) -> bool {
         match self {
             #[cfg(unix)]
@@ -354,10 +564,106 @@ pub enum LogFormat {
     Json,
 }
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchConfigMethod {
+    /// Recommended watcher for the current OS, usually `inotify` for Linux-based systems.
+    Recommended,
+    /// Poll-based watcher, typically used for watching files on EFS/NFS-like network storage systems.
+    /// The interval is determined by  [`RootOpts::watch_config_poll_interval_seconds`].
+    Poll,
+}
+
 pub fn handle_config_errors(errors: Vec<String>) -> exitcode::ExitCode {
     for error in errors {
-        error!(message = "Configuration error.", %error);
+        error!(message = "Configuration error.", %error, internal_log_rate_limit = false);
     }
 
     exitcode::CONFIG
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    #[cfg(unix)]
+    fn run_in_subprocess(test_name: &str) {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .env("__VECTOR_SUBPROCESS_TEST", "1")
+            .args(["--exact", test_name, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "subprocess test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_raise_file_descriptor_limit() {
+        if std::env::var("__VECTOR_SUBPROCESS_TEST").is_err() {
+            run_in_subprocess("cli::tests::test_raise_file_descriptor_limit");
+            return;
+        }
+
+        let (original_soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        let lowered = std::cmp::min(original_soft, 256);
+        if lowered < hard {
+            setrlimit(Resource::RLIMIT_NOFILE, lowered, hard).unwrap();
+
+            let (soft_before, _) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+            assert_eq!(soft_before, lowered);
+
+            super::raise_file_descriptor_limit();
+
+            let (soft_after, _) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+            assert!(
+                soft_after > lowered,
+                "Expected soft limit to be raised above {lowered}, got {soft_after}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_raise_file_descriptor_limit_already_at_max() {
+        if std::env::var("__VECTOR_SUBPROCESS_TEST").is_err() {
+            run_in_subprocess("cli::tests::test_raise_file_descriptor_limit_already_at_max");
+            return;
+        }
+
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+
+        if setrlimit(Resource::RLIMIT_NOFILE, hard, hard).is_err() {
+            #[cfg(target_os = "macos")]
+            if let Some(maxfiles) = super::macos_maxfilesperproc() {
+                setrlimit(Resource::RLIMIT_NOFILE, maxfiles, hard).ok();
+            }
+        }
+
+        let (soft_before, _) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+
+        super::raise_file_descriptor_limit();
+
+        let (soft_after, _) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        assert_eq!(soft_before, soft_after);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_maxfilesperproc_returns_positive() {
+        let result = super::macos_maxfilesperproc();
+        assert!(
+            result.is_some(),
+            "macos_maxfilesperproc() should return Some on macOS"
+        );
+        assert!(
+            result.unwrap() > 0,
+            "kern.maxfilesperproc should be positive"
+        );
+    }
 }

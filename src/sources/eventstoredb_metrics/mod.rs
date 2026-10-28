@@ -2,15 +2,16 @@ use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
 use http::Uri;
+use http_body::Collected;
 use hyper::{Body, Request};
 use serde_with::serde_as;
 use tokio_stream::wrappers::IntervalStream;
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol,
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    config::LogNamespace,
+    configurable::configurable_component,
+    internal_event::{ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol},
 };
-use vector_lib::EstimatedJsonEncodedSizeOf;
 
 use self::types::Stats;
 use crate::{
@@ -55,6 +56,7 @@ const fn default_scrape_interval_secs() -> Duration {
     Duration::from_secs(15)
 }
 
+#[must_use]
 pub fn default_endpoint() -> String {
     "https://localhost:2113/stats".to_string()
 }
@@ -66,7 +68,7 @@ impl_generate_config_from_default!(EventStoreDbConfig);
 impl SourceConfig for EventStoreDbConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         eventstoredb(
-            self.endpoint.clone(),
+            &self.endpoint,
             self.scrape_interval_secs,
             self.default_namespace.clone(),
             cx,
@@ -83,15 +85,15 @@ impl SourceConfig for EventStoreDbConfig {
 }
 
 fn eventstoredb(
-    endpoint: String,
+    endpoint: &str,
     interval: Duration,
     namespace: Option<String>,
     mut cx: SourceContext,
 ) -> crate::Result<super::Source> {
     let mut ticks = IntervalStream::new(tokio::time::interval(interval)).take_until(cx.shutdown);
-    let tls_settings = TlsSettings::from_options(&None)?;
+    let tls_settings = TlsSettings::from_options(None)?;
     let client = HttpClient::new(tls_settings, &cx.proxy)?;
-    let url: Uri = endpoint.as_str().parse()?;
+    let url: Uri = endpoint.parse()?;
 
     let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
     let events_received = register!(EventsReceived);
@@ -109,11 +111,13 @@ fn eventstoredb(
                         emit!(EventStoreDbMetricsHttpError {
                             error: error.into(),
                         });
-                        continue;
                     }
 
                     Ok(resp) => {
-                        let bytes = match hyper::body::to_bytes(resp.into_body()).await {
+                        let bytes = match http_body::Body::collect(resp.into_body())
+                            .await
+                            .map(Collected::to_bytes)
+                        {
                             Ok(b) => b,
                             Err(error) => {
                                 emit!(EventStoreDbMetricsHttpError {
@@ -127,7 +131,6 @@ fn eventstoredb(
                         match serde_json::from_slice::<Stats>(bytes.as_ref()) {
                             Err(error) => {
                                 emit!(EventStoreDbStatsParsingError { error });
-                                continue;
                             }
 
                             Ok(stats) => {
@@ -157,7 +160,7 @@ mod integration_tests {
     use tokio::time::Duration;
 
     use super::*;
-    use crate::test_util::components::{run_and_assert_source_compliance, SOURCE_TAGS};
+    use crate::test_util::components::{SOURCE_TAGS, run_and_assert_source_compliance};
 
     const EVENTSTOREDB_SCRAPE_ADDRESS: &str = "http://eventstoredb:2113/stats";
 

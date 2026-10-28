@@ -6,15 +6,15 @@ use derivative::Derivative;
 use influxdb_line_protocol::{FieldValue, ParsedLine};
 use smallvec::SmallVec;
 use vector_config::configurable_component;
-use vector_core::config::LogNamespace;
-use vector_core::event::{Event, Metric, MetricKind, MetricTags, MetricValue};
-use vector_core::{config::DataType, schema};
-use vrl::value::kind::Collection;
-use vrl::value::Kind;
-
-use crate::decoding::format::default_lossy;
+use vector_core::{
+    config::{DataType, LogNamespace},
+    event::{Event, Metric, MetricKind, MetricTags, MetricValue},
+    schema,
+};
+use vrl::value::{Kind, kind::Collection};
 
 use super::Deserializer;
+use crate::decoding::format::default_lossy;
 
 /// Config used to build a `InfluxdbDeserializer`.
 /// - [InfluxDB Line Protocol](https://docs.influxdata.com/influxdb/v1/write_protocols/line_protocol_tutorial/):
@@ -27,22 +27,26 @@ pub struct InfluxdbDeserializerConfig {
 }
 
 impl InfluxdbDeserializerConfig {
-    /// new constructs a new InfluxdbDeserializerConfig
+    /// new constructs a new `InfluxdbDeserializerConfig`
+    #[must_use]
     pub fn new(options: InfluxdbDeserializerOptions) -> Self {
         Self { influxdb: options }
     }
 
-    /// build constructs a new InfluxdbDeserializer
+    /// build constructs a new `InfluxdbDeserializer`
+    #[must_use]
     pub fn build(&self) -> InfluxdbDeserializer {
         Into::<InfluxdbDeserializer>::into(self)
     }
 
     /// The output type produced by the deserializer.
+    #[must_use]
     pub fn output_type(&self) -> DataType {
         DataType::Metric
     }
 
     /// The schema produced by the deserializer.
+    #[must_use]
     pub fn schema_definition(&self, log_namespace: LogNamespace) -> schema::Definition {
         schema::Definition::new_with_default_metadata(
             Kind::object(Collection::empty()),
@@ -56,7 +60,7 @@ impl InfluxdbDeserializerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct InfluxdbDeserializerOptions {
-    /// Determines whether or not to replace invalid UTF-8 sequences instead of failing.
+    /// Determines whether to replace invalid UTF-8 sequences instead of failing.
     ///
     /// When true, invalid UTF-8 sequences are replaced with the [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
     ///
@@ -78,21 +82,28 @@ pub struct InfluxdbDeserializer {
 }
 
 impl InfluxdbDeserializer {
-    /// new constructs a new InfluxdbDeserializer
+    /// new constructs a new `InfluxdbDeserializer`
+    #[must_use]
     pub fn new(lossy: bool) -> Self {
         Self { lossy }
     }
 }
 
 impl Deserializer for InfluxdbDeserializer {
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Preserve the existing floating-point representation of numeric values."
+    )]
     fn parse(
         &self,
         bytes: Bytes,
         _log_namespace: LogNamespace,
     ) -> vector_common::Result<SmallVec<[Event; 1]>> {
-        let line: Cow<str> = match self.lossy {
-            true => String::from_utf8_lossy(&bytes),
-            false => Cow::from(std::str::from_utf8(&bytes)?),
+        let line: Cow<str> = if self.lossy {
+            String::from_utf8_lossy(&bytes)
+        } else {
+            Cow::from(std::str::from_utf8(&bytes)?)
         };
         let parsed_line = influxdb_line_protocol::parse_lines(&line);
 
@@ -126,14 +137,14 @@ impl Deserializer for InfluxdbDeserializer {
                         };
                         Some(Event::Metric(
                             Metric::new(
-                                format!("{0}_{1}", measurement, f.0),
+                                format!("{measurement}_{}", f.0),
                                 MetricKind::Absolute,
                                 MetricValue::Gauge { value: val },
                             )
                             .with_tags(tags.map(|ts| {
-                                MetricTags::from_iter(
-                                    ts.iter().map(|t| (t.0.to_string(), t.1.to_string())),
-                                )
+                                ts.iter()
+                                    .map(|t| (t.0.to_string(), t.1.to_string()))
+                                    .collect::<MetricTags>()
                             }))
                             .with_timestamp(timestamp.map(DateTime::from_timestamp_nanos)),
                         ))
