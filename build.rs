@@ -136,7 +136,9 @@ fn main() {
 
     #[cfg(feature = "protobuf-build")]
     {
-        println!("cargo:rerun-if-changed=proto/third-party/google/cloud/bigquery/storage/v1/storage.proto");
+        println!(
+            "cargo:rerun-if-changed=proto/third-party/google/cloud/bigquery/storage/v1/storage.proto"
+        );
         println!("cargo:rerun-if-changed=proto/third-party/google/pubsub/v1/pubsub.proto");
         println!("cargo:rerun-if-changed=proto/third-party/google/rpc/status.proto");
         println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
@@ -173,6 +175,7 @@ fn main() {
                     "proto/third-party",
                     "proto/vector",
                     "lib/vector-core/proto/",
+                    "proto",
                 ],
             )
             .unwrap();
