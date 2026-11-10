@@ -8,7 +8,7 @@ use vector_core::sink::VectorSink;
 
 use crate::config::SinkConfig;
 use crate::sinks::gcp::bigquery::BigqueryConfig;
-use crate::test_util::components::{run_and_assert_sink_compliance, SINK_TAGS};
+use crate::test_util::components::{SINK_TAGS, run_and_assert_sink_compliance};
 use crate::test_util::{generate_events_with_stream, random_string, trace_init};
 
 /// An event generator that can be used with `generate_events_with_stream`
