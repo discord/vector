@@ -1,5 +1,5 @@
 use futures::FutureExt;
-use http::Uri;
+use http_1::Uri;
 use indoc::indoc;
 use tonic::transport::Channel;
 use vector_lib::codecs::encoding::ProtobufSerializerConfig;
