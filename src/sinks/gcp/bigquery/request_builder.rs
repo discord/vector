@@ -1,63 +1,167 @@
-use bytes::BytesMut;
-use prost::Message;
+use crate::codecs::encoding::ProtobufSerializer;
+use bytes::{Bytes, BytesMut};
+use prost::{Message, encoding::encoded_len_varint};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use tokio_util::codec::Encoder;
-use vector_lib::codecs::encoding::ProtobufSerializer;
-use vector_lib::event::Finalizable;
+use vector_lib::config;
+use vector_lib::event::{EventStatus, Finalizable};
+use vector_lib::internal_event::{ComponentEventsDropped, UNINTENTIONAL};
 use vector_lib::request_metadata::RequestMetadata;
 
-use super::proto::third_party::google::cloud::bigquery::storage::v1 as proto;
+use super::proto::google::cloud::bigquery::storage::v1 as proto;
 use super::service::BigqueryRequest;
 use crate::event::{Event, EventFinalizers};
 use crate::sinks::util::IncrementalRequestBuilder;
 use crate::sinks::util::metadata::RequestMetadataBuilder;
 
-// 10MB maximum message size:
+// 10MB maximum request size:
 // https://cloud.google.com/bigquery/docs/reference/storage/rpc/google.cloud.bigquery.storage.v1#appendrowsrequest
-pub const MAX_BATCH_PAYLOAD_SIZE: usize = 10_000_000;
+pub(super) const MAX_BATCH_PAYLOAD_SIZE: usize = 10_000_000;
+
+// This buffer is subtracted from the row length budget to account for varint growth in nested message
+// length prefixes. As rows fill up to 10MB, the size of the varint required to encode the length
+// grows to 4 bytes (up from 1). The same growth occurs one level up, in ProtoData.
+const LENGTH_PREFIX_BUFFER: usize = 6;
 
 #[derive(Debug, snafu::Snafu)]
-pub enum BigqueryRequestBuilderError {
+pub(super) enum BigqueryRequestBuilderError {
     #[snafu(display("Encoding protobuf failed: {}", message))]
-    ProtobufEncoding { message: String }, // `error` needs to be some concrete type
+    ProtobufEncoding { message: String },
+    #[snafu(display(
+        "Protobuf message `{}` references `{}` which is an external type.",
+        root,
+        type_name
+    ))]
+    ExternalTypeReference { root: String, type_name: String },
+    #[snafu(display("Protobuf message `{}` is not defined with proto2 syntax.", root))]
+    UnsupportedSyntax { root: String },
 }
 
-impl From<vector_lib::Error> for BigqueryRequestBuilderError {
-    fn from(error: vector_lib::Error) -> Self {
+/// Returns the first referenced type that isn't self-contained.
+fn find_external_type_reference(
+    descriptor: &prost_types::DescriptorProto,
+    root_full_name: &str,
+) -> Option<String> {
+    let root = format!(".{root_full_name}");
+    let nested_prefix = format!("{root}.");
+    let mut pending = vec![descriptor];
+    while let Some(message) = pending.pop() {
+        for field in &message.field {
+            let type_name = field.type_name();
+            if !type_name.is_empty() && type_name != root && !type_name.starts_with(&nested_prefix)
+            {
+                return Some(type_name.trim_start_matches('.').to_owned());
+            }
+        }
+        pending.extend(&message.nested_type);
+    }
+    None
+}
+
+impl From<vector_common::Error> for BigqueryRequestBuilderError {
+    fn from(error: vector_common::Error) -> Self {
         BigqueryRequestBuilderError::ProtobufEncoding {
-            message: format!("{:?}", error),
+            message: format!("{error}"),
         }
     }
 }
 
 #[derive(Default)]
-pub struct BigqueryRequestMetadata {
+pub(super) struct BigqueryRequestMetadata {
     request_metadata: RequestMetadata,
     finalizers: EventFinalizers,
 }
 
-pub struct BigqueryRequestBuilder {
-    pub protobuf_serializer: ProtobufSerializer,
-    pub write_stream: String,
+pub(super) struct BigqueryRequestBuilder {
+    protobuf_serializer: ProtobufSerializer,
+    write_stream: String,
+    // Cached schema for inclusion in every AppendRowsRequest.
+    proto_schema: proto::ProtoSchema,
+    // Encoded size of a full AppendRowsRequest with no rows, used to compute batch size limits.
+    request_overhead: usize,
 }
 
 impl BigqueryRequestBuilder {
+    pub(super) fn new(
+        protobuf_serializer: ProtobufSerializer,
+        write_stream: String,
+    ) -> Result<Self, BigqueryRequestBuilderError> {
+        let descriptor_proto = protobuf_serializer.descriptor_proto().clone();
+        let root_full_name = protobuf_serializer.message_full_name();
+
+        // The Storage Write API expects rows with proto2 semantics, especially for default values.
+        if protobuf_serializer.syntax() != prost_reflect::Syntax::Proto2 {
+            return Err(BigqueryRequestBuilderError::UnsupportedSyntax {
+                root: root_full_name.to_owned(),
+            });
+        }
+
+        // BigQuery only receives the root message's `DescriptorProto`, so it must be self-contained.
+        if let Some(type_name) = find_external_type_reference(&descriptor_proto, root_full_name) {
+            return Err(BigqueryRequestBuilderError::ExternalTypeReference {
+                root: root_full_name.to_owned(),
+                type_name,
+            });
+        }
+        let proto_schema = proto::ProtoSchema {
+            proto_descriptor: Some(descriptor_proto),
+        };
+        let request_overhead = proto::AppendRowsRequest {
+            write_stream: write_stream.clone(),
+            offset: None,
+            trace_id: String::new(),
+            missing_value_interpretations: BTreeMap::new(),
+            default_missing_value_interpretation: 0,
+            rows: Some(proto::append_rows_request::Rows::ProtoRows(
+                proto::append_rows_request::ProtoData {
+                    writer_schema: Some(proto_schema.clone()),
+                    rows: Some(proto::ProtoRows {
+                        serialized_rows: vec![],
+                    }),
+                },
+            )),
+        }
+        .encoded_len();
+
+        if request_overhead.saturating_add(LENGTH_PREFIX_BUFFER) >= MAX_BATCH_PAYLOAD_SIZE {
+            // This could only really happen if the proto schema is extremely large.
+            // Unlikely to be a problem in the real world but it's better to be defensive.
+            return Err(BigqueryRequestBuilderError::ProtobufEncoding {
+                message: format!("Request overhead ({request_overhead} bytes) is too large"),
+            });
+        }
+
+        Ok(Self {
+            protobuf_serializer,
+            write_stream,
+            proto_schema,
+            request_overhead,
+        })
+    }
+
     fn build_proto_data(
         &self,
-        serialized_rows: Vec<Vec<u8>>,
+        serialized_rows: Vec<Bytes>,
     ) -> (NonZeroUsize, proto::append_rows_request::ProtoData) {
         let proto_data = proto::append_rows_request::ProtoData {
-            writer_schema: Some(proto::ProtoSchema {
-                proto_descriptor: Some(translate_descriptor_proto(
-                    self.protobuf_serializer.descriptor_proto().clone(),
-                )),
-            }),
+            writer_schema: Some(self.proto_schema.clone()),
             rows: Some(proto::ProtoRows { serialized_rows }),
         };
         let size = NonZeroUsize::new(proto_data.encoded_len())
             .expect("encoded payload can never be empty");
         (size, proto_data)
     }
+}
+
+fn empty_chunk_metadata() -> RequestMetadataBuilder {
+    RequestMetadataBuilder::new(0, 0, config::telemetry().create_request_count_byte_size())
+}
+
+/// Marks an event as rejected so acknowledging sources don't treat it as delivered.
+fn reject_event(finalizers: &EventFinalizers, reason: &'static str) {
+    finalizers.update_status(EventStatus::Rejected);
+    emit!(ComponentEventsDropped::<UNINTENTIONAL> { count: 1, reason });
 }
 
 impl IncrementalRequestBuilder<Vec<Event>> for BigqueryRequestBuilder {
@@ -70,61 +174,81 @@ impl IncrementalRequestBuilder<Vec<Event>> for BigqueryRequestBuilder {
         &mut self,
         input: Vec<Event>,
     ) -> Vec<Result<(Self::Metadata, Self::Payload), Self::Error>> {
-        let base_proto_data_size: NonZeroUsize = self.build_proto_data(vec![]).0;
-        let max_serialized_rows_len: usize = MAX_BATCH_PAYLOAD_SIZE - base_proto_data_size.get();
-        let metadata = RequestMetadataBuilder::from_events(&input);
-        let mut errors: Vec<Self::Error> = vec![];
-        let mut bodies: Vec<(EventFinalizers, (NonZeroUsize, Self::Payload))> = vec![];
+        let max_serialized_rows_len =
+            MAX_BATCH_PAYLOAD_SIZE - self.request_overhead - LENGTH_PREFIX_BUFFER;
+        let mut results = vec![];
         let mut event_finalizers = EventFinalizers::DEFAULT;
-        let mut serialized_rows: Vec<Vec<u8>> = vec![];
-        let mut serialized_rows_len: usize = 0;
-        for mut event in input.into_iter() {
-            let current_event_finalizers = event.take_finalizers();
+        let mut chunk_metadata = empty_chunk_metadata();
+
+        let mut serialized_rows: Vec<Bytes> = vec![];
+        let mut serialized_rows_len = 0;
+        for mut event in input {
+            let finalizers = event.take_finalizers();
+            let event_metadata = RequestMetadataBuilder::from_event(&event);
             let mut bytes = BytesMut::new();
             if let Err(e) = self.protobuf_serializer.encode(event, &mut bytes) {
-                errors.push(BigqueryRequestBuilderError::ProtobufEncoding {
-                    message: format!("{:?}", e),
-                });
-            } else {
-                if bytes.len() + serialized_rows_len > max_serialized_rows_len {
-                    // there's going to be too many events to send in one body;
-                    // flush the current events and start a new body
-                    bodies.push((event_finalizers, self.build_proto_data(serialized_rows)));
-                    event_finalizers = EventFinalizers::DEFAULT;
-                    serialized_rows = vec![];
-                    serialized_rows_len = 0;
-                }
-                event_finalizers.merge(current_event_finalizers);
-                serialized_rows_len += bytes.len();
-                serialized_rows.push(bytes.into());
+                reject_event(&finalizers, "Failed to encode event.");
+                results.push(Err(BigqueryRequestBuilderError::ProtobufEncoding {
+                    message: format!("{e}"),
+                }));
+                continue;
             }
-        }
-        // flush the final body (if there are any events left)
-        if !serialized_rows.is_empty() {
-            bodies.push((event_finalizers, self.build_proto_data(serialized_rows)));
-        }
-        // throw everything together into the expected IncrementalRequestBuilder return type
-        bodies
-            .into_iter()
-            .map(|(event_finalizers, (size, proto_data))| {
-                Ok((
+
+            // Each row in ProtoRows.serialized_rows (field 1, wire type 2) is encoded as
+            // 1 byte tag + varint(len) bytes + payload bytes.
+            let row_framed_size = bytes.len() + 1 + encoded_len_varint(bytes.len() as u64);
+            if row_framed_size > max_serialized_rows_len {
+                // A single event that exceeds the limit cannot be sent in any request, reject it immediately.
+                reject_event(&finalizers, "Event is too large to send.");
+                results.push(Err(BigqueryRequestBuilderError::ProtobufEncoding {
+                    message: format!(
+                        "Event ({row_framed_size} bytes including proto framing) exceeds the maximum allowed serialized rows size ({max_serialized_rows_len} bytes).",
+                    ),
+                }));
+                continue;
+            }
+
+            if row_framed_size + serialized_rows_len > max_serialized_rows_len {
+                // Adding this event would overflow the current chunk so flush it first.
+                let (size, proto_data) = self.build_proto_data(serialized_rows);
+                results.push(Ok((
                     BigqueryRequestMetadata {
                         finalizers: event_finalizers,
-                        request_metadata: metadata.with_request_size(size),
+                        request_metadata: chunk_metadata.with_request_size(size),
                     },
                     proto_data,
-                ))
-            })
-            .chain(errors.into_iter().map(Err))
-            .collect()
+                )));
+                event_finalizers = EventFinalizers::DEFAULT;
+                chunk_metadata = empty_chunk_metadata();
+                serialized_rows_len = 0;
+                serialized_rows = vec![];
+            }
+            chunk_metadata.merge(event_metadata);
+            event_finalizers.merge(finalizers);
+            serialized_rows_len += row_framed_size;
+            serialized_rows.push(bytes.freeze());
+        }
+
+        // flush the final chunk if there are any events left.
+        if !serialized_rows.is_empty() {
+            let (size, proto_data) = self.build_proto_data(serialized_rows);
+            results.push(Ok((
+                BigqueryRequestMetadata {
+                    finalizers: event_finalizers,
+                    request_metadata: chunk_metadata.with_request_size(size),
+                },
+                proto_data,
+            )));
+        }
+        results
     }
 
     fn build_request(&mut self, metadata: Self::Metadata, payload: Self::Payload) -> Self::Request {
         let request = proto::AppendRowsRequest {
             write_stream: self.write_stream.clone(),
             offset: None, // not supported by _default stream
-            trace_id: Default::default(),
-            missing_value_interpretations: Default::default(),
+            trace_id: String::new(),
+            missing_value_interpretations: BTreeMap::new(),
             default_missing_value_interpretation: 0,
             rows: Some(proto::append_rows_request::Rows::ProtoRows(payload)),
         };
@@ -138,210 +262,99 @@ impl IncrementalRequestBuilder<Vec<Event>> for BigqueryRequestBuilder {
     }
 }
 
-/// Convert from `prost_reflect::prost_types::DescriptorProto` to `prost_types::DescriptorProto`
-///
-/// Someone upgraded `prost_reflect` without upgrading the other prost crates,
-/// so the `prost_types` version used by `prost_reflect` is newer than the version used by vector.
-///
-/// This function discards any `UninterpretedOption`s.
-///
-/// "Why don't you just upgrade `prost_types` to match the version used by `prost_reflect`?
-/// Ha. Hahaha. Hahahahahahaha. My branches are littered with the corpses of such attempts.
-fn translate_descriptor_proto(
-    old_descriptor: prost_reflect::prost_types::DescriptorProto,
-) -> prost_types::DescriptorProto {
-    prost_types::DescriptorProto {
-        name: old_descriptor.name,
-        field: old_descriptor
-            .field
-            .into_iter()
-            .map(|field| prost_types::FieldDescriptorProto {
-                name: field.name,
-                number: field.number,
-                label: field.label,
-                r#type: field.r#type,
-                type_name: field.type_name,
-                extendee: field.extendee,
-                default_value: field.default_value,
-                oneof_index: field.oneof_index,
-                json_name: field.json_name,
-                options: field.options.map(|options| prost_types::FieldOptions {
-                    ctype: options.ctype,
-                    packed: options.packed,
-                    jstype: options.jstype,
-                    lazy: options.lazy,
-                    deprecated: options.deprecated,
-                    weak: options.weak,
-                    uninterpreted_option: Default::default(),
-                }),
-                proto3_optional: field.proto3_optional,
-            })
-            .collect(),
-        extension: old_descriptor
-            .extension
-            .into_iter()
-            .map(|field| prost_types::FieldDescriptorProto {
-                name: field.name,
-                number: field.number,
-                label: field.label,
-                r#type: field.r#type,
-                type_name: field.type_name,
-                extendee: field.extendee,
-                default_value: field.default_value,
-                oneof_index: field.oneof_index,
-                json_name: field.json_name,
-                options: field.options.map(|options| prost_types::FieldOptions {
-                    ctype: options.ctype,
-                    packed: options.packed,
-                    jstype: options.jstype,
-                    lazy: options.lazy,
-                    deprecated: options.deprecated,
-                    weak: options.weak,
-                    uninterpreted_option: Default::default(),
-                }),
-                proto3_optional: field.proto3_optional,
-            })
-            .collect(),
-        nested_type: old_descriptor
-            .nested_type
-            .into_iter()
-            .map(translate_descriptor_proto)
-            .collect(),
-        enum_type: old_descriptor
-            .enum_type
-            .into_iter()
-            .map(|enum_descriptor| prost_types::EnumDescriptorProto {
-                name: enum_descriptor.name,
-                value: enum_descriptor
-                    .value
-                    .into_iter()
-                    .map(|value| prost_types::EnumValueDescriptorProto {
-                        name: value.name,
-                        number: value.number,
-                        options: value.options.map(|options| prost_types::EnumValueOptions {
-                            deprecated: options.deprecated,
-                            uninterpreted_option: Default::default(),
-                        }),
-                    })
-                    .collect(),
-                options: enum_descriptor
-                    .options
-                    .map(|options| prost_types::EnumOptions {
-                        allow_alias: options.allow_alias,
-                        deprecated: options.deprecated,
-                        uninterpreted_option: Default::default(),
-                    }),
-                reserved_range: enum_descriptor
-                    .reserved_range
-                    .into_iter()
-                    .map(
-                        |reserved_range| prost_types::enum_descriptor_proto::EnumReservedRange {
-                            start: reserved_range.start,
-                            end: reserved_range.end,
-                        },
-                    )
-                    .collect(),
-                reserved_name: enum_descriptor.reserved_name,
-            })
-            .collect(),
-        extension_range: old_descriptor
-            .extension_range
-            .into_iter()
-            .map(
-                |extension_range| prost_types::descriptor_proto::ExtensionRange {
-                    start: extension_range.start,
-                    end: extension_range.end,
-                    options: extension_range
-                        .options
-                        .map(|_| prost_types::ExtensionRangeOptions {
-                            uninterpreted_option: Default::default(),
-                        }),
-                },
-            )
-            .collect(),
-        oneof_decl: old_descriptor
-            .oneof_decl
-            .into_iter()
-            .map(|oneof| prost_types::OneofDescriptorProto {
-                name: oneof.name,
-                options: oneof.options.map(|_| prost_types::OneofOptions {
-                    uninterpreted_option: Default::default(),
-                }),
-            })
-            .collect(),
-        options: old_descriptor
-            .options
-            .map(|options| prost_types::MessageOptions {
-                message_set_wire_format: options.message_set_wire_format,
-                no_standard_descriptor_accessor: options.no_standard_descriptor_accessor,
-                deprecated: options.deprecated,
-                map_entry: options.map_entry,
-                uninterpreted_option: Default::default(),
-            }),
-        reserved_range: old_descriptor
-            .reserved_range
-            .into_iter()
-            .map(
-                |reserved_range| prost_types::descriptor_proto::ReservedRange {
-                    start: reserved_range.start,
-                    end: reserved_range.end,
-                },
-            )
-            .collect(),
-        reserved_name: old_descriptor.reserved_name,
-    }
-}
-
 #[cfg(test)]
 mod test {
+    use crate::codecs::encoding::{ProtobufSerializerConfig, ProtobufSerializerOptions};
+    use crate::event::{Event, EventMetadata, LogEvent, Value};
     use bytes::{BufMut, Bytes, BytesMut};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use vector_lib::codecs::encoding::{ProtobufSerializerConfig, ProtobufSerializerOptions};
-    use vector_lib::event::{Event, EventMetadata, LogEvent, Value};
 
-    use super::BigqueryRequestBuilder;
+    use super::{BigqueryRequestBuilder, MAX_BATCH_PAYLOAD_SIZE};
     use crate::sinks::util::IncrementalRequestBuilder;
 
-    #[test]
-    fn encode_events_incremental() {
-        // build the request builder
+    const OVERSIZED_PAYLOAD: &[u8] = &[0u8; MAX_BATCH_PAYLOAD_SIZE];
+
+    fn make_oversized_event() -> Event {
+        Event::Log(LogEvent::from_parts(
+            Value::Object(BTreeMap::from([(
+                "email".into(),
+                Value::Bytes(Bytes::from_static(OVERSIZED_PAYLOAD)),
+            )])),
+            EventMetadata::default(),
+        ))
+    }
+
+    fn make_request_builder() -> BigqueryRequestBuilder {
         let desc_file = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
-            .join("lib/codecs/tests/data/protobuf/test.desc");
+            .join("lib/codecs/tests/data/protobuf/protos/test_protobuf.desc");
         let protobuf_serializer = ProtobufSerializerConfig {
             protobuf: ProtobufSerializerOptions {
                 desc_file,
-                message_type: "test.Bytes".into(),
+                message_type: "test_protobuf.Person".into(),
                 use_json_names: false,
             },
         }
         .build()
         .unwrap();
-        let mut request_builder = BigqueryRequestBuilder {
+        BigqueryRequestBuilder::new(
             protobuf_serializer,
-            write_stream: "/projects/123/datasets/456/tables/789/streams/_default".to_string(),
-        };
-        // check that we break up large batches to avoid api limits
-        let mut events = vec![];
+            "/projects/123/datasets/456/tables/789/streams/_default".to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn no_events() {
+        let mut request_builder = make_request_builder();
+        let results = request_builder.encode_events_incremental(vec![]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn batch_is_split_into_chunks() {
+        let mut request_builder = make_request_builder();
         let mut data = BytesMut::with_capacity(63336);
         for i in 1..data.capacity() {
             data.put_u64(i as u64);
         }
-        for _ in 0..128 {
-            let event = Event::Log(LogEvent::from_parts(
-                Value::Object(BTreeMap::from([
-                    ("text".into(), Value::Bytes(Bytes::from("hello world"))),
-                    ("binary".into(), Value::Bytes(data.clone().into())),
-                ])),
-                EventMetadata::default(),
-            ));
-            events.push(event);
-        }
+        let events = (0..128)
+            .map(|_| {
+                Event::Log(LogEvent::from_parts(
+                    Value::Object(BTreeMap::from([
+                        ("name".into(), Value::Bytes(Bytes::from("hello world"))),
+                        ("email".into(), Value::Bytes(data.clone().into())),
+                    ])),
+                    EventMetadata::default(),
+                ))
+            })
+            .collect();
         let results = request_builder.encode_events_incremental(events);
-        assert!(results.iter().all(|r| r.is_ok()));
+        assert!(results.iter().all(std::result::Result::is_ok));
         assert!(results.len() > 1);
-        // check that we don't generate bodies with no events in them
-        let results = request_builder.encode_events_incremental(vec![]);
-        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn oversized_event_is_rejected() {
+        let mut request_builder = make_request_builder();
+        let results = request_builder.encode_events_incremental(vec![make_oversized_event()]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+    }
+
+    #[test]
+    fn oversized_event_mixed_with_normal_event() {
+        let mut request_builder = make_request_builder();
+        let normal_event = Event::Log(LogEvent::from_parts(
+            Value::Object(BTreeMap::from([(
+                "name".into(),
+                Value::Bytes(Bytes::from("hello")),
+            )])),
+            EventMetadata::default(),
+        ));
+        let results =
+            request_builder.encode_events_incremental(vec![normal_event, make_oversized_event()]);
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
     }
 }

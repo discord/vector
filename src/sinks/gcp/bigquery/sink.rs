@@ -1,24 +1,25 @@
+use crate::event::Event;
 use futures_util::{
     StreamExt,
     stream::{self, BoxStream},
 };
-use vector_lib::event::Event;
 use vector_lib::sink::StreamSink;
 use vector_lib::stream::BatcherSettings;
 
 use super::request_builder::BigqueryRequestBuilder;
-use super::service::BigqueryService;
+use super::service::{BigqueryRetryLogic, BigqueryService, RetriesExhaustedAsErrored};
 use crate::sinks::prelude::SinkRequestBuildError;
 use crate::sinks::util::builder::SinkBuilderExt;
+use crate::sinks::util::service::Svc;
 
-pub struct BigquerySink {
-    pub service: BigqueryService,
+pub(super) struct BigquerySink {
+    pub service: RetriesExhaustedAsErrored<Svc<BigqueryService, BigqueryRetryLogic>>,
     pub batcher_settings: BatcherSettings,
     pub request_builder: BigqueryRequestBuilder,
 }
 
 impl BigquerySink {
-    async fn run_inner(self: Box<BigquerySink>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+    async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         input
             .batched(self.batcher_settings.as_byte_size_config())
             .incremental_request_builder(self.request_builder)
@@ -33,7 +34,7 @@ impl BigquerySink {
                 }
             })
             .into_driver(self.service)
-            .protocol("gRPC")
+            .protocol("grpc")
             .run()
             .await
     }
