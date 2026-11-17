@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use http_1::Uri;
 use indoc::indoc;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use vector_lib::codecs::encoding::ProtobufSerializerConfig;
 use vector_lib::configurable::configurable_component;
 
@@ -104,18 +104,22 @@ impl GenerateConfig for BigqueryConfig {
     }
 }
 
+fn build_endpoint(uri: Uri) -> crate::Result<Endpoint> {
+    let use_tls = uri.scheme_str() == Some("https");
+    let endpoint = Channel::builder(uri);
+    if use_tls {
+        Ok(endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?)
+    } else {
+        Ok(endpoint)
+    }
+}
+
 /// Create a future that sends a single nothing-request to BigQuery
 async fn healthcheck_future(
-    uri: Uri,
+    channel: Channel,
     auth: GcpAuthenticator,
     write_stream: String,
 ) -> crate::Result<()> {
-    let channel = Channel::builder(uri)
-        .tls_config(tonic::transport::channel::ClientTlsConfig::new())
-        .unwrap()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .connect()
-        .await?;
     let mut client = proto::big_query_write_client::BigQueryWriteClient::with_interceptor(
         channel,
         AuthInterceptor { auth },
@@ -169,23 +173,19 @@ impl ValidatedSink for BigqueryConfig {
         let auth = self.auth.build(Scope::BigQueryInsertdata).await?;
         auth.spawn_regenerate_token();
 
+        let channel = build_endpoint(self.endpoint.parse()?)?
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect()
+            .await?;
+
         // Kick off the healthcheck
         let healthcheck: Healthcheck = if cx.healthcheck.enabled {
-            healthcheck_future(
-                self.endpoint.parse()?,
-                auth.clone(),
-                self.get_write_stream(),
-            )
-            .boxed()
+            healthcheck_future(channel.clone(), auth.clone(), self.get_write_stream()).boxed()
         } else {
             Box::pin(async move { Ok(()) })
         };
 
         // Create the gRPC client
-        let channel = Channel::builder(self.endpoint.parse()?)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .connect()
-            .await?;
         let service = BigqueryService::with_auth(channel, auth).await?;
 
         let batcher_settings = self
@@ -212,7 +212,49 @@ impl ValidatedSink for BigqueryConfig {
 
 #[cfg(test)]
 mod test {
-    use super::BigqueryConfig;
+    use std::time::Duration;
+
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+
+    use super::{BigqueryConfig, build_endpoint};
+
+    async fn connection_prefix(scheme: &str) -> [u8; 3] {
+        vector_lib::tls::install_default_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = build_endpoint(
+            format!(
+                "{scheme}://localhost:{}",
+                listener.local_addr().unwrap().port()
+            )
+            .parse()
+            .unwrap(),
+        )
+        .unwrap();
+        let read_prefix = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 3];
+            stream.read_exact(&mut prefix).await.unwrap();
+            prefix
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (_, prefix) = tokio::join!(endpoint.connect(), read_prefix);
+            prefix
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn https_channel_uses_tls() {
+        let prefix = connection_prefix("https").await;
+        assert_eq!(prefix[0], 0x16);
+        assert_eq!(prefix[1], 0x03);
+    }
+
+    #[tokio::test]
+    async fn http_channel_uses_plaintext() {
+        assert_eq!(&connection_prefix("http").await, b"PRI");
+    }
 
     #[test]
     fn generate_config() {
